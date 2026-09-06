@@ -1,0 +1,25 @@
+{
+  "build": {
+    "builder": "NIXPACKS",
+    "buildCommand": "pip install -r requirements.txt"
+  },
+  "deploy": {
+    "startCommand": "gunicorn app:app --bind 0.0.0.0:$PORT --workers 4 --threads 2 --timeout 300",
+    "healthcheckPath": "/api/health",
+    "restartPolicyType": "ON_FAILURE",
+    "environment": {
+      "FLASK_ENV": "production",
+      "PYTHONUNBUFFERED": "1"
+    }
+  },
+  "volumes": {
+    "uploads": {
+      "mountPath": "/app/uploads",
+      "size": "5GB"
+    },
+    "static": {
+      "mountPath": "/app/static",
+      "size": "2GB"
+    }
+  }
+}
