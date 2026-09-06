@@ -194,7 +194,7 @@ python-magic==0.4.27
 python-pptx==1.0.2
 python-slugify==8.0.4
 python-socketio==5.14.1
-python-tzdata==2025.3
+tzdata==2025.2
 python-xxhash==3.6.0
 pytz==2025.2
 pywin32==311
@@ -262,7 +262,6 @@ typer==0.19.2
 typing-extensions==4.15.0
 typing-inspect==0.9.0
 typing-inspection==0.4.1
-tzdata==2025.2
 ultralytics==8.3.217
 ultralytics-thop==2.0.17
 urllib3==2.5.0
