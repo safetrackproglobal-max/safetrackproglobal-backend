@@ -169,7 +169,8 @@ namex==0.1.0
 narwhals==2.8.0
 networkx==3.4.2
 nltk==3.9.2
-numpy==2.2.6
+# FIX: Downgraded numpy to resolve conflicts
+numpy==1.26.4
 oauthlib==3.3.1
 olefile==0.47
 onnxruntime==1.22.1
