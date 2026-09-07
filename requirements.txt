@@ -90,7 +90,7 @@ google-pasta==0.2.0
 googleapis-common-protos==1.70.0
 greenlet==3.2.4
 grpcio==1.75.1
-grpcio-status==1.48.2
+# REMOVED: grpcio-status==1.48.2 - let pip resolve
 h11==0.16.0
 h2==4.3.0
 h5py==3.15.0
@@ -183,7 +183,6 @@ opentelemetry-semantic-conventions==0.58b0
 opt-einsum==3.4.0
 optree==0.17.0
 ordered-set==4.1.0
-# REMOVED: orjson==3.11.3 - let pip resolve
 ormsgpack==1.12.1
 overrides==7.7.0
 packaging==23.2
