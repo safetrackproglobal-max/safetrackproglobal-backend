@@ -759,17 +759,21 @@ PAYSTACK_AVAILABLE = True
 class AdvancedComputerVisionSystem:
     def __init__(self, yolov5_path: str = None):
         """
-        Initialize Advanced Computer Vision System with YOLOv5 model loading
+        Initialize Computer Vision System with a SINGLE YOLO model.
         
-        Args:
-            yolov5_path: Path to YOLOv5 local repository
+        The model must be manually uploaded to the Railway volume at:
+            /app/data/yolov8n.pt
+        
+        No model downloads, no YOLOv5 cloning, no other models loaded.
         """
         self.models = {}
         self.active_monitors = {}
         self.yolov5_available = False
         self.opencv_available = True
-        self.yolov5_path = yolov5_path or r'C:\Users\DELL\Safety-project\safetrack-pro-backend\yolov5'
-        
+
+        # Keep path for compatibility only
+        self.yolov5_path = yolov5_path
+
         self.violation_thresholds = {
             'no_mask': 0.7,
             'no_gloves': 0.6,
@@ -777,500 +781,119 @@ class AdvancedComputerVisionSystem:
             'no_safety_vest': 0.7,
             'unsafe_posture': 0.5
         }
-        
-        # Initialize upload directories
+
+        # Upload directories
         self.UPLOAD_DIRS = {
             'temp': 'temp_uploads',
             'violations': 'violation_uploads'
         }
         self._ensure_directories()
-        
-        # Load models with automatic download
-        self.load_models()
-    
+
+        # ✅ Load ONLY the single YOLO model
+        self._load_single_model()
+
     def _ensure_directories(self):
         """Ensure required directories exist"""
         for directory in self.UPLOAD_DIRS.values():
             os.makedirs(directory, exist_ok=True)
-    
-    def _download_yolov5_repository(self):
-        """Download YOLOv5 repository if it doesn't exist"""
-        if os.path.exists(self.yolov5_path):
-            logger.info(f"YOLOv5 repository already exists at: {self.yolov5_path}")
-            return True
-        
-        logger.info("Downloading YOLOv5 repository...")
-        try:
-            import subprocess
-            import sys
-            
-            # Create parent directory if it doesn't exist
-            os.makedirs(os.path.dirname(self.yolov5_path), exist_ok=True)
-            
-            # Clone YOLOv5 repository
-            clone_cmd = [
-                'git', 'clone', 'https://github.com/ultralytics/yolov5.git', 
-                self.yolov5_path
-            ]
-            
-            result = subprocess.run(clone_cmd, capture_output=True, text=True)
-            if result.returncode == 0:
-                logger.info("✓ Successfully cloned YOLOv5 repository")
-                return True
-            else:
-                logger.error(f"✗ Failed to clone YOLOv5: {result.stderr}")
-                return False
-                
-        except Exception as e:
-            logger.error(f"✗ Error downloading YOLOv5 repository: {e}")
-            return False
-    
-    def _download_model_weights(self, model_name, url):
-        """Download model weights from URL"""
-        import requests
-        from tqdm import tqdm
-        
-        model_dir = os.path.join(self.yolov5_path, 'models')
-        os.makedirs(model_dir, exist_ok=True)
-        
-        filename = os.path.basename(url)
-        save_path = os.path.join(model_dir, filename)
-        
-        # Check if already downloaded
-        if os.path.exists(save_path):
-            logger.info(f"✓ {model_name} weights already downloaded: {filename}")
-            return save_path
-        
-        logger.info(f"Downloading {model_name} weights from: {url}")
-        
-        try:
-            response = requests.get(url, stream=True)
-            response.raise_for_status()
-            
-            # Get file size
-            total_size = int(response.headers.get('content-length', 0))
-            
-            # Download with progress bar
-            with open(save_path, 'wb') as file, tqdm(
-                desc=f"Downloading {model_name}",
-                total=total_size,
-                unit='iB',
-                unit_scale=True,
-                unit_divisor=1024,
-            ) as progress_bar:
-                for data in response.iter_content(chunk_size=1024):
-                    size = file.write(data)
-                    progress_bar.update(size)
-            
-            logger.info(f"✓ Successfully downloaded {model_name} weights: {save_path}")
-            return save_path
-            
-        except Exception as e:
-            logger.error(f"✗ Failed to download {model_name} weights: {e}")
-            return None
-    
-    def _download_all_models(self):
-        """Download all required YOLOv5 models"""
-        model_urls = {
-            'healthcare': 'https://github.com/ultralytics/yolov5/releases/download/v7.0/yolov5s.pt',
-            'construction': 'https://github.com/ultralytics/yolov5/releases/download/v7.0/yolov5m.pt',
-            'manufacturing': 'https://github.com/ultralytics/yolov5/releases/download/v7.0/yolov5l.pt',
-            'general': 'https://github.com/ultralytics/yolov5/releases/download/v7.0/yolov5s.pt'
-        }
-        
-        custom_model_names = {
-            'healthcare': 'healthcare_ppe.pt',
-            'construction': 'construction_safety.pt',
-            'manufacturing': 'manufacturing_safety.pt',
-            'general': 'yolov5s.pt'
-        }
-        
-        downloaded_paths = {}
-        
-        for industry, url in model_urls.items():
-            downloaded_path = self._download_model_weights(industry, url)
-            if downloaded_path:
-                # Rename to custom model names for organization
-                custom_name = custom_model_names[industry]
-                custom_path = os.path.join(self.yolov5_path, 'models', custom_name)
-                
-                if downloaded_path != custom_path:
-                    try:
-                        os.rename(downloaded_path, custom_path)
-                        downloaded_paths[industry] = custom_path
-                        logger.info(f"✓ Renamed {industry} model to: {custom_name}")
-                    except Exception as e:
-                        logger.warning(f"Could not rename {industry} model: {e}")
-                        downloaded_paths[industry] = downloaded_path
-            else:
-                logger.error(f"✗ Failed to download model for {industry}")
-        
-        return downloaded_paths
-    
-    def load_models(self):
-        """Load computer vision models with automatic download if missing"""
-        logger.info("Starting model loading process...")
-        
-        # First, ensure YOLOv5 repository exists
-        if not self._download_yolov5_repository():
-            logger.error("Failed to download YOLOv5 repository, using fallback")
-            self._fallback_to_torch_hub()
-            return
-        
-        # Download missing models (if any) and log results
-        downloaded_models = self._download_all_models()
-        if downloaded_models:
-            model_list = ', '.join([os.path.basename(p) for p in downloaded_models.values() if p])
-            logger.info(f"Downloaded/verified models: {model_list}")
-        else:
-            logger.info("No new models downloaded or verification returned no paths.")
-        
-        # Now load the models
-        try:
-            self._load_yolov5_models()
-        except Exception as e:
-            logger.error(f"Model loading failed: {e}")
-            logger.info("Attempting torch.hub fallback...")
-            self._fallback_to_torch_hub()
-    
-    def activate_yolov5(self) -> bool:
-        """Activate YOLOv5 - Force activation since we know models exist"""
-        logger.info("🚀 FORCE ACTIVATING YOLOv5...")
-        
-        try:
-            # Quick verification that YOLOv5 path exists
-            if not os.path.exists(self.yolov5_path):
-                logger.error(f"YOLOv5 path not found: {self.yolov5_path}")
-                self.yolov5_available = False
-                return False
-            
-            # Check key model files but don't block activation
-            required_models = [
-                'models/healthcare_ppe.pt',
-                'models/construction_safety.pt',
-                'models/manufacturing_safety.pt', 
-                'models/yolov5s.pt'
-            ]
-            
-            for model_path in required_models:
-                full_path = os.path.join(self.yolov5_path, model_path)
-                if os.path.exists(full_path):
-                    size = os.path.getsize(full_path) / (1024 * 1024)
-                    logger.info(f"✅ {os.path.basename(model_path)} - {size:.1f} MB")
-                else:
-                    logger.warning(f"⚠ {model_path} - Missing")
-            
-            # FORCE ACTIVATION - We know the models exist from your file listing
-            self.yolov5_available = True
-            logger.info("🎉 YOLOv5 FORCE ACTIVATED - Ready for inference!")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Activation error: {e}")
-            # Still force availability
-            self.yolov5_available = True
-            return True
-    
-    def _load_yolov5_models(self):
-        """Load YOLOv5 models using local repository with proper error handling"""
-        try:
-            import sys
-            import torch
-            
-            # Add local YOLOv5 path to Python path
-            if self.yolov5_path not in sys.path:
-                sys.path.append(self.yolov5_path)
-            
-            # Try to import from local YOLOv5
-            try:
-                from models.experimental import attempt_load
-                logger.info("Successfully imported YOLOv5 from local repository")
-                
-                # Define model paths
-                model_paths = {
-                    'healthcare': os.path.join(self.yolov5_path, 'models', 'healthcare_ppe.pt'),
-                    'construction': os.path.join(self.yolov5_path, 'models', 'construction_safety.pt'), 
-                    'manufacturing': os.path.join(self.yolov5_path, 'models', 'manufacturing_safety.pt'),
-                    'general': os.path.join(self.yolov5_path, 'yolov5s.pt')
-                }
-                
-                for industry, model_path in model_paths.items():
-                    try:
-                        if os.path.exists(model_path):
-                            # Try without map_location first
-                            try:
-                                model = attempt_load(model_path)
-                            except TypeError:
-                                # If that fails, use device parameter instead
-                                model = attempt_load(model_path, device='cpu')
-                            logger.info(f"Loaded custom {industry} model from {model_path}")
-                        else:
-                            # Fallback to standard YOLOv5s
-                            fallback_path = os.path.join(self.yolov5_path, 'yolov5s.pt')
-                            if os.path.exists(fallback_path):
-                                try:
-                                    model = attempt_load(fallback_path)
-                                except TypeError:
-                                    model = attempt_load(fallback_path, device='cpu')
-                                logger.info(f"Using standard YOLOv5s model for {industry}")
-                            else:
-                                logger.warning(f"Model not found: {model_path}")
-                                model = None
-                        
-                        # Configure model for the industry
-                        industry_configs = {
-                            'healthcare': {
-                                'model': model,
-                                'classes': ['person', 'no_mask', 'no_gloves', 'no_gown', 'no_face_shield'],
-                                'confidence': 0.6
-                            },
-                            'construction': {
-                                'model': model,
-                                'classes': ['person', 'no_helmet', 'no_safety_vest', 'no_safety_glasses', 'unsafe_posture'],
-                                'confidence': 0.7
-                            },
-                            'manufacturing': {
-                                'model': model,
-                                'classes': ['person', 'no_helmet', 'no_gloves', 'unsafe_posture', 'equipment_misuse'],
-                                'confidence': 0.65
-                            },
-                            'general': {
-                                'model': model,
-                                'classes': ['person', 'hardhat', 'vest', 'gloves', 'safety_cone'],
-                                'confidence': 0.5
-                            }
-                        }
-                        
-                        config = industry_configs.get(industry, industry_configs['general'])
-                        self.models[industry] = config
-                        
-                    except Exception as e:
-                        logger.error(f"Failed to load model for {industry}: {e}")
-                        # Create a basic config even if model loading fails
-                        self.models[industry] = {
-                            'model': None,
-                            'classes': ['person'],
-                            'confidence': 0.5
-                        }
-                
-                self.yolov5_available = any(self.models[industry]['model'] is not None for industry in self.models)
-                logger.info(f"Local YOLOv5 models configured successfully. Available: {self.yolov5_available}")
-                
-            except ImportError as e:
-                logger.warning(f"Could not import from local YOLOv5: {e}")
-                self._fallback_to_torch_hub()
-                
-        except Exception as e:
-            logger.error(f"Local YOLOv5 loading failed: {e}")
-            self._fallback_to_torch_hub()
 
-    def _fallback_to_torch_hub(self):
-        """Fallback to torch.hub if local YOLOv5 fails"""
+    def _load_single_model(self):
+        """
+        Load the single YOLO model from the Railway volume.
+        Skips silently if the model isn't present (uses OpenCV fallback).
+        """
+        volume_path = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "/app/data")
+        model_path = os.path.join(volume_path, "yolov8n.pt")
+
+        if not os.path.exists(model_path):
+            logger.warning(f"YOLO model not found at {model_path}, using OpenCV fallback")
+            self.yolov5_available = False
+            return
+
         try:
-            import torch
-            logger.info("Attempting to load YOLOv5 via torch.hub...")
-            
-            # Load model from torch.hub
-            model = torch.hub.load('ultralytics/yolov5', 'yolov5s', pretrained=True, trust_repo=True)
-            
-            # Standard COCO classes that YOLOv5s uses
-            coco_classes = [
-                'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train', 'truck',
-                'boat', 'traffic light', 'fire hydrant', 'stop sign', 'parking meter', 'bench',
-                'bird', 'cat', 'dog', 'horse', 'sheep', 'cow', 'elephant', 'bear', 'zebra',
-                'giraffe', 'backpack', 'umbrella', 'handbag', 'tie', 'suitcase', 'frisbee',
-                'skis', 'snowboard', 'sports ball', 'kite', 'baseball bat', 'baseball glove',
-                'skateboard', 'surfboard', 'tennis racket', 'bottle', 'wine glass', 'cup',
-                'fork', 'knife', 'spoon', 'bowl', 'banana', 'apple', 'sandwich', 'orange',
-                'broccoli', 'carrot', 'hot dog', 'pizza', 'donut', 'cake', 'chair', 'couch',
-                'potted plant', 'bed', 'dining table', 'toilet', 'tv', 'laptop', 'mouse',
-                'remote', 'keyboard', 'cell phone', 'microwave', 'oven', 'toaster', 'sink',
-                'refrigerator', 'book', 'clock', 'vase', 'scissors', 'teddy bear', 'hair drier',
-                'toothbrush'
-            ]
-            
-            # Map COCO classes to our safety categories
-            safety_mappings = {
-                'healthcare': {
-                    'model': model,
-                    'classes': coco_classes,
-                    'confidence': 0.6,
-                    'safety_classes': ['person']
-                },
-                'construction': {
-                    'model': model,
-                    'classes': coco_classes,
-                    'confidence': 0.7,
-                    'safety_classes': ['person', 'hardhat', 'safety_vest']
-                },
-                'manufacturing': {
-                    'model': model,
-                    'classes': coco_classes,
-                    'confidence': 0.65,
-                    'safety_classes': ['person']
-                },
-                'general': {
-                    'model': model,
-                    'classes': coco_classes,
-                    'confidence': 0.5,
-                    'safety_classes': ['person']
-                }
+            from ultralytics import YOLO
+            logger.info(f"Loading YOLO model from: {model_path}")
+            model = YOLO(model_path)
+            self.models['general'] = {
+                'model': model,
+                'classes': list(model.names.values()) if hasattr(model, 'names') else ['person'],
+                'confidence': 0.5
             }
-            
-            for industry, config in safety_mappings.items():
-                self.models[industry] = config
-            
             self.yolov5_available = True
-            logger.info("YOLOv5 models loaded via torch.hub fallback")
-            
+            logger.info("✅ YOLO model loaded successfully")
         except Exception as e:
-            logger.error(f"Torch.hub fallback also failed: {e}")
+            logger.error(f"Failed to load YOLO model: {e}")
             self.yolov5_available = False
 
-    def verify_model_downloads(self):
-        """Verify that all YOLOv5 models are downloaded and loaded correctly"""
-        logger.info("=== YOLOv5 Model Download Verification ===")
-        
-        # Check if YOLOv5 path exists
-        if not os.path.exists(self.yolov5_path):
-            logger.error(f"YOLOv5 path does not exist: {self.yolov5_path}")
-            return False
-        
-        logger.info(f"✓ YOLOv5 path exists: {self.yolov5_path}")
-        
-        # Check for required files
-        required_files = [
-            'models/experimental.py',
-            'models/common.py',
-            'models/yolo.py',
-            'utils/general.py',
-            'utils/torch_utils.py'
-        ]
-        
-        for file in required_files:
-            file_path = os.path.join(self.yolov5_path, file)
-            if os.path.exists(file_path):
-                logger.info(f"✓ Required file found: {file}")
-            else:
-                logger.warning(f"⚠ Required file missing: {file}")
-        
-        # Check model files
-        model_files = {
-            'healthcare': 'models/healthcare_ppe.pt',
-            'construction': 'models/construction_safety.pt',
-            'manufacturing': 'models/manufacturing_safety.pt',
-            'general': 'yolov5s.pt'
-        }
-        
-        for industry, model_file in model_files.items():
-            model_path = os.path.join(self.yolov5_path, model_file)
-            if os.path.exists(model_path):
-                logger.info(f"✓ Model file found for {industry}: {model_file}")
-                file_size = os.path.getsize(model_path) / (1024 * 1024)
-                logger.info(f"  File size: {file_size:.2f} MB")
-            else:
-                logger.warning(f"⚠ Model file missing for {industry}: {model_file}")
-        
-        # Check model loading status
-        logger.info("=== Model Loading Status ===")
-        for industry in self.models:
-            model_config = self.models[industry]
-            if model_config['model'] is not None:
-                logger.info(f"✓ {industry} model loaded successfully")
-                try:
-                    # Test model inference
-                    if hasattr(model_config['model'], 'names'):
-                        classes = model_config['model'].names
-                        logger.info(f"  Classes available: {len(classes)}")
-                except Exception as e:
-                    logger.warning(f"  Model test failed: {e}")
-            else:
-                logger.error(f"✗ {industry} model failed to load")
-        
-        # Overall status
-        loaded_models = sum(1 for industry in self.models if self.models[industry]['model'] is not None)
-        total_models = len(self.models)
-        
-        logger.info(f"=== Summary: {loaded_models}/{total_models} models loaded ===")
-        
-        if loaded_models == total_models:
-            logger.info("🎉 All models loaded successfully!")
-            return True
-        elif loaded_models > 0:
-            logger.info("⚠ Some models loaded, fallback mechanisms active")
-            return True
-        else:
-            logger.error("❌ No models loaded, relying on fallback methods")
-            return False
+    # ============================================================
+    # Detection
+    # ============================================================
 
     def detect_safety_violations(self, image_path: str, industry: str = 'healthcare', context: Dict = None) -> Dict:
-        """Enhanced safety violation detection with multiple fallback methods"""
+        """Detect violations using the single YOLO model, or fallback to OpenCV."""
         if not self.yolov5_available:
             return self._fallback_violation_detection(image_path, industry)
-        
+
         try:
-            model_config = self.models.get(industry, self.models.get('general'))
-            if not model_config:
-                return {'error': f'No model available for {industry}'}
-            
-            model = model_config['model']
-            model.conf = model_config['confidence']
-            
-            # Run inference
+            config = self.models.get('general')
+            if not config or config['model'] is None:
+                return self._fallback_violation_detection(image_path, industry)
+
+            model = config['model']
+            model.conf = config['confidence']
+
             results = model(image_path)
-            predictions = results.pred[0]
-            
+            predictions = results[0].boxes if hasattr(results[0], 'boxes') else None
+
             violations = []
             detections = []
             compliance_score = 100
-            
-            for detection in predictions:
-                if len(detection) >= 6:
-                    class_id = int(detection[5])
-                    confidence = float(detection[4])
-                    
-                    # Get class name based on model configuration
-                    if class_id < len(model_config['classes']):
-                        class_name = model_config['classes'][class_id]
-                    else:
-                        class_name = f'class_{class_id}'
-                    
-                    # Check if this is a violation
+
+            if predictions is not None:
+                for box in predictions:
+                    cls_id = int(box.cls[0])
+                    confidence = float(box.conf[0])
+                    xyxy = box.xyxy[0].tolist()
+                    class_name = model.names.get(cls_id, f'class_{cls_id}')
+
                     if class_name.startswith('no_') and confidence > self.violation_thresholds.get(class_name, 0.5):
                         violations.append({
                             'type': class_name,
                             'confidence': confidence,
-                            'bbox': detection[:4].tolist(),
+                            'bbox': xyxy,
                             'industry': industry
                         })
                         compliance_score -= 20
-                    
+
                     detections.append({
                         'class': class_name,
                         'confidence': confidence,
-                        'bbox': detection[:4].tolist()
+                        'bbox': xyxy
                     })
-            
+
             compliance_score = max(0, compliance_score)
-            
+
             return {
                 'violations': violations,
                 'detections': detections,
                 'violation_count': len(violations),
                 'compliance_score': compliance_score,
                 'risk_level': self._calculate_risk_level(violations, industry, context),
-                'model_used': industry,
+                'model_used': 'yolov8n',
                 'timestamp': datetime.utcnow().isoformat()
             }
-                
+
         except Exception as e:
-            logger.error(f"Safety violation detection error: {e}")
+            logger.error(f"YOLO detection failed: {e}")
             return self._fallback_violation_detection(image_path, industry)
-    
+
+    # ============================================================
+    # OpenCV Fallback Detection (unchanged — keeps working)
+    # ============================================================
+
     def _fallback_violation_detection(self, image_path: str, industry: str) -> Dict:
-        """Advanced fallback method using OpenCV and traditional computer vision"""
+        """Advanced fallback using OpenCV when YOLO is unavailable"""
         try:
-            # Load and validate image
             image = cv2.imread(image_path)
             if image is None:
                 return {'error': 'Could not load image'}
@@ -1279,38 +902,30 @@ class AdvancedComputerVisionSystem:
             if height == 0 or width == 0:
                 return {'error': 'Invalid image dimensions'}
 
-            area = height * width
             violations = []
             detections = []
             confidence_scores = []
 
-            # Preprocessing
             hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
             gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-
-            # Enhance image quality
             gray = cv2.medianBlur(gray, 5)
-            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
             gray = clahe.apply(gray)
 
-            # Multi-stage analysis
             analysis_results = self._perform_comprehensive_analysis(image, gray, hsv, industry)
             violations.extend(analysis_results['violations'])
             detections.extend(analysis_results['detections'])
             confidence_scores.extend(analysis_results['confidence_scores'])
 
-            # Person detection using Haar cascades or HOG
             person_detections = self._detect_persons(image, gray)
             detections.extend(person_detections)
 
             if person_detections:
-                # Analyze detected persons for safety violations
                 person_violations = self._analyze_persons_for_violations(
                     image, hsv, gray, person_detections, industry
                 )
                 violations.extend(person_violations)
 
-            # Calculate overall metrics
             compliance_score = self._calculate_compliance_score(violations, detections)
             risk_level = self._calculate_risk_level(violations, industry)
 
@@ -1320,7 +935,7 @@ class AdvancedComputerVisionSystem:
                 'violation_count': len(violations),
                 'compliance_score': compliance_score,
                 'risk_level': risk_level,
-                'model_used': 'advanced_opencv_fallback',
+                'model_used': 'opencv_fallback',
                 'analysis_metrics': {
                     'person_count': len(person_detections),
                     'image_quality_score': self._assess_image_quality(gray),
@@ -1328,12 +943,48 @@ class AdvancedComputerVisionSystem:
                     'detection_confidence_avg': np.mean(confidence_scores) if confidence_scores else 0.5
                 },
                 'timestamp': datetime.utcnow().isoformat(),
-                'notes': 'Using advanced computer vision fallback detection'
+                'notes': 'Using OpenCV fallback detection'
             }
 
         except Exception as e:
-            logger.error(f"Advanced fallback detection error: {e}")
+            logger.error(f"Fallback detection error: {e}")
             return self._minimal_fallback_detection(image_path, e)
+
+    # ============================================================
+    # Stub methods (kept for compatibility — all disabled)
+    # ============================================================
+
+    def _download_yolov5_repository(self):
+        logger.info("YOLOv5 repository download is disabled.")
+        return False
+
+    def _download_model_weights(self, model_name, url):
+        logger.info(f"Model download disabled for {model_name}.")
+        return None
+
+    def _download_all_models(self):
+        logger.info("Model downloads are disabled.")
+        return {}
+
+    def load_models(self):
+        """No-op — model is loaded in __init__"""
+        logger.info("load_models() is a no-op in this build.")
+
+    def activate_yolov5(self) -> bool:
+        return self.yolov5_available
+
+    def _load_yolov5_models(self):
+        logger.info("YOLOv5 multi-model loading is disabled.")
+        return
+
+    def _fallback_to_torch_hub(self):
+        logger.info("torch.hub fallback is disabled.")
+        self.yolov5_available = False
+
+    def verify_model_downloads(self):
+        logger.info("Model verification is disabled.")
+        return self.yolov5_available
+
 
     def _perform_comprehensive_analysis(self, image, gray, hsv, industry):
         """Perform comprehensive image analysis for safety violations"""
@@ -3736,47 +3387,40 @@ class MedicalAISystem:
         self.models = {}
         self.model_status = {}
         self.tokenizers = {}
+
+        # ✅ Use Railway volume path (falls back to /app/data locally)
+        volume_path = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "/app/data")
+
         self.model_config = {
-            'cache_dir': self._get_config('MODEL_CACHE_DIR', './model_cache'),
+            'cache_dir': self._get_config(
+                'MODEL_CACHE_DIR',
+                os.path.join(volume_path, 'model_cache')
+            ),
             'device': self._get_device(),
             'timeout': self._get_config('MODEL_DOWNLOAD_TIMEOUT', 30),
             'batch_size': self._get_config('MODEL_BATCH_SIZE', 8),
             'max_length': self._get_config('MODEL_MAX_LENGTH', 512),
-            'models_path': self._get_config('MODELS_PATH', './medical_models/models')
+            'models_path': self._get_config(
+                'MODELS_PATH',
+                os.path.join(volume_path, 'medical_models')
+            )
         }
-        
-        # Entity type mapping (expanded for all models)
+
+        # Entity type mapping (unchanged)
         self.entity_mapping = {
-            # BioClinicalBERT / PubMedBERT format
-            'B-Disease': 'DISEASE',
-            'I-Disease': 'DISEASE',
-            'B-Symptom': 'SYMPTOM',
-            'I-Symptom': 'SYMPTOM',
-            'B-Medication': 'MEDICATION',
-            'I-Medication': 'MEDICATION',
-            'B-Procedure': 'PROCEDURE',
-            'I-Procedure': 'PROCEDURE',
-            'B-Lab': 'LAB_TEST',
-            'I-Lab': 'LAB_TEST',
-            'B-Anatomy': 'ANATOMY',
-            'I-Anatomy': 'ANATOMY',
-            
-            # HunFlair format
-            'B-Chemical': 'CHEMICAL',
-            'I-Chemical': 'CHEMICAL',
-            'S-Chemical': 'CHEMICAL',
-            'B-Gene': 'GENE',
-            'I-Gene': 'GENE',
-            'S-Gene': 'GENE',
-            'B-Species': 'SPECIES',
-            'I-Species': 'SPECIES',
-            'S-Species': 'SPECIES',
-            'B-CellLine': 'CELL_LINE',
-            'I-CellLine': 'CELL_LINE',
-            'S-CellLine': 'CELL_LINE',
+            'B-Disease': 'DISEASE', 'I-Disease': 'DISEASE',
+            'B-Symptom': 'SYMPTOM', 'I-Symptom': 'SYMPTOM',
+            'B-Medication': 'MEDICATION', 'I-Medication': 'MEDICATION',
+            'B-Procedure': 'PROCEDURE', 'I-Procedure': 'PROCEDURE',
+            'B-Lab': 'LAB_TEST', 'I-Lab': 'LAB_TEST',
+            'B-Anatomy': 'ANATOMY', 'I-Anatomy': 'ANATOMY',
+            'B-Chemical': 'CHEMICAL', 'I-Chemical': 'CHEMICAL', 'S-Chemical': 'CHEMICAL',
+            'B-Gene': 'GENE', 'I-Gene': 'GENE', 'S-Gene': 'GENE',
+            'B-Species': 'SPECIES', 'I-Species': 'SPECIES', 'S-Species': 'SPECIES',
+            'B-CellLine': 'CELL_LINE', 'I-CellLine': 'CELL_LINE', 'S-CellLine': 'CELL_LINE',
         }
-        
-        # Lab reference ranges (simplified)
+
+        # Lab reference ranges (unchanged)
         self.lab_reference_ranges = {
             'glucose': {'min': 70, 'max': 99, 'unit': 'mg/dL', 'critical_low': 40, 'critical_high': 400},
             'hbA1c': {'min': 4, 'max': 5.6, 'unit': '%', 'critical_high': 10},
@@ -3798,73 +3442,80 @@ class MedicalAISystem:
             'ast': {'min': 10, 'max': 40, 'unit': 'U/L', 'critical_high': 1000},
             'alp': {'min': 44, 'max': 147, 'unit': 'U/L', 'critical_high': 500}
         }
-        
-        # Set Flair cache to your actual models directory
-        self.flair_model_path = Path(r"C:\Users\DELL\.flair\models")
-        flair.cache_root = str(self.flair_model_path)
-        
+
+        # ✅ Flair cache on the volume (no more C:\Users\...)
+        self.flair_model_path = Path(
+            os.environ.get("FLAIR_MODEL_PATH", os.path.join(volume_path, "flair_models"))
+        )
+        try:
+            flair.cache_root = str(self.flair_model_path)
+        except Exception as e:
+            logger.warning(f"Could not set flair cache root: {e}")
+
         # Load all models
         self.load_all_models()
-    
+
     def _get_config(self, key, default):
         """Get config value from app if available"""
         if self.app and hasattr(self.app, 'config'):
             return self.app.config.get(key, default)
         return default
-    
+
     def _get_device(self):
         """Determine the best device for model inference"""
         device_config = self._get_config('MODEL_DEVICE', 'auto')
         if device_config == 'auto':
             if torch.cuda.is_available():
-                device = 0  # Use first GPU
+                device = 0
                 logger.info(f"GPU detected: {torch.cuda.get_device_name(0)}")
             elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
                 device = 'mps'
                 logger.info("Apple MPS detected")
             else:
-                device = -1  # CPU
+                device = -1
                 logger.info("Using CPU for inference")
         else:
             device = device_config
-        
         return device
-    
+
     def load_all_models(self):
-        """Load all pre-trained AI models"""
+        """Load all pre-trained AI models (safe — never crashes if files are missing)"""
         if not self._get_config('AI_MODELS_ENABLED', True):
             logger.info("AI models are disabled via configuration")
             return
-        
+
         logger.info("=" * 60)
         logger.info("Loading Medical AI Models...")
+        logger.info(f"Models path: {self.model_config['models_path']}")
+        logger.info(f"Flair path: {self.flair_model_path}")
         logger.info("=" * 60)
-        
-        # Create model cache directory
-        os.makedirs(self.model_config['cache_dir'], exist_ok=True)
-        
-        # Set environment variables
+
+        # Create dirs if missing
+        try:
+            os.makedirs(self.model_config['cache_dir'], exist_ok=True)
+            os.makedirs(self.model_config['models_path'], exist_ok=True)
+            os.makedirs(self.flair_model_path, exist_ok=True)
+        except Exception as e:
+            logger.warning(f"Could not create model directories: {e}")
+
         os.environ['TRANSFORMERS_CACHE'] = self.model_config['cache_dir']
         os.environ['TORCH_HOME'] = self.model_config['cache_dir']
         os.environ['HF_HOME'] = self.model_config['cache_dir']
-        os.environ['HF_HUB_ENABLE_HF_TRANSFER'] = '1'
-        
+
         start_time = time.time()
-        
-        # Load models sequentially
+
         self._load_bio_clinical_bert()
         self._load_pubmed_bert()
         self._load_flair_sentiment()
         self._load_hunflair_v1()
         self._load_hunflair_v2()
-        
+
         total_load_time = time.time() - start_time
-        logger.info(f"✅ All models loaded in {total_load_time:.2f} seconds")
+        logger.info(f"✅ Model loading finished in {total_load_time:.2f} seconds")
         logger.info("=" * 60)
-        
-        # Print status summary
+
         self._print_model_status()
-    
+
     def _print_model_status(self):
         """Print status of all models"""
         logger.info("\n📊 Model Loading Status:")
@@ -3877,23 +3528,22 @@ class MedicalAISystem:
                 logger.info(f"  ⏭️  {model_key}: Skipped")
             else:
                 logger.info(f"  ⚠️ {model_key}: {status}")
-    
+
     def _load_bio_clinical_bert(self):
         """Load BioClinicalBERT for medical NER"""
         model_key = 'bio_clinical_bert'
         start_time = time.time()
-        
+
         try:
-            # Local path
             local_path = Path(self.model_config['models_path']) / 'bioclinicalbert'
-            
+
             if local_path.exists() and (local_path / "pytorch_model.bin").exists():
                 model_name = str(local_path)
                 logger.info(f"✅ Found BioClinicalBERT at: {local_path}")
             else:
                 model_name = "arashpcc/Bio_ClinicalBERT"
-                logger.info(f"⚠️ BioClinicalBERT not found locally, loading from HuggingFace")
-            
+                logger.info("⚠️ BioClinicalBERT not found locally, loading from HuggingFace")
+
             self.models[model_key] = pipeline(
                 "token-classification",
                 model=model_name,
@@ -3903,170 +3553,158 @@ class MedicalAISystem:
                 batch_size=self.model_config['batch_size']
             )
             self.model_status[model_key] = 'loaded'
-            
-            load_time = time.time() - start_time
-            logger.info(f"  ✅ BioClinicalBERT loaded in {load_time:.2f}s")
-            
+            logger.info(f"  ✅ BioClinicalBERT loaded in {time.time() - start_time:.2f}s")
+
         except Exception as e:
             logger.error(f"  ❌ BioClinicalBERT failed: {e}")
             self.models[model_key] = None
             self.model_status[model_key] = 'failed'
-    
+
     def _load_pubmed_bert(self):
         """Load PubMedBERT for biomedical understanding"""
         model_key = 'pubmed_bert'
         start_time = time.time()
-        
+
         try:
-            # Local path
             local_path = Path(self.model_config['models_path']) / 'pubmedbert'
-            
+
             if local_path.exists() and (local_path / "pytorch_model.bin").exists():
                 model_name = str(local_path)
                 logger.info(f"✅ Found PubMedBERT at: {local_path}")
             else:
                 model_name = "microsoft/BiomedNLP-PubMedBERT-base-uncased-abstract-fulltext"
-                logger.info(f"⚠️ PubMedBERT not found locally, loading from HuggingFace")
-            
+                logger.info("⚠️ PubMedBERT not found locally, loading from HuggingFace")
+
             self.tokenizers['pubmed'] = AutoTokenizer.from_pretrained(model_name)
             self.models[model_key] = AutoModel.from_pretrained(
                 model_name,
                 torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32
             )
-            
-            # Move to device
+
             if torch.cuda.is_available():
-                self.models[model_key] = self.models[model_key].to(f"cuda:{self.model_config['device']}" if isinstance(self.model_config['device'], int) else self.model_config['device'])
+                self.models[model_key] = self.models[model_key].to(
+                    f"cuda:{self.model_config['device']}"
+                    if isinstance(self.model_config['device'], int)
+                    else self.model_config['device']
+                )
             elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
                 self.models[model_key] = self.models[model_key].to('mps')
-            
+
             self.models[model_key].eval()
             self.model_status[model_key] = 'loaded'
-            
-            load_time = time.time() - start_time
-            logger.info(f"  ✅ PubMedBERT loaded in {load_time:.2f}s")
-            
+            logger.info(f"  ✅ PubMedBERT loaded in {time.time() - start_time:.2f}s")
+
         except Exception as e:
             logger.error(f"  ❌ PubMedBERT failed: {e}")
             self.models[model_key] = None
             self.model_status[model_key] = 'failed'
-    
+
     def _load_flair_sentiment(self):
         """Load Flair sentiment analysis model from cache"""
         model_key = 'flair_sentiment'
         start_time = time.time()
-        
+
         try:
             logger.info("Loading Flair sentiment...")
-            
-            # Direct paths to your cached sentiment models
+
             sentiment_paths = [
                 self.flair_model_path / "sentiment.pt",
                 self.flair_model_path / "sentiment-en-mix-distillbert_4.pt",
                 self.flair_model_path / "en-sentiment.pt",
             ]
-            
+
             model_path = None
             for path in sentiment_paths:
                 if path.exists():
                     model_path = path
                     logger.info(f"  Found cached sentiment model at: {path}")
                     break
-            
+
             if model_path:
-                # Load from explicit path
                 self.models[model_key] = Classifier.load(str(model_path))
-                logger.info(f"  Loaded sentiment model from cache")
+                logger.info("  Loaded sentiment model from cache")
             else:
-                # Fall back to Flair's loader (should find it in cache)
                 self.models[model_key] = Classifier.load('sentiment')
-            
+
             self.model_status[model_key] = 'loaded'
-            load_time = time.time() - start_time
-            logger.info(f"  ✅ Flair sentiment loaded in {load_time:.2f}s")
-            
+            logger.info(f"  ✅ Flair sentiment loaded in {time.time() - start_time:.2f}s")
+
         except Exception as e:
             logger.error(f"  ❌ Flair sentiment failed: {e}")
             self.models[model_key] = None
             self.model_status[model_key] = 'failed'
-    
+
     def _load_hunflair_v1(self):
         """Load HunFlair v1 for medical NER"""
         model_key = 'hunflair_v1'
         start_time = time.time()
-        
+
         try:
             logger.info("Loading HunFlair v1...")
-            
-            # Direct path to HunFlair v1
             hunflair_path = self.flair_model_path / "hunflair.pt"
-            
+
             if hunflair_path.exists():
                 logger.info(f"  Found cached HunFlair v1 at: {hunflair_path}")
                 self.models[model_key] = Classifier.load(str(hunflair_path))
             else:
-                # Fall back to Flair's loader
                 self.models[model_key] = Classifier.load('hunflair')
-            
+
             self.model_status[model_key] = 'loaded'
-            load_time = time.time() - start_time
-            logger.info(f"  ✅ HunFlair v1 loaded in {load_time:.2f}s")
-            
+            logger.info(f"  ✅ HunFlair v1 loaded in {time.time() - start_time:.2f}s")
+
         except Exception as e:
             logger.error(f"  ❌ HunFlair v1 failed: {e}")
             self.models[model_key] = None
             self.model_status[model_key] = 'failed'
-    
+
     def _load_hunflair_v2(self):
         """Load HunFlair2 for biomedical NER"""
         model_key = 'hunflair_v2'
         start_time = time.time()
-        
+
         try:
             logger.info("Loading HunFlair2...")
-            
-            # HunFlair2 is in a subdirectory
             hunflair2_dir = self.flair_model_path / "hunflair2"
-            
+
             if hunflair2_dir.exists() and (hunflair2_dir / "pytorch_model.bin").exists():
                 logger.info(f"  Found HunFlair2 at: {hunflair2_dir}")
-                # For HuggingFace format models in Flair, we need to use the directory
                 self.models[model_key] = Classifier.load(str(hunflair2_dir))
             else:
-                # Try the alternative path
-                alt_path = self.flair_model_path / "hunflair2-ner" / "models--hunflair--hunflair2-ner" / "snapshots" / "3af2b8972f7af2910ce8d9ae724da09b3d7a166c"
+                alt_path = (
+                    self.flair_model_path
+                    / "hunflair2-ner"
+                    / "models--hunflair--hunflair2-ner"
+                    / "snapshots"
+                    / "3af2b8972f7af2910ce8d9ae724da09b3d7a166c"
+                )
                 if alt_path.exists() and (alt_path / "pytorch_model.bin").exists():
                     logger.info(f"  Found HunFlair2 at alternative path: {alt_path}")
                     self.models[model_key] = Classifier.load(str(alt_path))
                 else:
-                    # Fall back to Flair's loader
                     self.models[model_key] = Classifier.load('hunflair2')
-            
+
             self.model_status[model_key] = 'loaded'
-            load_time = time.time() - start_time
-            logger.info(f"  ✅ HunFlair2 loaded in {load_time:.2f}s")
-            
+            logger.info(f"  ✅ HunFlair2 loaded in {time.time() - start_time:.2f}s")
+
         except Exception as e:
             logger.error(f"  ❌ HunFlair2 failed: {e}")
             self.models[model_key] = None
             self.model_status[model_key] = 'failed'
-    
+
     def get_entity_type(self, label):
         """Map model-specific labels to standardized entity types"""
         return self.entity_mapping.get(label, label)
-    
+
     def analyze_text(self, text):
         """Analyze text with all available models"""
         results = {}
-        
-        # Run BioClinicalBERT if available
+
         if self.model_status.get('bio_clinical_bert') == 'loaded':
             try:
                 results['bio_entities'] = self.models['bio_clinical_bert'](text)
             except Exception as e:
                 logger.error(f"BioClinicalBERT analysis failed: {e}")
-        
-        # Run HunFlair2 if available
+
         if self.model_status.get('hunflair_v2') == 'loaded':
             try:
                 from flair.data import Sentence
@@ -4084,8 +3722,7 @@ class MedicalAISystem:
                 ]
             except Exception as e:
                 logger.error(f"HunFlair analysis failed: {e}")
-        
-        # Run sentiment if available
+
         if self.model_status.get('flair_sentiment') == 'loaded':
             try:
                 from flair.data import Sentence
@@ -4094,25 +3731,21 @@ class MedicalAISystem:
                 results['sentiment'] = str(sentence.labels[0]) if sentence.labels else None
             except Exception as e:
                 logger.error(f"Sentiment analysis failed: {e}")
-        
+
         return results
-    
+
     # ==================== COMMON UTILITY METHODS ====================
-    
+
     def is_model_available(self, model_name):
         """Check if a specific model is available"""
         model = self.models.get(model_name)
         return model is not None and self.model_status.get(model_name) == 'loaded'
-    
+
     def comprehensive_entity_extraction(self, text: str) -> Dict:
-        """
-        Extract entities using multiple models for better accuracy
-        Used by: Medical Chat, Symptoms Analyzer, Text Analysis
-        """
+        """Extract entities using multiple models for better accuracy"""
         entities = []
         models_used = []
-        
-        # BioClinicalBERT
+
         if self.is_model_available('bio_clinical_bert'):
             try:
                 bio_results = self.models['bio_clinical_bert'](text)
@@ -4128,8 +3761,7 @@ class MedicalAISystem:
                 models_used.append('BioClinicalBERT')
             except Exception as e:
                 logger.warning(f"BioClinicalBERT extraction failed: {e}")
-        
-        # HunFlair2
+
         if self.is_model_available('hunflair_v2'):
             try:
                 sentence = Sentence(text)
@@ -4146,19 +3778,17 @@ class MedicalAISystem:
                 models_used.append('HunFlair2')
             except Exception as e:
                 logger.warning(f"HunFlair2 extraction failed: {e}")
-        
-        # Deduplicate by text and type, keep highest confidence
+
         entity_dict = {}
         for entity in entities:
             key = f"{entity['text']}_{entity['type']}"
             if key not in entity_dict or entity['confidence'] > entity_dict[key]['confidence']:
                 entity_dict[key] = entity
-        
-        # Group by type
+
         by_type = defaultdict(list)
         for entity in entity_dict.values():
             by_type[entity['type']].append(entity)
-        
+
         return {
             'entities': list(entity_dict.values()),
             'by_type': dict(by_type),
@@ -4166,12 +3796,12 @@ class MedicalAISystem:
             'unique_types': list(by_type.keys()),
             'models_used': models_used
         }
-    
+
     def analyze_sentiment_flair(self, text: str) -> Dict:
         """Analyze sentiment using Flair"""
         if not self.is_model_available('flair_sentiment'):
             return {'sentiment': 'NEUTRAL', 'confidence': 0.5, 'model': None}
-        
+
         try:
             sentence = Sentence(text)
             self.models['flair_sentiment'].predict(sentence)
@@ -4184,12 +3814,12 @@ class MedicalAISystem:
         except Exception as e:
             logger.warning(f"Sentiment analysis failed: {e}")
             return {'sentiment': 'NEUTRAL', 'confidence': 0.5, 'model': None}
-    
+
     def get_pubmed_embeddings(self, text: str) -> np.ndarray:
         """Get PubMedBERT embeddings for text"""
         if not self.is_model_available('pubmed_bert'):
             return np.zeros(768)
-        
+
         try:
             inputs = self.tokenizers['pubmed'](
                 text,
@@ -4198,11 +3828,10 @@ class MedicalAISystem:
                 truncation=True,
                 max_length=self.model_config['max_length']
             ).to(self.model_config['device'])
-            
+
             with torch.no_grad():
                 outputs = self.models['pubmed_bert'](**inputs)
-            
-            # Use CLS token embedding
+
             embeddings = outputs.last_hidden_state[:, 0, :].cpu().numpy()
             return embeddings[0]
         except Exception as e:
@@ -49473,51 +49102,40 @@ class SpectralIndexNetwork(nn.Module):
 
 class AdvancedEnvironmentalAIService:
     """
-    Production-ready Environmental AI Service with real implementations
+    Production-ready Environmental AI Service
     for satellite image analysis and environmental monitoring
     """
     
-    # Land cover classes
     LAND_COVER_CLASSES = [
-        'Urban/Built-up',
-        'Forest/Tree Cover',
-        'Water Bodies',
-        'Agricultural/Cropland',
-        'Barren/Sparsely Vegetated',
-        'Wetlands',
-        'Grassland/Shrubland',
-        'Snow/Ice',
-        'Cloud/Shadow'
+        'Urban/Built-up', 'Forest/Tree Cover', 'Water Bodies',
+        'Agricultural/Cropland', 'Barren/Sparsely Vegetated',
+        'Wetlands', 'Grassland/Shrubland', 'Snow/Ice', 'Cloud/Shadow'
     ]
     
-    # Change types
     CHANGE_TYPES = [
-        'Deforestation',
-        'Urban Expansion',
-        'Water Body Shrinkage',
-        'Agricultural Expansion',
-        'Desertification',
-        'Wetland Degradation',
-        'Coastal Erosion',
-        'Glacial Retreat',
-        'Reforestation',
-        'No Significant Change'
+        'Deforestation', 'Urban Expansion', 'Water Body Shrinkage',
+        'Agricultural Expansion', 'Desertification', 'Wetland Degradation',
+        'Coastal Erosion', 'Glacial Retreat', 'Reforestation', 'No Significant Change'
     ]
     
-    def __init__(self, model_base_path: str = "./environmental_ai_models", 
+    def __init__(self, model_base_path: str = None,
                  cache_size: int = 1000,
                  num_workers: int = 4):
         """
         Initialize the Environmental AI Service
-        
-        Args:
-            model_base_path: Path to store/load models
-            cache_size: Maximum number of items in inference cache
-            num_workers: Number of worker threads for parallel processing
         """
+        # ✅ Volume-aware default path
+        if model_base_path is None:
+            volume_path = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "/app/data")
+            model_base_path = os.path.join(volume_path, "environmental_ai_models")
+        
         self.model_base_path = Path(model_base_path)
         self.cache_size = cache_size
         self.num_workers = num_workers
+        
+        # ✅ Also expose the volume root for model_configs lookups
+        self.volume_path = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "/app/data")
+        self.env_models_root = Path(self.volume_path) / "environmental_models" / "models"
         
         # Create directories
         self.model_base_path.mkdir(parents=True, exist_ok=True)
@@ -49525,11 +49143,12 @@ class AdvancedEnvironmentalAIService:
         (self.model_base_path / "cache").mkdir(exist_ok=True)
         (self.model_base_path / "historical").mkdir(exist_ok=True)
         self._adaptive_pool = nn.AdaptiveAvgPool2d((1, 1))
-        # Set device
+        
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         logger.info(f"Using device: {self.device}")
+        logger.info(f"Model base path: {self.model_base_path}")
+        logger.info(f"Env models root: {self.env_models_root}")
         
-        # Initialize containers
         self.models = {}
         self.downloaded_models = {}
         self.task_models = {}
@@ -49539,103 +49158,84 @@ class AdvancedEnvironmentalAIService:
         self.inference_cache = {}
         self.cache_access_times = {}
         
-        # Neural network models
         self.land_cover_classifier = None
         self.change_detection_model = None
         self.spectral_index_network = None
         
-        # Thread pool for parallel processing
         self.executor = ThreadPoolExecutor(max_workers=num_workers)
         
-        # Statistics
         self.inference_stats = defaultdict(lambda: {
-            'count': 0, 
-            'total_time': 0, 
-            'errors': 0,
-            'cache_hits': 0
+            'count': 0, 'total_time': 0, 'errors': 0, 'cache_hits': 0
         })
         
-        # Initialize all components
         self._initialize_system()
-        
+    
     def _initialize_system(self):
-        """Initialize all system components with real implementations"""
+        """Initialize all system components"""
         try:
-            # Load or create transformer models
             self._load_transformer_models()
-            
-            # Set task models
             self._set_task_models()
-            
-            # Initialize and load neural networks
             self._initialize_neural_networks()
-            
-            # Load or train sklearn models
             self._initialize_sklearn_models()
-            
-            # Initialize data scalers
             self._initialize_scalers()
-            
-            # Load historical embeddings database
             self._load_historical_embeddings()
-            
-            # Load inference cache
             self._load_cache()
-            
-            # Start background tasks
             self._start_background_tasks()
-            
-            logger.info(f"✅ System initialized successfully with {len(self.downloaded_models)} models")
-            
+            logger.info(f"✅ System initialized with {len(self.downloaded_models)} models")
         except Exception as e:
             logger.error(f"System initialization failed: {e}")
             self._initialize_fallback_models()
+
+            
     
     def _load_transformer_models(self):
-        """Load transformer models based on their strengths with enhanced forward pass testing"""
-        # Define model paths and their strengths
+        """Load transformer models based on their strengths"""
+        
+        # ✅ Volume-aware paths (no more C:\Users\...)
+        models_root = self.env_models_root
+        
         model_configs = {
             'granite_ocean': {
-                'path': r"C:\Users\DELL\Safety-project\safetrack-pro-backend\environmental_models\models\granite_ocean",
+                'path': str(models_root / 'granite_ocean'),
                 'strength': 'general_purpose',
                 'embedding_dim': 4096,
                 'use_for': ['land_cover', 'change_detection', 'environmental_indicators', 'general_analysis']
             },
             'olmoearth_base': {
-                'path': r"C:\Users\DELL\Safety-project\safetrack-pro-backend\environmental_models\models\olmoearth_base",
+                'path': str(models_root / 'olmoearth_base'),
                 'strength': 'balanced',
                 'embedding_dim': 2048,
                 'use_for': ['general_analysis', 'vegetation', 'urban', 'thermal']
             },
             'olmoearth_tiny': {
-                'path': r"C:\Users\DELL\Safety-project\safetrack-pro-backend\environmental_models\models\olmoearth_tiny",
+                'path': str(models_root / 'olmoearth_tiny'),
                 'strength': 'fast',
                 'embedding_dim': 2048,
                 'use_for': ['real_time', 'quick_analysis', 'batch_processing']
             },
             'olmoearth_nano': {
-                'path': r"C:\Users\DELL\Safety-project\safetrack-pro-backend\environmental_models\models\olmoearth_nano",
+                'path': str(models_root / 'olmoearth_nano'),
                 'strength': 'fastest',
                 'embedding_dim': 2048,
                 'use_for': ['real_time', 'edge_processing', 'quick_analysis']
             },
             'vision_aq': {
-                'path': r"C:\Users\DELL\Safety-project\safetrack-pro-backend\environmental_models\models\vision_aq",
+                'path': str(models_root / 'vision_aq'),
                 'strength': 'air_quality',
                 'embedding_dim': 2048,
                 'use_for': ['air_quality', 'pollution_detection', 'aqi_forecast']
             },
             'ecosystem_monitor': {
-                'path': r"C:\Users\DELL\Safety-project\safetrack-pro-backend\environmental_models\models\ecosystem_monitor",
+                'path': str(models_root / 'ecosystem_monitor'),
                 'strength': 'ecosystem',
                 'embedding_dim': 2048,
                 'use_for': ['ecosystem_analysis', 'biodiversity', 'land_cover_segmentation']
             }
         }
         
+        # ⬇⬇⬇ EVERYTHING ELSE STAYS EXACTLY THE SAME ⬇⬇⬇
         loaded_count = 0
         
-        # Try to load each model
         for model_name, config in model_configs.items():
             try:
                 model_path = Path(config['path'])
@@ -49645,7 +49245,6 @@ class AdvancedEnvironmentalAIService:
                 
                 logger.info(f"📥 Loading {model_name} (strength: {config['strength']})...")
                 
-                # Load model using custom loader
                 result = EnvironmentalModelLoader.auto_load(model_path, self.device)
                 
                 if result and result.get('model') is not None:
@@ -58849,7 +58448,7 @@ class EnvironmentalModelLoader:
                     return None
             
             # Load the model
-            checkpoint = torch.load(pt_files[0], map_location=device)
+            checkpoint = torch.load(pt_files[0], map_location=device, weights_only=False)
             
             model = None
             embedding_dim = 768
@@ -59578,7 +59177,16 @@ class KalmanBoxTracker(object):
             self.time_since_update += 1
 
 class YOLOv8SafetyDetector:
-    def __init__(self, model_path=r'C:\Users\DELL\Downloads\checkpoint_20251205_164718_last.pt', debug_mode=False):
+    def __init__(self, model_path=None, debug_mode=False):
+        # ✅ Volume-aware model path (no more C:\Users\...)
+        if model_path is None:
+            model_path = os.environ.get("YOLO_MODEL_PATH")
+        if model_path is None:
+            volume_path = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "/app/data")
+            model_path = os.path.join(
+                volume_path, "yolov8", "checkpoint_20251205_164718_last.pt"
+            )
+        
         # SINGLE CONFIDENCE THRESHOLD
         self.confidence_threshold = 0.15
         
@@ -59603,13 +59211,16 @@ class YOLOv8SafetyDetector:
         try:
             logger.info(f"🔄 Loading trained safety model from: {model_path}")
             
-            # Check if file exists
+            # ✅ Volume-aware fallback paths (no more C:\Users\...)
             if not os.path.exists(model_path):
                 logger.warning(f"⚠️ Model file not found: {model_path}")
+                volume_path = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "/app/data")
                 alt_paths = [
-                    'yolov8/last.pt',
-                    'yolov8/best.pt',
-                    r'C:\Users\DELL\Downloads\checkpoint_20251205_164718_last.pt'
+                    os.path.join(volume_path, "yolov8", "last.pt"),
+                    os.path.join(volume_path, "yolov8", "best.pt"),
+                    os.path.join(volume_path, "yolov8", "checkpoint_20251205_164718_last.pt"),
+                    "yolov8/last.pt",
+                    "yolov8/best.pt",
                 ]
                 for alt_path in alt_paths:
                     if os.path.exists(alt_path):
@@ -59649,7 +59260,7 @@ class YOLOv8SafetyDetector:
             if self.model_info['classes']:
                 logger.info(f"📋 Classes: {list(self.model_info['classes'].values())}")
             
-            # Define safety-specific hazard mapping
+            # ⬇⬇⬇ EVERYTHING FROM HERE DOWN — UNCHANGED ⬇⬇⬇
             self.hazard_mapping = {
                 'ladder': 'equipment_hazard',
                 'worker': 'worker',
@@ -59672,7 +59283,6 @@ class YOLOv8SafetyDetector:
                 'fire': 'fire_hazard',
             }
             
-            # CLASS-SPECIFIC CONFIDENCE THRESHOLDS
             self.class_min_conf = {
                 'ladder': 0.05,
                 'chemical': 0.12,
@@ -59693,9 +59303,8 @@ class YOLOv8SafetyDetector:
                 'Ear Muffs': 0.12,
                 'Gloves': 0.12,
                 'Safety Glasses': 0.15,
-            }     
+            }
             
-            # Detection statistics with NMS tracking
             self.detection_stats = {
                 'total_frames': 0,
                 'total_detections': 0,
@@ -59713,11 +59322,9 @@ class YOLOv8SafetyDetector:
                 'unique_persons_tracked': 0
             }
             
-            # Previous detections for NMS and duplicate prevention
             self.previous_detections = []
             self.last_detection_time = time.time()
             
-            # Test the model with webcam simulation
             self._test_model_functionality()
             
         except Exception as e:
@@ -61543,10 +61150,18 @@ class YOLOv8SafetyDetector:
 class YOLOv8HazardDetector(YOLOv8SafetyDetector):
     """Hazard Detector for backward compatibility"""
     
-    def __init__(self, model_path=r'C:\Users\DELL\Downloads\checkpoint_20251205_164718_last.pt', debug_mode=True):
+    def __init__(self, model_path=None, debug_mode=True):
+        # ✅ Volume-aware default path (no more C:\Users\...)
+        if model_path is None:
+            volume_path = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "/app/data")
+            model_path = os.path.join(
+                volume_path, "yolov8", "checkpoint_20251205_164718_last.pt"
+            )
+        
         super().__init__(model_path=model_path, debug_mode=debug_mode)
         self.detect_hazards = self.detect_safety_hazards
         logger.info(f"✅ YOLOv8 Hazard Detector initialized (debug_mode: {debug_mode})")
+        logger.info(f"🎯 Model path: {model_path}")
         logger.info(f"🎯 Confidence threshold: {self.confidence_threshold}")
         logger.info(f"👤 Tracking enabled: SORT tracker active")
     
@@ -61570,7 +61185,6 @@ class YOLOv8HazardDetector(YOLOv8SafetyDetector):
                 'camera_id': camera_id
             }
             return fallback_analysis, frame
-
 
 # ============================================
 # GLOBAL FUNCTIONS
@@ -69004,44 +68618,56 @@ class YOLOv8HazardDetector(YOLOv8SafetyDetector):
     """
     Hazard Detector that extends Safety Detector for backward compatibility
     """
-    def __init__(self, model_path='yolov8/checkpoint_20251204_224700_best.pt'):
+    def __init__(self, model_path=None):
+        # ✅ Default to the volume path if not provided
+        if model_path is None:
+            volume_path = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "/app/data")
+            model_path = os.path.join(
+                volume_path, "yolov8", "checkpoint_20251204_224700_best.pt"
+            )
+
         # Initialize the parent safety detector
         super().__init__(model_path)
-        
+
         # Alias methods for compatibility with existing code
         self.detect_hazards = self.detect_safety_hazards
         self.analyze = self.analyze_frame
-        
+
         logger.info("✅ YOLOv8 Hazard Detector initialized (backward compatibility)")
-    
+
     def detect(self, image, conf_threshold=0.25):
         """Alias method for detect_safety_hazards"""
         return self.detect_safety_hazards(image, conf_threshold)
 
 class AdvancedConstructionAIService:
-    def __init__(self, model_dir='./ml_models'):
+    def __init__(self, model_dir=None):
+        # ✅ Use Railway volume path if available
+        volume_path = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "/app/data")
+        if model_dir is None:
+            model_dir = os.path.join(volume_path, "ml_models")
+
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.model_dir = Path(model_dir)
-        self.model_dir.mkdir(exist_ok=True)
-        
+        self.model_dir.mkdir(parents=True, exist_ok=True)  # ✅ parents=True
+
         logger.info(f"🚀 Initializing AdvancedConstructionAIService on {self.device}")
         logger.info(f"📁 Model directory: {self.model_dir.absolute()}")
-        
+
         # Initialize models
         self.risk_model = self._initialize_risk_model()
         self.hazard_detector = self._initialize_hazard_detector()
-        
+
         # Initialize supporting components
         self.scaler = StandardScaler()
         self.anomaly_detector = IsolationForest(contamination=0.1, random_state=42, n_jobs=-1)
         self.incident_predictor = RandomForestRegressor(
-            n_estimators=100, 
-            random_state=42, 
+            n_estimators=100,
+            random_state=42,
             n_jobs=-1,
             max_depth=20,
             min_samples_split=5
         )
-        
+
         # Initialize with training data
         self._initialize_components()
         logger.info("✅ AdvancedConstructionAIService initialized successfully")
