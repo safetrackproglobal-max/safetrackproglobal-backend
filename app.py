@@ -143999,7 +143999,7 @@ def _log_initialization_error(e):
         'traceback': traceback.format_exc(),
         'timestamp': datetime.now().isoformat()
     }
-    
+
 if __name__ == '__main__':
     print("\n" + "="*60)
     print("🚀 Starting SafetyTrack Pro Application")

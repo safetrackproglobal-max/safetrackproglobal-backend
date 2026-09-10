@@ -2,7 +2,6 @@
 
 WORKDIR /app
 
-# Install system dependencies
 RUN apt-get update && apt-get install -y \
     libgl1-mesa-dri \
     libglib2.0-0 \
@@ -16,14 +15,11 @@ RUN apt-get update && apt-get install -y \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Upgrade pip
 RUN pip install --no-cache-dir --upgrade pip
 
-# Install Python packages
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application code (NO .env, NO models, NO data)
 COPY app.py .
 COPY classes.py .
 COPY models.py .
@@ -33,15 +29,12 @@ COPY usermodels.py .
 COPY language_middleware.py .
 COPY extensions.py .
 
-
-
-# Create required directories
 RUN mkdir -p uploads detection_results generated_certificates generated_documents sessions static model_cache
 
 ENV PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1 \
-    PORT=8000
+    PYTHONDONTWRITEBYTECODE=1
 
 EXPOSE 8000
 
-CMD ["python", "app.py"]
+# ✅ Shell form for $PORT expansion + module-level app
+CMD gunicorn app:app --bind 0.0.0.0:${PORT:-8000} --workers 1 --threads 4 --timeout 300
