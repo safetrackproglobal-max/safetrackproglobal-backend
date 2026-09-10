@@ -33,9 +33,7 @@ COPY usermodels.py .
 COPY language_middleware.py .
 COPY extensions.py .
 
-# Copy small folders only
-COPY static/ ./static/
-COPY hse_documents/ ./hse_documents/
+
 
 # Create required directories
 RUN mkdir -p uploads detection_results generated_certificates generated_documents sessions static model_cache
