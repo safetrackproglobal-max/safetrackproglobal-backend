@@ -13,6 +13,14 @@ RUN apt-get update && apt-get install -y \
     gcc \
     wget \
     curl \
+    libpango-1.0-0 \
+    libpangoft2-1.0-0 \
+    libpangocairo-1.0-0 \
+    libcairo2 \
+    libgdk-pixbuf-2.0-0 \
+    libffi-dev \
+    shared-mime-info \
+    fonts-dejavu-core \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --no-cache-dir --upgrade pip
@@ -36,5 +44,4 @@ ENV PYTHONUNBUFFERED=1 \
 
 EXPOSE 8000
 
-# ✅ Shell form for $PORT expansion + module-level app
 CMD gunicorn app:app --bind 0.0.0.0:${PORT:-8000} --workers 1 --threads 4 --timeout 300
