@@ -3529,10 +3529,8 @@ class UrbanHeatIslandRecord(db.Model):
     # Metadata
     measurement_date = db.Column(db.DateTime, default=datetime.utcnow)
     season = db.Column(db.String(20))  # Summer, Winter, etc.
-    time_of_day = db.Column(db.String(20))  # Day, Night, Dawn, Dusk
+    time_of_day = db.Column(db.String(20)) 
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    
-    # Foreign keys
     analysis_id = db.Column(db.Integer, db.ForeignKey('thermal_analysis_results.id'))
     
     __table_args__ = (

@@ -887,10 +887,6 @@ class AdvancedComputerVisionSystem:
             logger.error(f"YOLO detection failed: {e}")
             return self._fallback_violation_detection(image_path, industry)
 
-    # ============================================================
-    # OpenCV Fallback Detection (unchanged — keeps working)
-    # ============================================================
-
     def _fallback_violation_detection(self, image_path: str, industry: str) -> Dict:
         """Advanced fallback using OpenCV when YOLO is unavailable"""
         try:
@@ -144014,8 +144010,7 @@ if __name__ == '__main__':
     print("\n" + "="*60)
     print("🚀 Starting System Initialization")
     print("="*60)
-    
-    # ✅ CRITICAL: Wrap everything in app context
+   
     with app.app_context():
         init_result = initialize_system()
         

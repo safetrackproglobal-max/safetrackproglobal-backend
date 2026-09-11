@@ -36,12 +36,8 @@ COPY safetytrack_bridge.py .
 COPY usermodels.py .
 COPY language_middleware.py .
 COPY extensions.py .
-
 RUN mkdir -p uploads detection_results generated_certificates generated_documents sessions static model_cache
-
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
-
 EXPOSE 8000
-
 CMD gunicorn app:app --bind 0.0.0.0:${PORT:-8000} --workers 1 --threads 4 --timeout 300

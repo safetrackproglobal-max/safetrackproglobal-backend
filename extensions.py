@@ -19,9 +19,3 @@ mail = Mail()
 jwt = JWTManager()
 limiter = Limiter(key_func=get_remote_address)
 
-# Optional: Add any other extensions you use
-# from flask_migrate import Migrate
-# migrate = Migrate()
-
-# from celery import Celery
-# celery = Celery()

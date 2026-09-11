@@ -14,7 +14,6 @@
 !static/
 !hse_documents/
 
-# Explicitly exclude secrets and data
 .env
 .env.*
 *.env

@@ -82,7 +82,6 @@ language_middleware = LanguageMiddleware()
 # Usage example:
 @language_middleware.wrap_ai_endpoint
 def analyze_symptoms(data):
-    # Your existing AI logic here
-    # data already contains language parameter
+   
     result = ai_model.predict(data['symptoms'])
     return result

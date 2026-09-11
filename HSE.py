@@ -9,9 +9,6 @@ import sys
 import io
 import locale
 
-
-
-
 class Industry(Enum):
     """Comprehensive industry classification for HSE"""
     CONSTRUCTION = "Construction"

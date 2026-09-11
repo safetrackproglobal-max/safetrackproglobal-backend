@@ -10,7 +10,6 @@ import bcrypt
 class User(db.Model):
     __tablename__ = 'users'
     
-    # ==================== BASIC FIELDS ====================
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(db.String(128), nullable=False)
     email = db.Column(db.String(128), unique=True, nullable=False, index=True)
@@ -31,8 +30,6 @@ class User(db.Model):
     company_name = db.Column(db.String(256))
     company_logo = db.Column(db.String(512))
     timezone = db.Column(db.String(64), default='UTC')
-    
-    # ==================== USER TYPE & ADMIN ====================
     user_type = db.Column(db.String(20), default='user')
     role = db.Column(db.String(64), default='user')
     is_system_team = db.Column(db.Boolean, default=False)
