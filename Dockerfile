@@ -40,4 +40,4 @@ RUN mkdir -p uploads detection_results generated_certificates generated_document
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 EXPOSE 8000
-CMD gunicorn app:app --bind 0.0.0.0:${PORT:-8000} --workers 1 --threads 4 --timeout 300
+CMD gunicorn app:app --bind 0.0.0.0:${PORT:-8000} --workers 1 --threads 4 --timeout 900 --graceful-timeout 60

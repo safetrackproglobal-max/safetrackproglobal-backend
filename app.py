@@ -68090,18 +68090,21 @@ _environmental_ai_service_instance = None
 ENVIRONMENTAL_AI_AVAILABLE = False
 
 def initialize_environmental_ai_service():
-    """Initialize the Environmental AI Service with all models"""
     global _environmental_ai_service_instance, ENVIRONMENTAL_AI_AVAILABLE
     
     try:
-        # Create the service instance
+        import os
+        _volume_root = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "/app/data")
+        _model_base = os.path.join(_volume_root, "environmental_models")
+        
+        logger.info(f"🌍 Initializing Environmental AI from: {_model_base}")
+        
         _environmental_ai_service_instance = AdvancedEnvironmentalAIService(
-            model_base_path="./environmental_ai_models",
+            model_base_path=_model_base,
             cache_size=500,
             num_workers=4
         )
         
-        # Check if models loaded successfully
         if _environmental_ai_service_instance.downloaded_models or _environmental_ai_service_instance.models:
             ENVIRONMENTAL_AI_AVAILABLE = True
             logger.info("✅ Environmental AI Service initialized successfully")
