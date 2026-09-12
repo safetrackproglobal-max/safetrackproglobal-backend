@@ -2723,11 +2723,7 @@ def create_app():
             environment=os.getenv('ENVIRONMENT', 'production')
         )
     
-    # ✅ Local imports (at the correct indentation — inside create_app)
-    from classes import *
-    from models import *
-    from HSE import *
-    
+   
     # ✅ Initialize extensions
     db.init_app(app)
     jwt.init_app(app)
@@ -2809,6 +2805,9 @@ def create_app():
     
     return app
 
+from classes import *
+from models import *
+from HSE import *
 
 app = create_app()
 # Initialize Paystack with enhanced error handling
