@@ -2766,7 +2766,7 @@ def create_app():
         'https://safetrackproglobal.com',
         'https://safetrack-pro-frontend.vercel.app',
         'https://safetrackproglobal.com',
-        
+        'https://safetrackproglobal-backend-production.up.railway.app',
         'http://localhost:3000',
         'http://127.0.0.1:3000',
         'http://127.0.0.1:5000',
@@ -2857,7 +2857,7 @@ def add_cors_headers(response):
     allowed_origins = [
         'http://localhost:3000',
         'http://127.0.0.1:3000',
-        
+        'https://safetrackproglobal-backend-production.up.railway.app',
         'https://www.safetrackproglobal.com',
         'https://safetrackproglobal.com',
         'https://safetrack-pro-frontend.vercel.app',
@@ -7497,7 +7497,7 @@ def health_check():
         db_status = f'unhealthy: {str(e)}'
     
     # Check AI models status
-    ai_status = ai_manager.get_status()
+    ai_status = ai_manager.get_status() if ai_manager is not None else 'unavailable'
     
     # Check computer vision system
     cv_status = 'available' if cv_system.yolov5_available else 'unavailable'
@@ -68090,18 +68090,21 @@ _environmental_ai_service_instance = None
 ENVIRONMENTAL_AI_AVAILABLE = False
 
 def initialize_environmental_ai_service():
-    """Initialize the Environmental AI Service with all models"""
     global _environmental_ai_service_instance, ENVIRONMENTAL_AI_AVAILABLE
     
     try:
-        # Create the service instance
+        import os
+        _volume_root = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "/app/data")
+        _model_base = os.path.join(_volume_root, "environmental_models")
+        
+        logger.info(f"🌍 Initializing Environmental AI from: {_model_base}")
+        
         _environmental_ai_service_instance = AdvancedEnvironmentalAIService(
-            model_base_path="./environmental_ai_models",
+            model_base_path=_model_base,
             cache_size=500,
             num_workers=4
         )
         
-        # Check if models loaded successfully
         if _environmental_ai_service_instance.downloaded_models or _environmental_ai_service_instance.models:
             ENVIRONMENTAL_AI_AVAILABLE = True
             logger.info("✅ Environmental AI Service initialized successfully")
