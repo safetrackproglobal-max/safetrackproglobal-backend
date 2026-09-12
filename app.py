@@ -2607,7 +2607,6 @@ def create_app():
     _db_url = os.getenv('DATABASE_URL') or os.getenv('DATABASE_URI')
     if not _db_url:
         raise RuntimeError("DATABASE_URL is not set — Postgres is required")
-    # SQLAlchemy 2.x requires 'postgresql://', not 'postgres://'
     if _db_url.startswith('postgres://'):
         _db_url = _db_url.replace('postgres://', 'postgresql://', 1)
     
@@ -2618,12 +2617,8 @@ def create_app():
         # Security & Authentication
         SECRET_KEY=os.getenv('SECRET_KEY', 'dev-secret-key'),
         JWT_SECRET_KEY=os.getenv('JWT_SECRET_KEY', 'jwt-secret-key'),
-        JWT_ACCESS_TOKEN_EXPIRES=timedelta(
-            hours=int(os.getenv('JWT_ACCESS_TOKEN_HOURS', '24'))
-        ),
-        JWT_REFRESH_TOKEN_EXPIRES=timedelta(
-            days=int(os.getenv('JWT_REFRESH_TOKEN_DAYS', '30'))
-        ),
+        JWT_ACCESS_TOKEN_EXPIRES=timedelta(hours=int(os.getenv('JWT_ACCESS_TOKEN_HOURS', '24'))),
+        JWT_REFRESH_TOKEN_EXPIRES=timedelta(days=int(os.getenv('JWT_REFRESH_TOKEN_DAYS', '30'))),
         
         # ✅ Database — Postgres only
         SQLALCHEMY_DATABASE_URI=_db_url,
@@ -2676,22 +2671,20 @@ def create_app():
         DEBUG=os.getenv('DEBUG', 'False').lower() == 'true',
         LOG_LEVEL=os.getenv('LOG_LEVEL', 'INFO'),
         
-        # API Keys & External Services
+        # API Keys
         SENTRY_DSN=os.getenv('SENTRY_DSN'),
         NEW_RELIC_LICENSE_KEY=os.getenv('NEW_RELIC_LICENSE_KEY'),
         
-        # AI/ML Models Configuration
+        # AI/ML Configuration
         AI_MODELS_ENABLED=os.getenv('AI_MODELS_ENABLED', 'True').lower() == 'true',
         HUGGINGFACE_API_KEY=os.getenv('HUGGINGFACE_API_KEY', ''),
-        
-        # Pre-trained Models Configuration
         MODEL_CACHE_DIR=os.getenv(
             'MODEL_CACHE_DIR',
             os.path.join(os.environ.get('RAILWAY_VOLUME_MOUNT_PATH', '/app/data'), 'model_cache')
         ),
         MODEL_DOWNLOAD_TIMEOUT=int(os.getenv('MODEL_DOWNLOAD_TIMEOUT', '300')),
         
-        # ✅ Computer Vision Models — volume path, not Windows path
+        # ✅ CV Models — volume path, not Windows path
         YOLO_MODEL_PATH=os.getenv(
             'YOLO_MODEL_PATH',
             os.path.join(os.environ.get('RAILWAY_VOLUME_MOUNT_PATH', '/app/data'), 'yolov8')
@@ -2704,11 +2697,9 @@ def create_app():
         NER_MODEL=os.getenv('NER_MODEL', 'dslim/bert-base-NER'),
         MEDICAL_NER_MODEL=os.getenv('MEDICAL_NER_MODEL', 'samrawal/bert-base-uncased_clinical-ner'),
         
-        # Safety Analysis Models
         RISK_ASSESSMENT_MODEL=os.getenv('RISK_ASSESSMENT_MODEL', 'nickmuchi/financial-risk-assessment'),
         COMPLIANCE_MODEL=os.getenv('COMPLIANCE_MODEL', 'microsoft/deberta-v3-base'),
         
-        # Model Performance
         MODEL_BATCH_SIZE=int(os.getenv('MODEL_BATCH_SIZE', '8')),
         MODEL_MAX_LENGTH=int(os.getenv('MODEL_MAX_LENGTH', '512')),
         MODEL_DEVICE=os.getenv('MODEL_DEVICE', 'cuda' if torch.cuda.is_available() else 'cpu'),
@@ -2732,20 +2723,29 @@ def create_app():
             environment=os.getenv('ENVIRONMENT', 'production')
         )
     
+    # ✅ Local imports (at the correct indentation — inside create_app)
+    from classes import *
+    from models import *
+    from HSE import *
     
-
-    # Initialize extensions
+    # ✅ Initialize extensions
     db.init_app(app)
     jwt.init_app(app)
     mail.init_app(app)
-    socketio.init_app(app, cors_allowed_origins="*")
     limiter.init_app(app)
-
+    
+    # ✅ Create Postgres tables on startup (idempotent)
+    with app.app_context():
+        try:
+            db.create_all()
+            logger.info("✅ Postgres tables created/verified")
+        except Exception as e:
+            logger.error(f"❌ Failed to create tables: {e}")
+    
     # YOLOv5 Activation
     with app.app_context():
         try:
             cv_system = AdvancedComputerVisionSystem()
-            
             cv_system.yolov5_available = True
             
             model_files = {
@@ -2764,7 +2764,6 @@ def create_app():
                     app.logger.warning(f"⚠ {industry}: {model_file} - MISSING")
             
             app.cv_system = cv_system
-            
             app.logger.info("🎉 YOLOv5 ACTIVATED SUCCESSFULLY!")
             
         except Exception as e:
@@ -2772,66 +2771,44 @@ def create_app():
             app.cv_system = AdvancedComputerVisionSystem()
             app.cv_system.yolov5_available = False
     
-
-
-    # Initialize CORS with proper configuration
+    # ✅ CORS setup
     ALLOWED_ORIGINS = [
         'https://www.safetrackproglobal.com',
         'https://safetrackproglobal.com',
         'https://safetrack-pro-frontend.vercel.app',
-        'https://safetrackproglobal.com',
         'https://safetrackproglobal-backend-production.up.railway.app',
         'http://localhost:3000',
         'http://127.0.0.1:3000',
         'http://127.0.0.1:5000',
         'http://localhost:5000',
-        'http://localhost:3000'
     ]
     
-    # ✅ Initialize CORS once
-    CORS(app, 
+    CORS(app,
          origins=ALLOWED_ORIGINS,
          supports_credentials=True,
          methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
          allow_headers=[
-             "Content-Type", 
-             "Authorization", 
-             "X-Requested-With",
-             "X-Industry-Standard",
-             "X-Client-Version", 
-             "X-Industry-Type",
-             "X-Module",
-             "X-Standards",
-             "X-Compliance-Level",
-             "X-Healthcare-Facility",
-             "X-User-Role",
-             "X-HIPAA-Compliant",
-             "X-Data-Sensitivity",
-             "X-Healthcare-Version",
-             "X-Healthcare-Context"
-             "X-Healthcare-Facility",      
-             "X-User-Role",                
-             "X-HIPAA-Compliant",          
-             "X-Data-Sensitivity",         
-             "X-Healthcare-Version",       
-             "X-Healthcare-Context",       
-             "X-User-Plan",                
-             "X-Is-Super-Admin"
+             "Content-Type", "Authorization", "X-Requested-With",
+             "X-Industry-Standard", "X-Client-Version", "X-Industry-Type",
+             "X-Module", "X-Standards", "X-Compliance-Level",
+             "X-Healthcare-Facility", "X-User-Role", "X-HIPAA-Compliant",
+             "X-Data-Sensitivity", "X-Healthcare-Version", "X-Healthcare-Context",
+             "X-User-Plan", "X-Is-Super-Admin"
          ],
          expose_headers=["Content-Range", "X-Content-Range"],
          max_age=3600
     )
-
-   
+    
+    # ✅ SocketIO — async only, NO cors_allowed_origins (Flask-CORS handles it)
     socketio.init_app(
         app,
-        cors_allowed_origins=ALLOWED_ORIGINS,
         async_mode='gevent',
         logger=True,
         engineio_logger=True
     )
-
+    
     return app
+
 
 app = create_app()
 # Initialize Paystack with enhanced error handling
@@ -2856,8 +2833,6 @@ for dir_name, dir_path in UPLOAD_DIRS.items():
 # Create models directory for ML models
 os.makedirs(MODELS_DIR, exist_ok=True)
 
-# ===== INITIALIZE CV SYSTEM =====
-cv_system = AdvancedComputerVisionSystem()
 
 @app.after_request
 def add_cors_headers(response):
@@ -2892,9 +2867,6 @@ def add_cors_headers(response):
 
 
 # ===== LOCAL IMPORTS =====
-from classes import *
-from models import *
-from HSE import *
 
 class BackblazeB2Manager:
     def __init__(self):
@@ -30377,7 +30349,7 @@ def send_admin_payment_notification(admin, user, payment):
                     </ol>
                     
                     <p style="text-align: center;">
-                        <a href="{app.config.get('ADMIN_URL', 'http://localhost:3000/admin/payments')}" class="button">
+                        <a href="{app.config.get('ADMIN_URL', 'http://safetrackproglobal.com/admin/payments')}" class="button">
                             Go to Admin Dashboard
                         </a>
                     </p>
@@ -32656,7 +32628,7 @@ def send_payment_confirmation_email(user, payment):
                     </div>
                     
                     <div style="text-align: center; margin: 25px 0;">
-                        <a href="{app.config.get('FRONTEND_URL', 'http://localhost:3000')}/dashboard" 
+                        <a href="{app.config.get('FRONTEND_URL', 'http://safetrackproglobal.com')}/dashboard" 
                            style="background: #1890ff; color: white; padding: 12px 30px; text-decoration: none; border-radius: 5px; display: inline-block;">
                             Go to Dashboard
                         </a>
@@ -32832,7 +32804,7 @@ def send_payment_reminder_email(user, payment):
                     </div>
                     
                     <div style="text-align: center; margin: 25px 0;">
-                        <a href="{app.config.get('FRONTEND_URL', 'http://localhost:3000')}/pricing" 
+                        <a href="{app.config.get('FRONTEND_URL', 'http://safetrackproglobal.com')}/pricing" 
                            style="background: #1890ff; color: white; padding: 12px 30px; text-decoration: none; border-radius: 5px; display: inline-block;">
                             Complete Payment
                         </a>
@@ -35481,7 +35453,7 @@ def send_welcome_email(user, password, created_by_admin):
         from app import mail
         
         # Get base URL from request or app config
-        base_url = request.host_url if request else current_app.config.get('BASE_URL', 'http://localhost:3000')
+        base_url = request.host_url if request else current_app.config.get('BASE_URL', 'http://safetrackproglobal.com')
         login_url = f"{base_url}login"
         
         subject = f"Welcome to SafetyTrack Pro - Your Account is Ready!"
@@ -39320,7 +39292,7 @@ def send_employee_welcome_email(email, name, employee_id, password, company_name
                     </div>
                     
                     <div style="text-align: center; margin: 20px 0;">
-                        <a href="{app.config.get('FRONTEND_URL', 'http://localhost:3000')}/login" 
+                        <a href="{app.config.get('FRONTEND_URL', 'http://safetrackproglobal.com')}/login" 
                            style="background: #1890ff; color: white; padding: 12px 30px; text-decoration: none; border-radius: 5px; display: inline-block;">
                             Login to Your Account
                         </a>
@@ -41867,7 +41839,7 @@ def send_admin_approval_notification(super_admin_email, admin_user):
                     <p>Please review this application in the admin panel and approve or reject it.</p>
                     
                     <p>
-                        <a href="{os.getenv('ADMIN_PANEL_URL', 'http://localhost:3000/admin')}" class="button">
+                        <a href="{os.getenv('ADMIN_PANEL_URL', 'http://safetrackproglobal.com/admin')}" class="button">
                             Go to Admin Panel
                         </a>
                     </p>
@@ -41901,7 +41873,7 @@ def send_admin_approval_notification(super_admin_email, admin_user):
 
         Please review this application in the admin panel and approve or reject it.
 
-        Admin Panel: {os.getenv('ADMIN_PANEL_URL', 'http://localhost:3000/admin')}
+        Admin Panel: {os.getenv('ADMIN_PANEL_URL', 'http://safetrackproglobal.com/admin')}
 
         Best regards,
         The SafetyTrack Pro System
@@ -101086,7 +101058,7 @@ def get_incident_timeline(incident_id):
 
 def get_base_url():
     """Get base URL for email links"""
-    return os.getenv('FRONTEND_URL', 'http://localhost:3000')
+    return os.getenv('FRONTEND_URL', 'http://safetrackproglobal.com')
 
 def send_status_update_email(recipient: User, incident: Incident, new_status: str, notes: str = ''):
     """Send incident status update email"""
@@ -115119,7 +115091,7 @@ def send_welcome_email(doctor):
             <li><strong>Hospital:</strong> {doctor.hospital.name if doctor.hospital else 'N/A'}</li>
         </ul>
         <p>You can now log in to access your patient dashboard.</p>
-        <p><a href="{app.config.get('FRONTEND_URL', 'http://localhost:3000')}/doctor/login">Login Here</a></p>
+        <p><a href="{app.config.get('FRONTEND_URL', 'http://safetrackproglobal.com')}/doctor/login">Login Here</a></p>
         <br>
         <p>Best regards,<br>Hospital Management Team</p>
         """
@@ -115144,7 +115116,7 @@ def send_welcome_email(doctor):
             <li><strong>Hospital:</strong> {doctor.hospital.name if doctor.hospital else 'N/A'}</li>
         </ul>
         <p>You can now log in to access your patient dashboard.</p>
-        <p><a href="{app.config.get('FRONTEND_URL', 'http://localhost:3000')}/doctor/login">Login Here</a></p>
+        <p><a href="{app.config.get('FRONTEND_URL', 'http://safetrackproglobal.com')}/doctor/login">Login Here</a></p>
         <br>
         <p>Best regards,<br>Hospital Management Team</p>
         """
@@ -115166,7 +115138,7 @@ def send_login_notification(doctor):
         <p><strong>Employee ID:</strong> {doctor.employee_id}</p>
         <p><strong>Email:</strong> {doctor.email}</p>
         <p>If this was not you, please reset your password immediately.</p>
-        <p><a href="{app.config.get('FRONTEND_URL', 'http://localhost:3000')}/doctor/reset-password">Reset Password</a></p>
+        <p><a href="{app.config.get('FRONTEND_URL', 'http://safetrackproglobal.com')}/doctor/reset-password">Reset Password</a></p>
         <br>
         <p>Best regards,<br>Hospital Management Team</p>
         """
@@ -115178,7 +115150,7 @@ def send_login_notification(doctor):
 def send_password_reset_email(doctor, reset_token):
     """Send password reset email"""
     try:
-        reset_link = f"{app.config.get('FRONTEND_URL', 'http://localhost:3000')}/doctor/reset-password/confirm?token={reset_token}"
+        reset_link = f"{app.config.get('FRONTEND_URL', 'http://safetrackproglobal.com')}/doctor/reset-password/confirm?token={reset_token}"
         subject = "Password Reset Request"
         body = f"""
         <h2>Password Reset Request</h2>
@@ -115231,7 +115203,7 @@ def send_patient_assigned_email(patient, doctor):
             <li><strong>Status:</strong> {patient.status}</li>
             <li><strong>Bed:</strong> {f'#{patient.bed_number}' if patient.bed_number else 'Not assigned'}</li>
         </ul>
-        <p><a href="{app.config.get('FRONTEND_URL', 'http://localhost:3000')}/doctor/patients/{patient.id}">View Patient Details</a></p>
+        <p><a href="{app.config.get('FRONTEND_URL', 'http://safetrackproglobal.com')}/doctor/patients/{patient.id}">View Patient Details</a></p>
         <br>
         <p>Best regards,<br>Hospital Management Team</p>
         """
@@ -131230,7 +131202,7 @@ def create_paypal_payment():
         transaction_id = f"PAYPAL-{user_id}-{int(time.time())}-{uuid.uuid4().hex[:8].upper()}"
         
         # Get frontend URL for redirects
-        frontend_url = app.config.get('FRONTEND_URL', 'http://localhost:3000')
+        frontend_url = app.config.get('FRONTEND_URL', 'http://safetrackproglobal.com')
         
         # ✅ FIX: Shorten the custom data - keep it under 256 characters
         # Store only essential data in the custom field
@@ -131379,7 +131351,7 @@ def execute_paypal_payment():
         payment_id = request.args.get('paymentId')
         payer_id = request.args.get('PayerID')
         
-        frontend_url = app.config.get('FRONTEND_URL', 'http://localhost:3000')
+        frontend_url = app.config.get('FRONTEND_URL', 'http://safetrackproglobal.com')
         
         if not payment_id or not payer_id:
             return redirect(f"{frontend_url}/payment-failed?error=missing_params")
@@ -131493,7 +131465,7 @@ def execute_paypal_payment():
         logging.error(f"❌ PayPal execute error: {e}")
         import traceback
         traceback.print_exc()
-        frontend_url = app.config.get('FRONTEND_URL', 'http://localhost:3000')
+        frontend_url = app.config.get('FRONTEND_URL', 'http://safetrackproglobal.com')
         return redirect(f"{frontend_url}/payment-failed?error=execute_error")
 
 @app.route('/api/payment/paypal/webhook', methods=['POST'])
@@ -131666,7 +131638,7 @@ def create_paypal_payment_public():
         transaction_id = f"PAYPAL-SIGNUP-{int(time.time())}-{uuid.uuid4().hex[:8].upper()}"
         
         # Get frontend URL for redirects
-        frontend_url = app.config.get('FRONTEND_URL', 'http://localhost:3000')
+        frontend_url = app.config.get('FRONTEND_URL', 'http://safetrackproglobal.com')
         
         # Store data in shortened format for custom field
         custom_data = {
@@ -131820,7 +131792,7 @@ def execute_paypal_payment_public():
         payment_id = request.args.get('paymentId')
         payer_id = request.args.get('PayerID')
         
-        frontend_url = app.config.get('FRONTEND_URL', 'http://localhost:3000')
+        frontend_url = app.config.get('FRONTEND_URL', 'http://safetrackproglobal.com')
         
         if not payment_id or not payer_id:
             return redirect(f"{frontend_url}/payment-failed?error=missing_params")
@@ -131882,7 +131854,7 @@ def execute_paypal_payment_public():
         logging.error(f"❌ PayPal execute error: {e}")
         import traceback
         traceback.print_exc()
-        frontend_url = app.config.get('FRONTEND_URL', 'http://localhost:3000')
+        frontend_url = app.config.get('FRONTEND_URL', 'http://safetrackproglobal.com')
         return redirect(f"{frontend_url}/payment-failed?error=execute_error")
 
 @app.route('/api/payment/paystack/initialize', methods=['POST'])
@@ -131976,7 +131948,7 @@ def initialize_paystack_payment():
             
             return jsonify({
                 'success': True,
-                'authorization_url': f"{app.config.get('FRONTEND_URL', 'http://localhost:3000')}/mock-payment?reference={reference}",
+                'authorization_url': f"{app.config.get('FRONTEND_URL', 'http://safetrackproglobal.com')}/mock-payment?reference={reference}",
                 'reference': reference,
                 'access_code': f"mock_access_{reference}",
                 'mock': True,
@@ -132092,7 +132064,7 @@ def paystack_public_callback():
         reference = request.args.get('reference')
         
         if not reference:
-            return redirect(f"{app.config.get('FRONTEND_URL', 'http://localhost:3000')}/payment-failed?error=no_reference")
+            return redirect(f"{app.config.get('FRONTEND_URL', 'http://safetrackproglobal.com')}/payment-failed?error=no_reference")
         
         # Find payment in your database
         payment = Payment.query.filter_by(transaction_id=reference).first()
@@ -132103,7 +132075,7 @@ def paystack_public_callback():
         
         if not payment:
             logger.error(f"Payment not found for reference: {reference}")
-            return redirect(f"{app.config.get('FRONTEND_URL', 'http://localhost:3000')}/payment-failed?error=payment_not_found")
+            return redirect(f"{app.config.get('FRONTEND_URL', 'http://safetrackproglobal.com')}/payment-failed?error=payment_not_found")
         
         # Verify transaction with Paystack
         if PAYSTACK_AVAILABLE and paystack:
@@ -132192,9 +132164,9 @@ def paystack_public_callback():
                             logger.info(f"Paystack payment successful: {reference} - User: {user.email} - Plan: {payment.plan}")
                             
                             # Send confirmation email (if you have this function)
-                            # send_payment_confirmation_email(user, payment)
+                            send_payment_confirmation_email(user, payment)
                     
-                    return redirect(f"{app.config.get('FRONTEND_URL', 'http://localhost:3000')}/payment-success?reference={reference}")
+                    return redirect(f"{app.config.get('FRONTEND_URL', 'http://safetrackproglobal.com')}/payment-success?reference={reference}")
                 else:
                     # Payment verification failed
                     payment.status = 'failed'
@@ -132213,11 +132185,11 @@ def paystack_public_callback():
                         db.session.commit()
                     
                     logger.warning(f"Paystack verification failed: {reference} - {response.get('message')}")
-                    return redirect(f"{app.config.get('FRONTEND_URL', 'http://localhost:3000')}/payment-failed?reference={reference}&error=verification_failed")
+                    return redirect(f"{app.config.get('FRONTEND_URL', 'http://safetrackproglobal.com')}/payment-failed?reference={reference}&error=verification_failed")
                     
             except Exception as e:
                 logger.error(f"Paystack verification error: {e}")
-                return redirect(f"{app.config.get('FRONTEND_URL', 'http://localhost:3000')}/payment-failed?reference={reference}&error=verification_error")
+                return redirect(f"{app.config.get('FRONTEND_URL', 'http://safetrackproglobal.com')}/payment-failed?reference={reference}&error=verification_error")
         else:
             # Mock verification for development
             if payment.status == 'pending':
@@ -132249,13 +132221,13 @@ def paystack_public_callback():
                     
                     logger.info(f"Mock payment completed for user {user.email}")
             
-            return redirect(f"{app.config.get('FRONTEND_URL', 'http://localhost:3000')}/payment-success?reference={reference}&mock=true")
+            return redirect(f"{app.config.get('FRONTEND_URL', 'http://safetrackproglobal.com')}/payment-success?reference={reference}&mock=true")
             
     except Exception as e:
         logger.error(f"Paystack callback error: {e}")
         import traceback
         traceback.print_exc()
-        return redirect(f"{app.config.get('FRONTEND_URL', 'http://localhost:3000')}/payment-failed?error=callback_error")
+        return redirect(f"{app.config.get('FRONTEND_URL', 'http://safetrackproglobal.com')}/payment-failed?error=callback_error")
 
 
 @app.route('/api/payment/paystack/webhook', methods=['POST'])
@@ -132573,7 +132545,7 @@ def initialize_paystack_payment_public():
             "Content-Type": "application/json"
         }
         
-        callback_url = f"{current_app.config.get('FRONTEND_URL', 'http://localhost:3000')}/payment/callback"
+        callback_url = f"{current_app.config.get('FRONTEND_URL', 'http://safetrackproglobal.com')}/payment/callback"
         
         payload = {
             "email": email,
@@ -132749,7 +132721,7 @@ def paystack_callback():
         reference = request.args.get('reference')
         
         if not reference:
-            return redirect(f"{app.config.get('FRONTEND_URL', 'http://localhost:3000')}/payment-failed?error=no_reference")
+            return redirect(f"{app.config.get('FRONTEND_URL', 'http://safetrackproglobal.com')}/payment-failed?error=no_reference")
         
         # Check if this is a signup payment
         is_signup = 'SIGNUP' in reference or reference.startswith('PAYSTACK-SIGNUP')
@@ -132768,7 +132740,7 @@ def paystack_callback():
                 session.modified = True
                 
                 logger.info(f"Signup payment completed via callback: {reference}")
-                return redirect(f"{app.config.get('FRONTEND_URL', 'http://localhost:3000')}/payment-success?reference={reference}&signup=true")
+                return redirect(f"{app.config.get('FRONTEND_URL', 'http://safetrackproglobal.com')}/payment-success?reference={reference}&signup=true")
         
         # Regular payment flow for authenticated users
         payment = Payment.query.filter_by(transaction_id=reference).first()
@@ -132781,11 +132753,11 @@ def paystack_callback():
             pass
         
         # Default redirect
-        return redirect(f"{app.config.get('FRONTEND_URL', 'http://localhost:3000')}/payment-waiting?reference={reference}")
+        return redirect(f"{app.config.get('FRONTEND_URL', 'http://safetrackproglobal.com')}/payment-waiting?reference={reference}")
         
     except Exception as e:
         logger.error(f"Paystack callback error: {e}")
-        return redirect(f"{app.config.get('FRONTEND_URL', 'http://localhost:3000')}/payment-failed?error=callback_error")
+        return redirect(f"{app.config.get('FRONTEND_URL', 'http://safetrackproglobal.com')}/payment-failed?error=callback_error")
 
 def calculate_expiry_date(duration):
     """Calculate expiry date based on duration"""
@@ -132802,13 +132774,13 @@ def send_payment_notification_to_admin(transaction, user):
     """Send email notification to admin about new payment"""
     try:
         # Get admin emails from config
-        admin_emails = current_app.config.get('ADMIN_NOTIFICATION_EMAILS', ['admin@safetypro.com'])
+        admin_emails = current_app.config.get('ADMIN_NOTIFICATION_EMAILS', ['admin@abigalisticstudious.com'])
         
         # Prepare email subject
         subject = f"💰 New Manual Payment Received - {user.email} - GHS {transaction.amount}"
         
         # Get frontend URL
-        frontend_url = current_app.config.get('FRONTEND_URL', 'http://localhost:3000')
+        frontend_url = current_app.config.get('FRONTEND_URL', 'http://safetrackproglobal.com')
         admin_url = f"{frontend_url}/admin/payments"
         
         # ✅ FIX: Get reference correctly
@@ -133024,7 +132996,7 @@ def send_payment_confirmation_email(user, transaction):
     """Send payment confirmation email to user"""
     try:
         # Get frontend URL
-        frontend_url = current_app.config.get('FRONTEND_URL', 'http://localhost:3000')
+        frontend_url = current_app.config.get('FRONTEND_URL', 'http://safetrackproglobal.com')
         dashboard_url = f"{frontend_url}/dashboard"
         
         # ✅ FIX: Get all attributes safely
@@ -133212,7 +133184,7 @@ Your Complete Safety Management Solution
 def send_payment_rejection_email(user, transaction, reason):
     """Send payment rejection email to user"""
     try:
-        frontend_url = current_app.config.get('FRONTEND_URL', 'http://localhost:3000')
+        frontend_url = current_app.config.get('FRONTEND_URL', 'http://safetrackproglobal.com')
         contact_url = f"{frontend_url}/contact"
         payment_url = f"{frontend_url}/pricing"
         
@@ -144006,6 +143978,18 @@ def _log_initialization_error(e):
         'traceback': traceback.format_exc(),
         'timestamp': datetime.now().isoformat()
     }
+
+try:
+    with app.app_context():
+        _init_result = initialize_system()
+        if _init_result.get('success'):
+            logger.info("✅ Production system initialization completed")
+        else:
+            logger.error(f"❌ Production system initialization failed: {_init_result.get('error')}")
+except Exception as _e:
+    logger.error(f"❌ Production system initialization crashed: {_e}")
+
+
 
 if __name__ == '__main__':
     print("\n" + "="*60)
