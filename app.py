@@ -7497,7 +7497,7 @@ def health_check():
         db_status = f'unhealthy: {str(e)}'
     
     # Check AI models status
-    ai_status = ai_manager.get_status()
+    ai_status = ai_manager.get_status() if ai_manager is not None else 'unavailable'
     
     # Check computer vision system
     cv_status = 'available' if cv_system.yolov5_available else 'unavailable'
