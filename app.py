@@ -2795,20 +2795,20 @@ def create_app():
              "X-Data-Sensitivity",
              "X-Healthcare-Version",
              "X-Healthcare-Context"
-             "X-Healthcare-Facility",      # ✅ ADD THIS
-             "X-User-Role",                # ✅ ADD THIS
-             "X-HIPAA-Compliant",          # ✅ ADD THIS
-             "X-Data-Sensitivity",         # ✅ ADD THIS
-             "X-Healthcare-Version",       # ✅ ADD THIS
-             "X-Healthcare-Context",       # ✅ ADD THIS
-             "X-User-Plan",                # ✅ ADD THIS
+             "X-Healthcare-Facility",      
+             "X-User-Role",                
+             "X-HIPAA-Compliant",          
+             "X-Data-Sensitivity",         
+             "X-Healthcare-Version",       
+             "X-Healthcare-Context",       
+             "X-User-Plan",                
              "X-Is-Super-Admin"
          ],
          expose_headers=["Content-Range", "X-Content-Range"],
          max_age=3600
     )
 
-    # ✅ SocketIO with CORS support (but doesn't add duplicate headers)
+   
     socketio.init_app(
         app,
         cors_allowed_origins=ALLOWED_ORIGINS,
@@ -2819,10 +2819,6 @@ def create_app():
 
     return app
 
-# ==================== ADD THIS AFTER CORS AND SOCKETIO ====================
-
-
-# ===== CREATE APP =====
 app = create_app()
 # Initialize Paystack with enhanced error handling
 try:
@@ -2945,7 +2941,6 @@ class BackblazeB2Manager:
                 }
             )
             
-            # Return public URL - Backblaze B2 uses different URL format
             file_url = self._get_public_url(object_key)
             
             logger.info(f"File uploaded to Backblaze B2: {object_key}")
@@ -2963,8 +2958,7 @@ class BackblazeB2Manager:
     
     def _get_public_url(self, object_key):
         """Generate public URL for Backblaze B2 file"""
-        # Backblaze B2 public URL format: https://f002.backblazeb2.com/file/bucket-name/object-key
-        # Or custom domain if configured
+       
         if hasattr(app.config, 'BACKBLAZE_PUBLIC_URL') and app.config.get('BACKBLAZE_PUBLIC_URL'):
             return urljoin(app.config['BACKBLAZE_PUBLIC_URL'], object_key)
         else:
