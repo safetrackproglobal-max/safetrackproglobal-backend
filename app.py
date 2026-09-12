@@ -3043,7 +3043,7 @@ class BackblazeB2Manager:
 
 # Initialize Backblaze B2 manager
 b2_manager = BackblazeB2Manager()
-
+cv_system = AdvancedComputerVisionSystem() 
 # -- ENHANCED AI MODELS INITIALIZATION --
 # complete_medical_system.py
 """
