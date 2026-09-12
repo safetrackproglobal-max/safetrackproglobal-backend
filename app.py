@@ -2602,6 +2602,15 @@ def get_healthcare_context():
 
 def create_app():
     """Application factory pattern"""
+    
+    # ✅ Force Postgres — no SQLite fallback
+    _db_url = os.getenv('DATABASE_URL') or os.getenv('DATABASE_URI')
+    if not _db_url:
+        raise RuntimeError("DATABASE_URL is not set — Postgres is required")
+    # SQLAlchemy 2.x requires 'postgresql://', not 'postgres://'
+    if _db_url.startswith('postgres://'):
+        _db_url = _db_url.replace('postgres://', 'postgresql://', 1)
+    
     app = Flask(__name__)
     
     # Enhanced Configuration
@@ -2616,8 +2625,8 @@ def create_app():
             days=int(os.getenv('JWT_REFRESH_TOKEN_DAYS', '30'))
         ),
         
-        # Database
-        SQLALCHEMY_DATABASE_URI=os.getenv('DATABASE_URI', os.getenv('DATABASE_URL', 'sqlite:///safetytrack_pro.db')),
+        # ✅ Database — Postgres only
+        SQLALCHEMY_DATABASE_URI=_db_url,
         SQLALCHEMY_TRACK_MODIFICATIONS=False,
         SQLALCHEMY_ENGINE_OPTIONS={
             'pool_recycle': int(os.getenv('DB_POOL_RECYCLE', '300')),
@@ -2643,6 +2652,7 @@ def create_app():
         PAYSTACK_MOCK_MODE=os.getenv('PAYSTACK_MOCK_MODE', 'True').lower() == 'true',
         PAYSTACK_MODE=os.getenv('PAYSTACK_MODE', 'test'),
         PAYSTACK_API_URL=os.getenv('PAYSTACK_API_URL', 'https://api.paystack.co'),
+        
         # Cloud Services
         CLOUD_VISION_CREDENTIALS=os.getenv('GOOGLE_APPLICATION_CREDENTIALS', ''),
         BACKBLAZE_APPLICATION_KEY_ID=os.getenv('BACKBLAZE_APPLICATION_KEY_ID'),
@@ -2670,18 +2680,22 @@ def create_app():
         SENTRY_DSN=os.getenv('SENTRY_DSN'),
         NEW_RELIC_LICENSE_KEY=os.getenv('NEW_RELIC_LICENSE_KEY'),
         
-        
-        
         # AI/ML Models Configuration
         AI_MODELS_ENABLED=os.getenv('AI_MODELS_ENABLED', 'True').lower() == 'true',
         HUGGINGFACE_API_KEY=os.getenv('HUGGINGFACE_API_KEY', ''),
         
         # Pre-trained Models Configuration
-        MODEL_CACHE_DIR=os.getenv('MODEL_CACHE_DIR', './model_cache'),
+        MODEL_CACHE_DIR=os.getenv(
+            'MODEL_CACHE_DIR',
+            os.path.join(os.environ.get('RAILWAY_VOLUME_MOUNT_PATH', '/app/data'), 'model_cache')
+        ),
         MODEL_DOWNLOAD_TIMEOUT=int(os.getenv('MODEL_DOWNLOAD_TIMEOUT', '300')),
         
-        # Computer Vision Models
-        YOLO_MODEL_PATH=os.getenv('YOLO_MODEL_PATH', r'C:\Users\DELL\Safety-project\safetrack-pro-backend\yolov5'),
+        # ✅ Computer Vision Models — volume path, not Windows path
+        YOLO_MODEL_PATH=os.getenv(
+            'YOLO_MODEL_PATH',
+            os.path.join(os.environ.get('RAILWAY_VOLUME_MOUNT_PATH', '/app/data'), 'yolov8')
+        ),
         USE_OPENCV_FALLBACK=os.getenv('USE_OPENCV_FALLBACK', 'False').lower() == 'true',
         
         # NLP Models
@@ -3104,7 +3118,7 @@ def add_security_headers(response):
         "style-src 'self' 'unsafe-inline'; "
         "img-src 'self' data: https:; "
         "font-src 'self' data:; "
-        "connect-src 'self' wss: https://api.safetrackproglobal.com; "
+        "connect-src 'self' wss: https://safetrackproglobal.com; "
         "frame-ancestors 'none'; "
         "base-uri 'self'; "
         "form-action 'self'"
