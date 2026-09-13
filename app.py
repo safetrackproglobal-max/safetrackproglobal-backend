@@ -68213,7 +68213,7 @@ def get_environmental_ai_service():
 
 
 # Initialize the Environmental AI Service (new)
-initialize_environmental_ai_service()
+# 
 
 print("\n" + "="*80)
 print("✅ HSE DOCUMENT & ENVIRONMENTAL AI SYSTEM READY")
@@ -144247,76 +144247,55 @@ _startup_log("▶ About to call create_app()")
 app = create_app()
 _startup_log("✓ create_app() returned")
 
-_startup_log("▶ About to call initialize_system()")
-try:
-    with app.app_context():
-        _init_result = initialize_system()
-    _startup_log(f"✓ initialize_system() returned: success={_init_result.get('success')}")
-except Exception as e:
-    _startup_log(f"✗ initialize_system() FAILED: {e}")
+# ============================================================================
+# ✅ BACKGROUND INITIALIZATION — non-blocking
+# Heavy init runs in threads so gunicorn binds the port fast and the
+# healthcheck can pass immediately.
+# ============================================================================
+import threading
 
-_startup_log("▶ About to call initialize_environmental_ai_service()")
-try:
-    initialize_environmental_ai_service()
-    _startup_log("✓ initialize_environmental_ai_service() done")
-except Exception as e:
-    _startup_log(f"✗ initialize_environmental_ai_service() FAILED: {e}")
+def _bg_system_init():
+    try:
+        _startup_log("▶ [BG] initialize_system() starting...")
+        with app.app_context():
+            result = initialize_system()
+        _startup_log(f"✓ [BG] initialize_system() done: success={result.get('success')}")
+    except Exception as e:
+        _startup_log(f"✗ [BG] initialize_system() FAILED: {e}")
 
-_startup_log("▶ About to call init_medical_ai()")
-try:
-    medical_ai = init_medical_ai()
-    _startup_log("✓ init_medical_ai() done")
-except Exception as e:
-    _startup_log(f"✗ init_medical_ai() FAILED: {e}")
+def _bg_env_init():
+    try:
+        _startup_log("▶ [BG] initialize_environmental_ai_service() starting...")
+        with app.app_context():
+            initialize_environmental_ai_service()
+        _startup_log("✓ [BG] initialize_environmental_ai_service() done")
+    except Exception as e:
+        _startup_log(f"✗ [BG] initialize_environmental_ai_service() FAILED: {e}")
 
-_startup_log("▶ Module loading COMPLETE — gunicorn should serve now")
+def _bg_medical_init():
+    try:
+        _startup_log("▶ [BG] init_medical_ai() starting...")
+        with app.app_context():
+            init_medical_ai()
+        _startup_log("✓ [BG] init_medical_ai() done")
+    except Exception as e:
+        _startup_log(f"✗ [BG] init_medical_ai() FAILED: {e}")
+
+# Start all three in parallel — DO NOT block gunicorn
+threading.Thread(target=_bg_system_init, daemon=True).start()
+threading.Thread(target=_bg_env_init, daemon=True).start()
+threading.Thread(target=_bg_medical_init, daemon=True).start()
+_startup_log("✓ Background init threads started — gunicorn can bind port NOW")
 
 
 if __name__ == '__main__':
+    # Local dev only — gunicorn doesn't use this block
     print("\n" + "="*60)
-    print("🚀 Starting SafetyTrack Pro Application")
+    print("🚀 Starting SafetyTrack Pro (local dev)")
     print("="*60)
-    
-    # Add delay before any initialization
-    import time
-    print("⏳ Waiting 2 seconds for SQLAlchemy to settle...")
-    time.sleep(2)
-    
-    # Run initialization before starting server
-    print("\n" + "="*60)
-    print("🚀 Starting System Initialization")
-    print("="*60)
-   
-    with app.app_context():
-        init_result = initialize_system()
-        
-        if init_result.get('success'):
-            print("\n✅ Initialization completed successfully!")
-            print(f"   AI Database: {'Ready' if init_result.get('ai_database') else 'Failed'}")
-            print(f"   Construction DB: {'Ready' if init_result.get('construction_db') else 'Failed'}")
-            print(f"   Admin Accounts: {'Created' if init_result.get('admin_created') else 'Failed'}")
-            print(f"   HSE Document System: {'Ready' if init_result.get('hse_document_system') else 'Failed'}")
-        else:
-            print(f"\n❌ Initialization failed: {init_result.get('error')}")
-            if 'traceback' in init_result:
-                print(f"\n🔍 Traceback:\n{init_result.get('traceback')}")
-        
-        # Initialize enhanced exam system - SIMPLIFIED VERSION
-        print("\n🎯 Initializing Enhanced Exam System...")
-        try:
-            medical_ai = init_medical_ai()
-            print("✅ Enhanced CSP Exam System initialized (template-based only)")
-        except Exception as e:
-            print(f"❌ Exam system initialization failed: {e}")
-            medical_ai = None
-    
-    # Start the application
-    print("\n" + "="*60)
-    print("🚀 Starting Flask/SocketIO Server...")
-    print("="*60)
-    logger.info("Starting SafetyTrack Pro Server...")
+    logger.info("Starting SafetyTrack Pro Server (local)...")
     socketio.run(
-        app, 
+        app,
         debug=os.getenv('FLASK_DEBUG', 'False').lower() == 'true',
         host=os.getenv('HOST', '0.0.0.0'),
         port=int(os.getenv('PORT', 5000)),
