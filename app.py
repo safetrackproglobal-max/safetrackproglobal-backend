@@ -5089,9 +5089,7 @@ def init_medical_ai():
     
     # imports
     _startup_log("▶ Importing models/classes/HSE...")
-    from models import *
-    from classes import *
-    from HSE import *
+
     _startup_log("✓ Imports complete")
     
     # extensions
@@ -7564,7 +7562,7 @@ def _log_first_request():
     if not globals().get('_FIRST_REQUEST_LOGGED'):
         _FIRST_REQUEST_LOGGED = True
         _startup_log(f"✓ First request received: {request.method} {request.path}")
-        
+
 @app.route('/api/health', methods=['GET'])
 def health_check():
     """Enhanced health check endpoint"""
