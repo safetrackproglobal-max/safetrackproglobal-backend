@@ -1,4 +1,5 @@
 # ===== STANDARD LIBRARY IMPORTS =====
+import psycopg2
 import os
 import sys
 import io
