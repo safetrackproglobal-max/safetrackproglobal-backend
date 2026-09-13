@@ -142951,6 +142951,12 @@ class HTMLTemplateEngineCompatibility:
 
 
 def initialize_system():
+    import sys, faulthandler, logging
+    faulthandler.enable(file=sys.stderr)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    logger.critical("[DEBUG] ============ INITIALIZE_SYSTEM START ============")
+    sys.stdout.flush()
     """Initialize the complete system with proper separation"""
     # =========================================================================
     # INITIALIZATION HEADER
@@ -143059,6 +143065,12 @@ def _log_phase_header(phase_name):
 
 
 def _perform_pre_initialization_checks():
+    import sys, faulthandler
+    sys.stdout.flush()
+    sys.stderr.flush()
+    faulthandler.enable(file=sys.stderr)
+    logger.critical("[DEBUG] ===== _perform_pre_initialization_checks START =====")
+    sys.stdout.flush()
     """PHASE 0: Pre-initialization model registry check"""
     with app.app_context():
         try:
@@ -143074,12 +143086,12 @@ def _perform_pre_initialization_checks():
                 logger.error(f"   ❌ Database connection failed: {conn_err}")
             
             # Scan for registered models
-            _scan_registered_models()
+            logger.critical("[DEBUG] Calling _scan_registered_models"); sys.stdout.flush(); sys.stderr.flush(); _scan_registered_models(); logger.critical("[DEBUG] _scan_registered_models completed"); sys.stdout.flush()
             
             # Check specific models
-            _check_industry_model()
-            _check_incident_model()
-            _check_user_model()
+            logger.critical("[DEBUG] Calling _check_industry_model"); sys.stdout.flush(); sys.stderr.flush(); _check_industry_model(); logger.critical("[DEBUG] _check_industry_model completed"); sys.stdout.flush()
+            logger.critical("[DEBUG] Calling _check_incident_model"); sys.stdout.flush(); sys.stderr.flush(); _check_incident_model(); logger.critical("[DEBUG] _check_incident_model completed"); sys.stdout.flush()
+            logger.critical("[DEBUG] Calling _check_user_model"); sys.stdout.flush(); sys.stderr.flush(); _check_user_model(); logger.critical("[DEBUG] _check_user_model completed"); sys.stdout.flush()
             
         except Exception as debug_error:
             logger.error(f"   ❌ Debug error in PHASE 0: {debug_error}")
@@ -143087,7 +143099,7 @@ def _perform_pre_initialization_checks():
             logger.error(traceback.format_exc())
 
 
-def _scan_registered_models():
+def logger.critical("[DEBUG] Calling _scan_registered_models"); sys.stdout.flush(); sys.stderr.flush(); _scan_registered_models(); logger.critical("[DEBUG] _scan_registered_models completed"); sys.stdout.flush():
     """Scan and log all registered models"""
     from sqlalchemy import inspect
     from sqlalchemy.orm import class_mapper
@@ -143110,7 +143122,7 @@ def _scan_registered_models():
         logger.info(f"      - {mapper.class_.__name__} -> {mapper.class_.__tablename__}")
 
 
-def _check_industry_model():
+def logger.critical("[DEBUG] Calling _check_industry_model"); sys.stdout.flush(); sys.stderr.flush(); _check_industry_model(); logger.critical("[DEBUG] _check_industry_model completed"); sys.stdout.flush():
     """Check Industry model registration"""
     logger.info("\n🔍 Checking Industry model:")
     try:
@@ -143132,7 +143144,7 @@ def _check_industry_model():
         logger.error(f"      Error type: {type(e).__name__}")
 
 
-def _check_incident_model():
+def logger.critical("[DEBUG] Calling _check_incident_model"); sys.stdout.flush(); sys.stderr.flush(); _check_incident_model(); logger.critical("[DEBUG] _check_incident_model completed"); sys.stdout.flush():
     """Check Incident model registration"""
     logger.info("\n🔍 Checking Incident model:")
     try:
@@ -143165,7 +143177,7 @@ def _check_incident_model():
         logger.error(f"      Error type: {type(e).__name__}")
 
 
-def _check_user_model():
+def logger.critical("[DEBUG] Calling _check_user_model"); sys.stdout.flush(); sys.stderr.flush(); _check_user_model(); logger.critical("[DEBUG] _check_user_model completed"); sys.stdout.flush():
     """Check User model registration"""
     logger.info("\n🔍 Checking User model:")
     try:
