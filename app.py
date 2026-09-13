@@ -58900,19 +58900,24 @@ def print_environmental_ai_status(ai_service):
     print("✅ ENVIRONMENTAL AI SYSTEM READY")
     print("="*80 + "\n")
 
-print("\n🚀 Initializing Environmental AI Service...")
-try:
-    ai_service = AdvancedEnvironmentalAIService(
-        model_base_path="./environmental_ai_models",
-        cache_size=500,
-        num_workers=4
-    )
-    app.config['ai_service'] = ai_service
-    print("✅ Environmental AI Service initialized successfully")
-    print(f"   📊 Models loaded: {len(ai_service.downloaded_models) if hasattr(ai_service, 'downloaded_models') else 0}")
-except Exception as e:
-    print(f"❌ Failed to initialize Environmental AI Service: {e}")
-    app.config['ai_service'] = None
+# ❌ DISABLED at module level — was training models synchronously, blocking gunicorn
+# print("\n🚀 Initializing Environmental AI Service...")
+# try:
+#     ai_service = AdvancedEnvironmentalAIService(
+#         model_base_path="./environmental_ai_models",
+#         cache_size=500,
+#         num_workers=4
+#     )
+#     app.config['ai_service'] = ai_service
+#     print("✅ Environmental AI Service initialized successfully")
+#     print(f"   📊 Models loaded: {len(ai_service.downloaded_models) if hasattr(ai_service, 'downloaded_models') else 0}")
+# except Exception as e:
+#     print(f"❌ Failed to initialize Environmental AI Service: {e}")
+#     app.config['ai_service'] = None
+
+# ✅ Placeholder — actual init happens lazily via get_environmental_ai_service()
+app.config['ai_service'] = None
+print("⚠️ Environmental AI Service DISABLED at import — init on demand via endpoint")
 
 class SortTracker:
     """
@@ -144283,7 +144288,7 @@ def _bg_medical_init():
 
 # Start all three in parallel — DO NOT block gunicorn
 threading.Thread(target=_bg_system_init, daemon=True).start()
-threading.Thread(target=_bg_env_init, daemon=True).start()
+
 threading.Thread(target=_bg_medical_init, daemon=True).start()
 _startup_log("✓ Background init threads started — gunicorn can bind port NOW")
 
