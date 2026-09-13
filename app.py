@@ -143958,6 +143958,165 @@ def _log_initialization_complete(init_results):
     
     return final_results
 
+# ============================================================================
+# ✅ CONSOLIDATED MASTER INIT ENDPOINT
+# Creates every table, adds every missing column, seeds admin — all at once.
+# Protected by ADMIN_SECRET header/query param.
+# ============================================================================
+@app.route('/api/admin/init-everything', methods=['GET', 'POST'])
+def admin_init_everything():
+    """
+    Master initialization endpoint.
+    Runs in this order:
+      1. db.create_all()           — SQLAlchemy models
+      2. AI tables                 — ensure_ai_tables_exist()
+      3. PowerBI + env tables      — ensure_powerbi_tables_exist()
+      4. Thermal monitoring        — _initialize_thermal_monitoring_tables()
+      5. Missing columns           — add_missing_* helpers
+      6. Notification templates    — create_initial_notification_templates()
+      7. Admin accounts            — ensure_admin_user()
+      8. Full system init          — initialize_system()
+    """
+    secret = os.getenv('ADMIN_SECRET', 'change-me')
+    provided = request.headers.get('X-Admin-Secret') or request.args.get('secret')
+    if provided != secret:
+        return jsonify({'success': False, 'error': 'Unauthorized'}), 401
+
+    import traceback
+    import importlib
+    from sqlalchemy import inspect
+
+    results = {
+        'imports': {},
+        'tables_before': 0,
+        'tables_after': 0,
+        'new_tables': [],
+        'steps': {},
+        'errors': []
+    }
+
+    try:
+        with app.app_context():
+            # ─── 0. Import all model modules via importlib (safe inside functions) ───
+            for mod in ['models', 'usermodels', 'classes', 'HSE', 'extensions']:
+                try:
+                    importlib.import_module(mod)
+                    results['imports'][mod] = 'ok'
+                except Exception as e:
+                    results['imports'][mod] = f'error: {e}'
+                    results['errors'].append(f'import {mod}: {e}')
+
+            # ─── 1. Baseline table count ───
+            inspector = inspect(db.engine)
+            before = set(inspector.get_table_names())
+            results['tables_before'] = len(before)
+
+            # ─── 2. db.create_all() — creates every registered model's table ───
+            try:
+                db.create_all()
+                results['steps']['db.create_all'] = 'ok'
+            except Exception as e:
+                results['steps']['db.create_all'] = f'error: {e}'
+                results['errors'].append(f'db.create_all: {e}')
+
+            # ─── 3. AI tables ───
+            try:
+                results['steps']['ensure_ai_tables_exist'] = ensure_ai_tables_exist()
+            except Exception as e:
+                results['steps']['ensure_ai_tables_exist'] = f'error: {e}'
+                results['errors'].append(f'ensure_ai_tables_exist: {e}')
+
+            # ─── 4. PowerBI + environmental tables ───
+            try:
+                results['steps']['ensure_powerbi_tables_exist'] = ensure_powerbi_tables_exist()
+            except Exception as e:
+                results['steps']['ensure_powerbi_tables_exist'] = f'error: {e}'
+                results['errors'].append(f'ensure_powerbi_tables_exist: {e}')
+
+            # ─── 5. Thermal monitoring tables ───
+            try:
+                _initialize_thermal_monitoring_tables()
+                results['steps']['thermal_tables'] = 'ok'
+            except Exception as e:
+                results['steps']['thermal_tables'] = f'error: {e}'
+                results['errors'].append(f'thermal_tables: {e}')
+
+            # ─── 6. Missing columns on existing tables ───
+            for fn_name in [
+                'add_document_fields_to_users',
+                'add_pdf_tracking_columns',
+                'add_missing_columns_to_ai_document_generation',
+                'add_missing_columns_to_ai_html_preview',
+            ]:
+                try:
+                    fn = globals().get(fn_name)
+                    if callable(fn):
+                        fn()
+                        results['steps'][fn_name] = 'ok'
+                    else:
+                        results['steps'][fn_name] = 'not_found'
+                except Exception as e:
+                    results['steps'][fn_name] = f'error: {e}'
+                    results['errors'].append(f'{fn_name}: {e}')
+
+            # ─── 7. System logs table + notification templates ───
+            try:
+                create_system_logs_table()
+                results['steps']['create_system_logs_table'] = 'ok'
+            except Exception as e:
+                results['steps']['create_system_logs_table'] = f'error: {e}'
+
+            try:
+                create_initial_notification_templates()
+                results['steps']['notification_templates'] = 'ok'
+            except Exception as e:
+                results['steps']['notification_templates'] = f'error: {e}'
+                results['errors'].append(f'notification_templates: {e}')
+
+            # ─── 8. Required documents, analytics ───
+            for fn_name in ['initialize_required_documents', 'create_analytics_tables', 'create_default_analytics_data']:
+                try:
+                    fn = globals().get(fn_name)
+                    if callable(fn):
+                        fn()
+                        results['steps'][fn_name] = 'ok'
+                    else:
+                        results['steps'][fn_name] = 'not_found'
+                except Exception as e:
+                    results['steps'][fn_name] = f'error: {e}'
+
+            # ─── 9. Admin accounts ───
+            try:
+                results['steps']['ensure_admin_user'] = ensure_admin_user()
+            except Exception as e:
+                results['steps']['ensure_admin_user'] = f'error: {e}'
+                results['errors'].append(f'ensure_admin_user: {e}')
+
+            # ─── 10. Final table count ───
+            inspector = inspect(db.engine)
+            after = set(inspector.get_table_names())
+            results['tables_after'] = len(after)
+            results['new_tables'] = sorted(after - before)
+            results['all_tables'] = sorted(after)
+
+            # ─── 11. Optional: full initialize_system() ───
+            if request.args.get('full') == '1':
+                try:
+                    results['steps']['initialize_system'] = initialize_system()
+                except Exception as e:
+                    results['steps']['initialize_system'] = f'error: {e}'
+                    results['errors'].append(f'initialize_system: {e}')
+
+        results['success'] = len(results['errors']) == 0
+        return jsonify(results), 200 if results['success'] else 500
+
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e),
+            'traceback': traceback.format_exc()
+        }), 500
+
 
 def _log_initialization_error(e):
     """Log initialization error and return error results"""
@@ -143978,15 +144137,6 @@ def _log_initialization_error(e):
         'timestamp': datetime.now().isoformat()
     }
 
-try:
-    with app.app_context():
-        _init_result = initialize_system()
-        if _init_result.get('success'):
-            logger.info("✅ Production system initialization completed")
-        else:
-            logger.error(f"❌ Production system initialization failed: {_init_result.get('error')}")
-except Exception as _e:
-    logger.error(f"❌ Production system initialization crashed: {_e}")
 
 
 
