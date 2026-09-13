@@ -1,4 +1,4 @@
-﻿FROM python:3.11-slim
+FROM python:3.11-slim
 
 WORKDIR /app
 
@@ -36,8 +36,18 @@ COPY safetytrack_bridge.py .
 COPY usermodels.py .
 COPY language_middleware.py .
 COPY extensions.py .
+COPY debug_models.py .
+COPY app_init_debug.py .
 RUN mkdir -p uploads detection_results generated_certificates generated_documents sessions static model_cache
+
 ENV PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1
+    PYTHONDONTWRITEBYTECODE=1 \
+    CUDA_VISIBLE_DEVICES=-1 \
+    TF_CPP_MIN_LOG_LEVEL=2 \
+    PYTHONFAULTHANDLER=1
+
 EXPOSE 8000
-CMD gunicorn app:app --bind 0.0.0.0:${PORT:-8000} --workers 1 --threads 4 --timeout 900 --graceful-timeout 60
+
+# Use debug wrapper to catch SIGSEGV point
+CMD exec python -u -X dev debug_models.py 2>&1 | tee /tmp/startup.log & sleep 10 && exec gunicorn app:app --bind 0.0.0.0:${PORT:-8000} --workers 2 --worker-class sync --timeout 900 --graceful-timeout 60
+
