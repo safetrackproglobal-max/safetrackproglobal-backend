@@ -1,4 +1,13 @@
 
+# ============================================================================
+# DISABLE TENSORFLOW GPU - PREVENT SIGSEGV IN MULTI-THREADED ENVIRONMENTS
+# ============================================================================
+# TensorFlow GPU initialization in gunicorn gthread workers causes segfaults
+# Force CPU-only mode to prevent memory corruption in multi-threaded context
+import os
+os.environ['CUDA_VISIBLE_DEVICES'] = '-1'  # Disable all GPUs
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'    # Reduce TensorFlow logging noise
+
 import os
 import sys
 import json
