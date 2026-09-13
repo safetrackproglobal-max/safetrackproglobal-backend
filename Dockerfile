@@ -1,4 +1,4 @@
-﻿FROM python:3.11-slim
+FROM python:3.11-slim
 
 WORKDIR /app
 
@@ -37,7 +37,12 @@ COPY usermodels.py .
 COPY language_middleware.py .
 COPY extensions.py .
 RUN mkdir -p uploads detection_results generated_certificates generated_documents sessions static model_cache
+
 ENV PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1
+    PYTHONDONTWRITEBYTECODE=1 \
+    CUDA_VISIBLE_DEVICES=-1 \
+    TF_CPP_MIN_LOG_LEVEL=2
+
 EXPOSE 8000
-CMD gunicorn app:app --bind 0.0.0.0:${PORT:-8000} --workers 1 --threads 4 --timeout 900 --graceful-timeout 60
+
+CMD exec gunicorn app:app --bind 0.0.0.0:${PORT:-8000} --workers 2 --worker-class sync --timeout 900 --graceful-timeout 60
