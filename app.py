@@ -1,5 +1,4 @@
 # ===== STANDARD LIBRARY IMPORTS =====
-import psycopg2
 import os
 import sys
 import io
@@ -188,20 +187,6 @@ import numpy as np
 from datetime import datetime, timedelta
 from flask import current_app
 
-import time as _time
-_STARTUP_T0 = _time.time()
-
-def _startup_log(msg):
-    """Log with elapsed time since app.py was imported."""
-    elapsed = _time.time() - _STARTUP_T0
-    line = f"[STARTUP +{elapsed:6.2f}s] {msg}"
-    # Print to stdout so it shows in Railway logs even before logger is configured
-    print(line, flush=True)
-    try:
-        logger.info(line)
-    except Exception:
-        pass
-
 try:
     from paystackapi.paystack import Paystack
     from paystackapi.transaction import Transaction
@@ -210,12 +195,7 @@ except ImportError:
 # ===== 1. SET ENVIRONMENT VARIABLES FIRST =====
 os.environ['PYTHONIOENCODING'] = 'utf-8'
 os.environ['PYTHONUTF8'] = '1'
-# FONTCONFIG_FILE only exists on local Windows dev
-if sys.platform == 'win32':
-    _fonts_conf = r'C:\Users\DELL\Safety-project\safetrack-pro-backend\fonts.conf'
-    if os.path.exists(_fonts_conf):
-        os.environ['FONTCONFIG_FILE'] = _fonts_conf
-# On Linux (Railway), FONTCONFIG_FILE is unset — system defaults work
+os.environ['FONTCONFIG_FILE'] = r'C:\Users\DELL\Safety-project\safetrack-pro-backend\fonts.conf'
 os.environ['GIO_EXTRA_MODULES'] = ''
 
 # ===== 2. LOAD ENV VARIABLES =====
@@ -823,7 +803,7 @@ class AdvancedComputerVisionSystem:
         Skips silently if the model isn't present (uses OpenCV fallback).
         """
         volume_path = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "/app/data")
-        model_path = os.path.join(volume_path, "yolov8", "checkpoint_20251204_224700_best.pt")
+        model_path = os.path.join(volume_path, "yolov8n.pt")
 
         if not os.path.exists(model_path):
             logger.warning(f"YOLO model not found at {model_path}, using OpenCV fallback")
@@ -2622,11 +2602,6 @@ def get_healthcare_context():
 
 def create_app():
     """Application factory pattern"""
-    _startup_log("▶ create_app() ENTERED")
-    ...
-
-def create_app():
-    """Application factory pattern"""
     
     # ✅ Force Postgres — no SQLite fallback
     _db_url = os.getenv('DATABASE_URL') or os.getenv('DATABASE_URI')
@@ -2830,6 +2805,10 @@ def create_app():
     
     return app
 
+from classes import *
+from models import *
+from HSE import *
+
 app = create_app()
 # Initialize Paystack with enhanced error handling
 try:
@@ -2886,13 +2865,24 @@ def add_cors_headers(response):
     return response
 
 
+
+@app.route('/api/version', methods=['GET'])
+def version_check():
+    import hashlib, os as _os
+    try:
+        with open(_os.path.abspath(__file__), 'rb') as f:
+            file_hash = hashlib.sha256(f.read()).hexdigest()[:12]
+    except Exception as e:
+        file_hash = f'error: {e}'
+    return jsonify({
+        'deployed_file_hash': file_hash,
+        'has_init_everything': 'admin_init_everything' in globals(),
+        'has_create_tables': 'admin_create_tables' in globals(),
+        'app_py_size_bytes': _os.path.getsize(_os.path.abspath(__file__)),
+        'cwd': _os.getcwd(),
+        'python_file': _os.path.abspath(__file__),
+    })
 # ===== LOCAL IMPORTS =====
-from classes import *
-from models import *
-from HSE import *
-
-
-
 
 class BackblazeB2Manager:
     def __init__(self):
@@ -5069,71 +5059,6 @@ def init_medical_ai():
     global medical_ai
     medical_ai = MedicalAISystem()
     return medical_ai
-
-    _db_url = os.getenv('DATABASE_URL') or os.getenv('DATABASE_URI')
-    if not _db_url:
-        raise RuntimeError("DATABASE_URL is not set — Postgres is required")
-    if _db_url.startswith('postgres://'):
-        _db_url = _db_url.replace('postgres://', 'postgresql://', 1)
-    _startup_log(f"✓ DB URL resolved (starts with: {_db_url[:20]}...)")
-    
-    app = Flask(__name__)
-    _startup_log("✓ Flask app created")
-    
-    app.config.update(...)
-    _startup_log("✓ Config loaded")
-    
-    if os.getenv('SENTRY_DSN'):
-        sentry_sdk.init(...)
-        _startup_log("✓ Sentry initialized")
-    
-    # imports
-    _startup_log("▶ Importing models/classes/HSE...")
-
-    _startup_log("✓ Imports complete")
-    
-    # extensions
-    db.init_app(app)
-    _startup_log("✓ db.init_app")
-    jwt.init_app(app)
-    _startup_log("✓ jwt.init_app")
-    mail.init_app(app)
-    _startup_log("✓ mail.init_app")
-    limiter.init_app(app)
-    _startup_log("✓ limiter.init_app")
-    
-    # create tables
-    _startup_log("▶ db.create_all() starting...")
-    with app.app_context():
-        try:
-            db.create_all()
-            _startup_log("✓ db.create_all() complete")
-        except Exception as e:
-            _startup_log(f"✗ db.create_all() FAILED: {e}")
-    
-    # YOLO
-    _startup_log("▶ YOLOv5 activation starting...")
-    with app.app_context():
-        try:
-            cv_system = AdvancedComputerVisionSystem()
-            ...
-            _startup_log("✓ YOLOv5 activated")
-        except Exception as e:
-            _startup_log(f"✗ YOLOv5 activation FAILED: {e}")
-    
-    # CORS
-    _startup_log("▶ CORS setup...")
-    CORS(app, ...)
-    _startup_log("✓ CORS done")
-    
-    # SocketIO
-    _startup_log("▶ SocketIO init...")
-    socketio.init_app(app, ...)
-    _startup_log("✓ SocketIO done")
-    
-    _startup_log("▶ create_app() EXITED")
-    return app
-
 
 
 def debug_middleware():
@@ -7556,12 +7481,6 @@ For specific compliance requirements, please consult the relevant regulatory sta
         return f"AI analysis completed with limitations. Some advanced features may be unavailable. Technical details: {str(e)}"
 
 # -- ENHANCED ROUTES --
-@app.before_request
-def _log_first_request():
-    global _FIRST_REQUEST_LOGGED
-    if not globals().get('_FIRST_REQUEST_LOGGED'):
-        _FIRST_REQUEST_LOGGED = True
-        _startup_log(f"✓ First request received: {request.method} {request.path}")
 
 @app.route('/api/health', methods=['GET'])
 def health_check():
@@ -58900,24 +58819,19 @@ def print_environmental_ai_status(ai_service):
     print("✅ ENVIRONMENTAL AI SYSTEM READY")
     print("="*80 + "\n")
 
-# ❌ DISABLED at module level — was training models synchronously, blocking gunicorn
-# print("\n🚀 Initializing Environmental AI Service...")
-# try:
-#     ai_service = AdvancedEnvironmentalAIService(
-#         model_base_path="./environmental_ai_models",
-#         cache_size=500,
-#         num_workers=4
-#     )
-#     app.config['ai_service'] = ai_service
-#     print("✅ Environmental AI Service initialized successfully")
-#     print(f"   📊 Models loaded: {len(ai_service.downloaded_models) if hasattr(ai_service, 'downloaded_models') else 0}")
-# except Exception as e:
-#     print(f"❌ Failed to initialize Environmental AI Service: {e}")
-#     app.config['ai_service'] = None
-
-# ✅ Placeholder — actual init happens lazily via get_environmental_ai_service()
-app.config['ai_service'] = None
-print("⚠️ Environmental AI Service DISABLED at import — init on demand via endpoint")
+print("\n🚀 Initializing Environmental AI Service...")
+try:
+    ai_service = AdvancedEnvironmentalAIService(
+        model_base_path="./environmental_ai_models",
+        cache_size=500,
+        num_workers=4
+    )
+    app.config['ai_service'] = ai_service
+    print("✅ Environmental AI Service initialized successfully")
+    print(f"   📊 Models loaded: {len(ai_service.downloaded_models) if hasattr(ai_service, 'downloaded_models') else 0}")
+except Exception as e:
+    print(f"❌ Failed to initialize Environmental AI Service: {e}")
+    app.config['ai_service'] = None
 
 class SortTracker:
     """
@@ -68218,7 +68132,7 @@ def get_environmental_ai_service():
 
 
 # Initialize the Environmental AI Service (new)
-# 
+initialize_environmental_ai_service()
 
 print("\n" + "="*80)
 print("✅ HSE DOCUMENT & ENVIRONMENTAL AI SYSTEM READY")
@@ -143054,12 +142968,6 @@ class HTMLTemplateEngineCompatibility:
 
 
 def initialize_system():
-    import sys, faulthandler, logging
-    faulthandler.enable(file=sys.stderr)
-    sys.stdout.flush()
-    sys.stderr.flush()
-    logger.critical("[DEBUG] ============ INITIALIZE_SYSTEM START ============")
-    sys.stdout.flush()
     """Initialize the complete system with proper separation"""
     # =========================================================================
     # INITIALIZATION HEADER
@@ -143168,12 +143076,6 @@ def _log_phase_header(phase_name):
 
 
 def _perform_pre_initialization_checks():
-    import sys, faulthandler
-    sys.stdout.flush()
-    sys.stderr.flush()
-    faulthandler.enable(file=sys.stderr)
-    logger.critical("[DEBUG] ===== _perform_pre_initialization_checks START =====")
-    sys.stdout.flush()
     """PHASE 0: Pre-initialization model registry check"""
     with app.app_context():
         try:
@@ -143189,12 +143091,12 @@ def _perform_pre_initialization_checks():
                 logger.error(f"   ❌ Database connection failed: {conn_err}")
             
             # Scan for registered models
-            logger.critical("[DEBUG] Calling _scan_registered_models"); sys.stdout.flush(); sys.stderr.flush(); _scan_registered_models(); logger.critical("[DEBUG] _scan_registered_models completed"); sys.stdout.flush()
+            _scan_registered_models()
             
             # Check specific models
-            logger.critical("[DEBUG] Calling _check_industry_model"); sys.stdout.flush(); sys.stderr.flush(); _check_industry_model(); logger.critical("[DEBUG] _check_industry_model completed"); sys.stdout.flush()
-            logger.critical("[DEBUG] Calling _check_incident_model"); sys.stdout.flush(); sys.stderr.flush(); _check_incident_model(); logger.critical("[DEBUG] _check_incident_model completed"); sys.stdout.flush()
-            logger.critical("[DEBUG] Calling _check_user_model"); sys.stdout.flush(); sys.stderr.flush(); _check_user_model(); logger.critical("[DEBUG] _check_user_model completed"); sys.stdout.flush()
+            _check_industry_model()
+            _check_incident_model()
+            _check_user_model()
             
         except Exception as debug_error:
             logger.error(f"   ❌ Debug error in PHASE 0: {debug_error}")
@@ -143217,6 +143119,7 @@ def _scan_registered_models():
     else:
         logger.warning("   ⚠️ No tables found in database")
     
+    # Get all mappers from SQLAlchemy
     logger.info("\n🔍 Checking specific model registration:")
     mappers = list(db.Model.registry.mappers)
     logger.info(f"   📊 Total mappers registered: {len(mappers)}")
@@ -143258,6 +143161,7 @@ def _check_incident_model():
         logger.info(f"      Table: {Incident.__tablename__}")
         logger.info(f"      Columns: {[c.name for c in Incident.__table__.columns]}")
         
+        # Check Incident's relationship to Industry
         if hasattr(Incident, 'industry'):
             logger.info(f"      Relationship 'industry': EXISTS")
             try:
@@ -143290,6 +143194,7 @@ def _check_user_model():
         logger.info(f"      Table: {User.__tablename__}")
         logger.info(f"      Columns: {[c.name for c in User.__table__.columns]}")
         
+        # Check for document fields
         doc_fields = ['documents_uploaded', 'documents_verified', 'documents_uploaded_at']
         existing_fields = [f for f in doc_fields if hasattr(User, f)]
         missing_fields = [f for f in doc_fields if f not in existing_fields]
@@ -143301,6 +143206,7 @@ def _check_user_model():
         logger.error("   ❌ Cannot import User model")
     except Exception as e:
         logger.error(f"   ❌ User model NOT registered: {e}")
+
 
 def _start_background_services():
     """PHASE 1: Start background services"""
@@ -144248,59 +144154,54 @@ def _log_initialization_error(e):
         'timestamp': datetime.now().isoformat()
     }
 
-_startup_log("▶ About to call create_app()")
-app = create_app()
-_startup_log("✓ create_app() returned")
 
-# ============================================================================
-# ✅ BACKGROUND INITIALIZATION — non-blocking
-# Heavy init runs in threads so gunicorn binds the port fast and the
-# healthcheck can pass immediately.
-# ============================================================================
-import threading
-
-def _bg_system_init():
-    try:
-        _startup_log("▶ [BG] initialize_system() starting...")
-        with app.app_context():
-            result = initialize_system()
-        _startup_log(f"✓ [BG] initialize_system() done: success={result.get('success')}")
-    except Exception as e:
-        _startup_log(f"✗ [BG] initialize_system() FAILED: {e}")
-
-def _bg_env_init():
-    try:
-        _startup_log("▶ [BG] initialize_environmental_ai_service() starting...")
-        with app.app_context():
-            initialize_environmental_ai_service()
-        _startup_log("✓ [BG] initialize_environmental_ai_service() done")
-    except Exception as e:
-        _startup_log(f"✗ [BG] initialize_environmental_ai_service() FAILED: {e}")
-
-def _bg_medical_init():
-    try:
-        _startup_log("▶ [BG] init_medical_ai() starting...")
-        with app.app_context():
-            init_medical_ai()
-        _startup_log("✓ [BG] init_medical_ai() done")
-    except Exception as e:
-        _startup_log(f"✗ [BG] init_medical_ai() FAILED: {e}")
-
-# Start all three in parallel — DO NOT block gunicorn
-threading.Thread(target=_bg_system_init, daemon=True).start()
-
-threading.Thread(target=_bg_medical_init, daemon=True).start()
-_startup_log("✓ Background init threads started — gunicorn can bind port NOW")
 
 
 if __name__ == '__main__':
-    # Local dev only — gunicorn doesn't use this block
     print("\n" + "="*60)
-    print("🚀 Starting SafetyTrack Pro (local dev)")
+    print("🚀 Starting SafetyTrack Pro Application")
     print("="*60)
-    logger.info("Starting SafetyTrack Pro Server (local)...")
+    
+    # Add delay before any initialization
+    import time
+    print("⏳ Waiting 2 seconds for SQLAlchemy to settle...")
+    time.sleep(2)
+    
+    # Run initialization before starting server
+    print("\n" + "="*60)
+    print("🚀 Starting System Initialization")
+    print("="*60)
+   
+    with app.app_context():
+        init_result = initialize_system()
+        
+        if init_result.get('success'):
+            print("\n✅ Initialization completed successfully!")
+            print(f"   AI Database: {'Ready' if init_result.get('ai_database') else 'Failed'}")
+            print(f"   Construction DB: {'Ready' if init_result.get('construction_db') else 'Failed'}")
+            print(f"   Admin Accounts: {'Created' if init_result.get('admin_created') else 'Failed'}")
+            print(f"   HSE Document System: {'Ready' if init_result.get('hse_document_system') else 'Failed'}")
+        else:
+            print(f"\n❌ Initialization failed: {init_result.get('error')}")
+            if 'traceback' in init_result:
+                print(f"\n🔍 Traceback:\n{init_result.get('traceback')}")
+        
+        # Initialize enhanced exam system - SIMPLIFIED VERSION
+        print("\n🎯 Initializing Enhanced Exam System...")
+        try:
+            medical_ai = init_medical_ai()
+            print("✅ Enhanced CSP Exam System initialized (template-based only)")
+        except Exception as e:
+            print(f"❌ Exam system initialization failed: {e}")
+            medical_ai = None
+    
+    # Start the application
+    print("\n" + "="*60)
+    print("🚀 Starting Flask/SocketIO Server...")
+    print("="*60)
+    logger.info("Starting SafetyTrack Pro Server...")
     socketio.run(
-        app,
+        app, 
         debug=os.getenv('FLASK_DEBUG', 'False').lower() == 'true',
         host=os.getenv('HOST', '0.0.0.0'),
         port=int(os.getenv('PORT', 5000)),
