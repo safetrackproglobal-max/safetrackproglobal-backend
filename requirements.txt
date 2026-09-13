@@ -207,7 +207,7 @@ prophet==1.1.7
 proto-plus==1.26.1
 protobuf==5.28.3
 psutil==7.1.0
-psycopg2-binary==2.9.10
+# psycopg2-binary==2.9.10
 py-cpuinfo==9.0.0
 pyarrow==22.0.0
 pyasn1==0.6.1
@@ -343,3 +343,4 @@ zope.event==6.0
 zope.interface==8.0.1
 zopfli==0.4.0
 zstandard==0.25.0
+pg8000==1.31.2
