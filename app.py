@@ -2624,10 +2624,12 @@ def create_app():
         SQLALCHEMY_DATABASE_URI=_db_url,
         SQLALCHEMY_TRACK_MODIFICATIONS=False,
         SQLALCHEMY_ENGINE_OPTIONS={
+            'pool_size': 5,
+            'max_overflow': 10,
             'pool_recycle': int(os.getenv('DB_POOL_RECYCLE', '300')),
-            'pool_pre_ping': os.getenv('DB_POOL_PRE_PING', 'True').lower() == 'true'
+            'pool_pre_ping': os.getenv('DB_POOL_PRE_PING', 'True').lower() == 'true',
+            'connect_args': {'connect_timeout': 10}
         },
-        
         # Email
         MAIL_SERVER=os.getenv('MAIL_SERVER', 'smtp.gmail.com'),
         MAIL_PORT=int(os.getenv('MAIL_PORT', '587')),
