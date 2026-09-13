@@ -188,6 +188,20 @@ import numpy as np
 from datetime import datetime, timedelta
 from flask import current_app
 
+import time as _time
+_STARTUP_T0 = _time.time()
+
+def _startup_log(msg):
+    """Log with elapsed time since app.py was imported."""
+    elapsed = _time.time() - _STARTUP_T0
+    line = f"[STARTUP +{elapsed:6.2f}s] {msg}"
+    # Print to stdout so it shows in Railway logs even before logger is configured
+    print(line, flush=True)
+    try:
+        logger.info(line)
+    except Exception:
+        pass
+
 try:
     from paystackapi.paystack import Paystack
     from paystackapi.transaction import Transaction
@@ -2605,6 +2619,11 @@ def get_healthcare_context():
             'data_sensitivity': 'medium',
             'is_hospital_endpoint': False
         }
+
+def create_app():
+    """Application factory pattern"""
+    _startup_log("▶ create_app() ENTERED")
+    ...
 
 def create_app():
     """Application factory pattern"""
@@ -5051,6 +5070,73 @@ def init_medical_ai():
     medical_ai = MedicalAISystem()
     return medical_ai
 
+    _db_url = os.getenv('DATABASE_URL') or os.getenv('DATABASE_URI')
+    if not _db_url:
+        raise RuntimeError("DATABASE_URL is not set — Postgres is required")
+    if _db_url.startswith('postgres://'):
+        _db_url = _db_url.replace('postgres://', 'postgresql://', 1)
+    _startup_log(f"✓ DB URL resolved (starts with: {_db_url[:20]}...)")
+    
+    app = Flask(__name__)
+    _startup_log("✓ Flask app created")
+    
+    app.config.update(...)
+    _startup_log("✓ Config loaded")
+    
+    if os.getenv('SENTRY_DSN'):
+        sentry_sdk.init(...)
+        _startup_log("✓ Sentry initialized")
+    
+    # imports
+    _startup_log("▶ Importing models/classes/HSE...")
+    from models import *
+    from classes import *
+    from HSE import *
+    _startup_log("✓ Imports complete")
+    
+    # extensions
+    db.init_app(app)
+    _startup_log("✓ db.init_app")
+    jwt.init_app(app)
+    _startup_log("✓ jwt.init_app")
+    mail.init_app(app)
+    _startup_log("✓ mail.init_app")
+    limiter.init_app(app)
+    _startup_log("✓ limiter.init_app")
+    
+    # create tables
+    _startup_log("▶ db.create_all() starting...")
+    with app.app_context():
+        try:
+            db.create_all()
+            _startup_log("✓ db.create_all() complete")
+        except Exception as e:
+            _startup_log(f"✗ db.create_all() FAILED: {e}")
+    
+    # YOLO
+    _startup_log("▶ YOLOv5 activation starting...")
+    with app.app_context():
+        try:
+            cv_system = AdvancedComputerVisionSystem()
+            ...
+            _startup_log("✓ YOLOv5 activated")
+        except Exception as e:
+            _startup_log(f"✗ YOLOv5 activation FAILED: {e}")
+    
+    # CORS
+    _startup_log("▶ CORS setup...")
+    CORS(app, ...)
+    _startup_log("✓ CORS done")
+    
+    # SocketIO
+    _startup_log("▶ SocketIO init...")
+    socketio.init_app(app, ...)
+    _startup_log("✓ SocketIO done")
+    
+    _startup_log("▶ create_app() EXITED")
+    return app
+
+
 
 def debug_middleware():
     """Global debug middleware to trace ALL requests"""
@@ -7472,7 +7558,13 @@ For specific compliance requirements, please consult the relevant regulatory sta
         return f"AI analysis completed with limitations. Some advanced features may be unavailable. Technical details: {str(e)}"
 
 # -- ENHANCED ROUTES --
-
+@app.before_request
+def _log_first_request():
+    global _FIRST_REQUEST_LOGGED
+    if not globals().get('_FIRST_REQUEST_LOGGED'):
+        _FIRST_REQUEST_LOGGED = True
+        _startup_log(f"✓ First request received: {request.method} {request.path}")
+        
 @app.route('/api/health', methods=['GET'])
 def health_check():
     """Enhanced health check endpoint"""
@@ -144153,7 +144245,33 @@ def _log_initialization_error(e):
         'timestamp': datetime.now().isoformat()
     }
 
+_startup_log("▶ About to call create_app()")
+app = create_app()
+_startup_log("✓ create_app() returned")
 
+_startup_log("▶ About to call initialize_system()")
+try:
+    with app.app_context():
+        _init_result = initialize_system()
+    _startup_log(f"✓ initialize_system() returned: success={_init_result.get('success')}")
+except Exception as e:
+    _startup_log(f"✗ initialize_system() FAILED: {e}")
+
+_startup_log("▶ About to call initialize_environmental_ai_service()")
+try:
+    initialize_environmental_ai_service()
+    _startup_log("✓ initialize_environmental_ai_service() done")
+except Exception as e:
+    _startup_log(f"✗ initialize_environmental_ai_service() FAILED: {e}")
+
+_startup_log("▶ About to call init_medical_ai()")
+try:
+    medical_ai = init_medical_ai()
+    _startup_log("✓ init_medical_ai() done")
+except Exception as e:
+    _startup_log(f"✗ init_medical_ai() FAILED: {e}")
+
+_startup_log("▶ Module loading COMPLETE — gunicorn should serve now")
 
 
 if __name__ == '__main__':
