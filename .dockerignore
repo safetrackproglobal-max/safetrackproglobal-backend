@@ -11,6 +11,8 @@
 !language_middleware.py
 !extensions.py
 !requirements.txt
+!debug_models.py
+!app_init_debug.py
 !static/
 !hse_documents/
 

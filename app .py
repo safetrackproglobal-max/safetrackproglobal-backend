@@ -195,12 +195,7 @@ except ImportError:
 # ===== 1. SET ENVIRONMENT VARIABLES FIRST =====
 os.environ['PYTHONIOENCODING'] = 'utf-8'
 os.environ['PYTHONUTF8'] = '1'
-# FONTCONFIG_FILE only exists on local Windows dev
-if sys.platform == 'win32':
-    _fonts_conf = r'C:\Users\DELL\Safety-project\safetrack-pro-backend\fonts.conf'
-    if os.path.exists(_fonts_conf):
-        os.environ['FONTCONFIG_FILE'] = _fonts_conf
-# On Linux (Railway), FONTCONFIG_FILE is unset — system defaults work
+os.environ['FONTCONFIG_FILE'] = r'C:\Users\DELL\Safety-project\safetrack-pro-backend\fonts.conf'
 os.environ['GIO_EXTRA_MODULES'] = ''
 
 # ===== 2. LOAD ENV VARIABLES =====
@@ -2810,6 +2805,10 @@ def create_app():
     
     return app
 
+from classes import *
+from models import *
+from HSE import *
+
 app = create_app()
 # Initialize Paystack with enhanced error handling
 try:
@@ -2866,13 +2865,24 @@ def add_cors_headers(response):
     return response
 
 
+
+@app.route('/api/version', methods=['GET'])
+def version_check():
+    import hashlib, os as _os
+    try:
+        with open(_os.path.abspath(__file__), 'rb') as f:
+            file_hash = hashlib.sha256(f.read()).hexdigest()[:12]
+    except Exception as e:
+        file_hash = f'error: {e}'
+    return jsonify({
+        'deployed_file_hash': file_hash,
+        'has_init_everything': 'admin_init_everything' in globals(),
+        'has_create_tables': 'admin_create_tables' in globals(),
+        'app_py_size_bytes': _os.path.getsize(_os.path.abspath(__file__)),
+        'cwd': _os.getcwd(),
+        'python_file': _os.path.abspath(__file__),
+    })
 # ===== LOCAL IMPORTS =====
-from classes import *
-from models import *
-from HSE import *
-
-
-
 
 class BackblazeB2Manager:
     def __init__(self):
@@ -142958,12 +142968,6 @@ class HTMLTemplateEngineCompatibility:
 
 
 def initialize_system():
-    import sys, faulthandler, logging
-    faulthandler.enable(file=sys.stderr)
-    sys.stdout.flush()
-    sys.stderr.flush()
-    logger.critical("[DEBUG] ============ INITIALIZE_SYSTEM START ============")
-    sys.stdout.flush()
     """Initialize the complete system with proper separation"""
     # =========================================================================
     # INITIALIZATION HEADER
@@ -143072,12 +143076,6 @@ def _log_phase_header(phase_name):
 
 
 def _perform_pre_initialization_checks():
-    import sys, faulthandler
-    sys.stdout.flush()
-    sys.stderr.flush()
-    faulthandler.enable(file=sys.stderr)
-    logger.critical("[DEBUG] ===== _perform_pre_initialization_checks START =====")
-    sys.stdout.flush()
     """PHASE 0: Pre-initialization model registry check"""
     with app.app_context():
         try:
@@ -143093,12 +143091,12 @@ def _perform_pre_initialization_checks():
                 logger.error(f"   ❌ Database connection failed: {conn_err}")
             
             # Scan for registered models
-            logger.critical("[DEBUG] Calling _scan_registered_models"); sys.stdout.flush(); sys.stderr.flush(); _scan_registered_models(); logger.critical("[DEBUG] _scan_registered_models completed"); sys.stdout.flush()
+            _scan_registered_models()
             
             # Check specific models
-            logger.critical("[DEBUG] Calling _check_industry_model"); sys.stdout.flush(); sys.stderr.flush(); _check_industry_model(); logger.critical("[DEBUG] _check_industry_model completed"); sys.stdout.flush()
-            logger.critical("[DEBUG] Calling _check_incident_model"); sys.stdout.flush(); sys.stderr.flush(); _check_incident_model(); logger.critical("[DEBUG] _check_incident_model completed"); sys.stdout.flush()
-            logger.critical("[DEBUG] Calling _check_user_model"); sys.stdout.flush(); sys.stderr.flush(); _check_user_model(); logger.critical("[DEBUG] _check_user_model completed"); sys.stdout.flush()
+            _check_industry_model()
+            _check_incident_model()
+            _check_user_model()
             
         except Exception as debug_error:
             logger.error(f"   ❌ Debug error in PHASE 0: {debug_error}")
@@ -143121,6 +143119,7 @@ def _scan_registered_models():
     else:
         logger.warning("   ⚠️ No tables found in database")
     
+    # Get all mappers from SQLAlchemy
     logger.info("\n🔍 Checking specific model registration:")
     mappers = list(db.Model.registry.mappers)
     logger.info(f"   📊 Total mappers registered: {len(mappers)}")
@@ -143162,6 +143161,7 @@ def _check_incident_model():
         logger.info(f"      Table: {Incident.__tablename__}")
         logger.info(f"      Columns: {[c.name for c in Incident.__table__.columns]}")
         
+        # Check Incident's relationship to Industry
         if hasattr(Incident, 'industry'):
             logger.info(f"      Relationship 'industry': EXISTS")
             try:
@@ -143194,6 +143194,7 @@ def _check_user_model():
         logger.info(f"      Table: {User.__tablename__}")
         logger.info(f"      Columns: {[c.name for c in User.__table__.columns]}")
         
+        # Check for document fields
         doc_fields = ['documents_uploaded', 'documents_verified', 'documents_uploaded_at']
         existing_fields = [f for f in doc_fields if hasattr(User, f)]
         missing_fields = [f for f in doc_fields if f not in existing_fields]
@@ -143205,6 +143206,7 @@ def _check_user_model():
         logger.error("   ❌ Cannot import User model")
     except Exception as e:
         logger.error(f"   ❌ User model NOT registered: {e}")
+
 
 def _start_background_services():
     """PHASE 1: Start background services"""
