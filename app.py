@@ -823,7 +823,7 @@ class AdvancedComputerVisionSystem:
         Skips silently if the model isn't present (uses OpenCV fallback).
         """
         volume_path = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "/app/data")
-        model_path = os.path.join(volume_path, "yolov8n.pt")
+        model_path = os.path.join(volume_path, "yolov8", "checkpoint_20251204_224700_best.pt")
 
         if not os.path.exists(model_path):
             logger.warning(f"YOLO model not found at {model_path}, using OpenCV fallback")

@@ -1097,15 +1097,15 @@ class VideoAnalysis(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False, index=True)
     video_path = db.Column(db.String(512), nullable=False)
-    upload_file_id = db.Column(db.Integer, db.ForeignKey('upload_files.id'))
-    analysis_results = db.Column(db.Text)  # JSON string of analysis results
-    duration = db.Column(db.Float)  # in seconds
+    upload_file_id = db.Column(db.Integer, db.ForeignKey('uploaded_files.id'))   # ← FIXED
+    analysis_results = db.Column(db.Text)
+    duration = db.Column(db.Float)
     violations_count = db.Column(db.Integer, default=0)
     compliance_score = db.Column(db.Float)
     industry = db.Column(db.String(64))
-    status = db.Column(db.String(32), default='completed')  # processing, completed, failed
+    status = db.Column(db.String(32), default='completed')
     analyzed_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
-    processing_time = db.Column(db.Float)  # in seconds
+    processing_time = db.Column(db.Float)
 
 class AIRequest(db.Model):
     __tablename__ = 'ai_requests'

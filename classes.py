@@ -77509,9 +77509,9 @@ INSPECTION CONCLUSIONS:
 │ • No significant defects detected                                          │
 │                                                                              │
 │ Recommended Actions:                                                        │
-│ ✅ Continue current operating parameters                                   │
-│ ✅ Maintain annual inspection schedule                                     │
-│ ✅ Monitor corrosion rates at designated locations                         │
+│  Continue current operating parameters                                   │
+│  Maintain annual inspection schedule                                     │
+│  Monitor corrosion rates at designated locations                         │
 │                                                                              │
 │ Certified Inspector: _____________________ Level: _______________          │
 │                                                                              │
@@ -79507,7 +79507,7 @@ class GeneralSafetyDocuments:
     def _safety_checklist(self):
         return """
 ╔═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════╗
-║                                    ✅ SAFETY CHECKLIST                                                            ║
+║                                     SAFETY CHECKLIST                                                            ║
 ║                                   COMPREHENSIVE SAFETY INSPECTION                                                 ║
 ╠═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════╣
 ┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐

@@ -217,8 +217,6 @@ class SafetyTrackModelBridge:
         Main prediction function - replaces your ML model calls
         Returns everything needed for template generation
         """
-        
-        # 1. Get industry prediction
         industry = self.predict_industry(features)
         
         # 2. Get complexity prediction
