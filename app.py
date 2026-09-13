@@ -142968,7 +142968,10 @@ def initialize_system():
         # PHASE 0: PRE-INITIALIZATION CHECKS
         # =========================================================================
         _log_phase_header("PHASE 0: PRE-INITIALIZATION MODEL REGISTRY CHECK")
-        _perform_pre_initialization_checks()
+        try:
+            _perform_pre_initialization_checks()
+        except Exception as e:
+            logger.warning(f"Pre-init checks failed (non-fatal): {e}")
         
         # =========================================================================
         # PHASE 1: BACKGROUND SERVICES
