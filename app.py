@@ -144386,8 +144386,8 @@ def nuke_and_rebuild():
                 conn.execute(text("GRANT ALL ON SCHEMA public TO public"))
             print("🔗 [NUKE] ✅ Schema dropped and recreated", flush=True)
 
-            # ─── 3. Recreate tables MANUALLY (bypasses _safe_create_all patch) ───
-             print("🔗 [NUKE] Creating tables from models...", flush=True)
+            # ─── 3. Recreate tables MANUALLY (bypasses patch) ───
+            print("🔗 [NUKE] Creating tables from models...", flush=True)
             total_registered = len(db.metadata.tables)
             print(f"🔗 [NUKE] Models registered in metadata: {total_registered}", flush=True)
 
@@ -144395,40 +144395,33 @@ def nuke_and_rebuild():
                 results['errors'].append('No tables registered in db.metadata')
                 print("🔗 [NUKE] ❌ No tables in metadata", flush=True)
             else:
-                # ✅ Step 3a: Create base tables WITHOUT foreign keys first
-                # This breaks the circular dependency between users ↔ companies ↔ hospitals
                 BASE_TABLES = ['users', 'companies', 'hospitals', 'industries']
-                
                 created_count = 0
                 failed_tables = []
-                
+
+                # ─── 3a. Base tables first (no FK issues) ───
                 print("🔗 [NUKE] Step 3a: Creating base tables without FKs...", flush=True)
                 for tname in BASE_TABLES:
                     table = db.metadata.tables.get(tname)
                     if table is None:
                         continue
                     try:
-                        # Strip FKs temporarily
                         fks_backup = {}
                         for col in table.columns:
                             fks_backup[col.name] = list(col.foreign_keys)
-                            # Remove FK constraints
                             for fk in list(col.foreign_keys):
                                 col.foreign_keys.discard(fk)
-                        
                         table.create(bind=db.engine, checkfirst=True)
                         created_count += 1
                         print(f"🔗 [NUKE]   ✅ {tname} created (no FKs)", flush=True)
-                        
-                        # Restore FKs in metadata (harmless since table exists)
                         for col_name, fks in fks_backup.items():
                             for fk in fks:
                                 table.columns[col_name].foreign_keys.add(fk)
                     except Exception as e:
                         failed_tables.append(f"{tname}: {str(e)[:120]}")
                         print(f"🔗 [NUKE]   ❌ {tname}: {str(e)[:100]}", flush=True)
-                
-                # ✅ Step 3b: Create remaining tables (now users/companies exist)
+
+                # ─── 3b. Remaining tables ───
                 print("🔗 [NUKE] Step 3b: Creating remaining tables...", flush=True)
                 for tname, table in db.metadata.tables.items():
                     if tname in BASE_TABLES:
@@ -144438,7 +144431,7 @@ def nuke_and_rebuild():
                         created_count += 1
                     except Exception as e:
                         failed_tables.append(f"{tname}: {str(e)[:80]}")
-                
+
                 print(f"🔗 [NUKE] ✅ Created {created_count}/{total_registered} tables", flush=True)
                 if failed_tables:
                     print(f"🔗 [NUKE] ⚠️ {len(failed_tables)} tables failed:", flush=True)
@@ -144511,7 +144504,7 @@ def nuke_and_rebuild():
             'traceback': traceback.format_exc(),
             'partial_results': results,
         }), 500
-
+        
 def _log_initialization_error(e):
     """Log initialization error and return error results"""
     logger.error("\n" + "=" * 80)
