@@ -2917,98 +2917,152 @@ def add_cors_headers(response):
     
     return response
 
-with app.app_context():
-    from sqlalchemy import inspect
-    import importlib
-
-    for mod in ['models', 'usermodels', 'classes', 'HSE', 'extensions']:
-        try:
-            importlib.import_module(mod)
-        except Exception as e:
-            print(f"🔗 [STARTUP] ⚠️ Could not import {mod}: {e}", flush=True)
-
-    inspector = inspect(db.engine)
-    existing = set(inspector.get_table_names())
-    print(f"🔗 [STARTUP] Existing tables: {len(existing)}", flush=True)
-
-    created, failed = [], []
-    for table_name, table in db.metadata.tables.items():
-        if table_name in existing:
-            continue
-        try:
-            table.create(bind=db.engine, checkfirst=True)
-            created.append(table_name)
-        except Exception as e:
-            failed.append((table_name, str(e)[:80]))
-
-    print(f"🔗 [STARTUP] ✅ Created {len(created)} new tables", flush=True)
-    if failed:
-        print(f"🔗 [STARTUP] ⚠️ {len(failed)} failed (non-critical):", flush=True)
-        for name, err in failed[:5]:
-            print(f"    - {name}: {err}", flush=True)
-
-    inspector = inspect(db.engine)
-    final = set(inspector.get_table_names())
-    print(f"🔗 [STARTUP] Total tables: {len(final)}", flush=True)
-    if 'users' in final:
-        print("🔗 [STARTUP] ✅ users table exists", flush=True)
-    else:
-        print("🔗 [STARTUP] ❌ users table MISSING", flush=True)
-
-
 # ============================================================================
-# ✅ Seed admin user
+# ✅ Force-create tables in dependency order
+# Base tables first, then everything else
 # ============================================================================
 with app.app_context():
+    from sqlalchemy import inspect, text
+    
+    print("🔗 [STARTUP] Creating base tables first...", flush=True)
+    
+    # ✅ STEP 1: Create the BASE tables that everything references
+    base_tables_sql = [
+        # companies (referenced by users, employees, etc.)
+        """CREATE TABLE IF NOT EXISTS companies (
+            id SERIAL PRIMARY KEY,
+            name VARCHAR(255) NOT NULL,
+            created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW()
+        )""",
+        # industries (referenced by incidents, etc.)
+        """CREATE TABLE IF NOT EXISTS industries (
+            id SERIAL PRIMARY KEY,
+            name VARCHAR(100) NOT NULL,
+            code VARCHAR(50) NOT NULL,
+            created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW()
+        )""",
+        # hospitals (referenced by many medical tables)
+        """CREATE TABLE IF NOT EXISTS hospitals (
+            id SERIAL PRIMARY KEY,
+            name VARCHAR(255) NOT NULL,
+            created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW()
+        )""",
+    ]
+    
+    for sql in base_tables_sql:
+        try:
+            with db.engine.begin() as conn:
+                conn.execute(text(sql))
+            print(f"🔗 [STARTUP] ✅ Base table created", flush=True)
+        except Exception as e:
+            print(f"🔗 [STARTUP] ⚠️ Base table failed: {str(e)[:100]}", flush=True)
+    
+    # ✅ STEP 2: Create users table explicitly (most important)
+    print("🔗 [STARTUP] Creating users table explicitly...", flush=True)
+    users_table_sql = """
+    CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        email VARCHAR(128) UNIQUE NOT NULL,
+        password_hash VARCHAR(255) NOT NULL,
+        name VARCHAR(128) NOT NULL,
+        user_type VARCHAR(20) DEFAULT 'user',
+        role VARCHAR(64) DEFAULT 'user',
+        admin_role VARCHAR(64),
+        admin_level VARCHAR(20) DEFAULT 'standard',
+        admin_tier VARCHAR(20) DEFAULT 'company',
+        is_platform_owner BOOLEAN DEFAULT FALSE,
+        is_system_team BOOLEAN DEFAULT FALSE,
+        verified BOOLEAN DEFAULT FALSE,
+        is_verified BOOLEAN DEFAULT FALSE,
+        is_active BOOLEAN DEFAULT TRUE,
+        approval_status VARCHAR(20) DEFAULT 'pending',
+        approved_at TIMESTAMP WITHOUT TIME ZONE,
+        approved_by INTEGER,
+        rejected_at TIMESTAMP WITHOUT TIME ZONE,
+        rejection_reason TEXT,
+        subscription_plan VARCHAR(50) DEFAULT 'free',
+        subscription_status VARCHAR(20) DEFAULT 'inactive',
+        trial_plan VARCHAR(32),
+        trial_ends_at TIMESTAMP WITHOUT TIME ZONE,
+        billing_cycle VARCHAR(20),
+        subscription_starts_at TIMESTAMP WITHOUT TIME ZONE,
+        subscription_ends_at TIMESTAMP WITHOUT TIME ZONE,
+        payment_method VARCHAR(50),
+        payment_gateway VARCHAR(50),
+        payment_id VARCHAR(100),
+        last_payment_date TIMESTAMP WITHOUT TIME ZONE,
+        next_payment_date TIMESTAMP WITHOUT TIME ZONE,
+        company_id INTEGER,
+        company_name VARCHAR(256),
+        company_logo VARCHAR(512),
+        platform_permissions TEXT,
+        country VARCHAR(64),
+        phone VARCHAR(20),
+        address TEXT,
+        website VARCHAR(255),
+        employee_id VARCHAR(64),
+        employee_count INTEGER DEFAULT 0,
+        department VARCHAR(128),
+        industry VARCHAR(64) DEFAULT 'Healthcare',
+        preferred_language VARCHAR(8) DEFAULT 'en',
+        timezone VARCHAR(64) DEFAULT 'UTC',
+        currency VARCHAR(16),
+        hospital_id INTEGER,
+        documents_uploaded BOOLEAN DEFAULT FALSE,
+        documents_verified BOOLEAN DEFAULT FALSE,
+        documents_uploaded_at TIMESTAMP WITHOUT TIME ZONE,
+        login_count INTEGER DEFAULT 0,
+        activity_count INTEGER DEFAULT 0,
+        last_login TIMESTAMP WITHOUT TIME ZONE,
+        last_activity TIMESTAMP WITHOUT TIME ZONE,
+        total_session_duration INTEGER DEFAULT 0,
+        avg_session_duration FLOAT DEFAULT 0,
+        activity_rate FLOAT DEFAULT 0,
+        login_frequency FLOAT DEFAULT 0,
+        performance_score INTEGER DEFAULT 0,
+        performance_grade VARCHAR(5) DEFAULT 'F',
+        monthly_uploads_used INTEGER DEFAULT 0,
+        monthly_api_calls_used INTEGER DEFAULT 0,
+        monthly_ai_requests_used INTEGER DEFAULT 0,
+        monthly_video_minutes_used INTEGER DEFAULT 0,
+        usage_reset_date TIMESTAMP WITHOUT TIME ZONE,
+        is_enterprise BOOLEAN DEFAULT FALSE,
+        enterprise_features TEXT,
+        custom_requirements TEXT,
+        avatar_url VARCHAR(500),
+        daily_pdf_generations INTEGER DEFAULT 0,
+        monthly_pdf_generations INTEGER DEFAULT 0,
+        total_pdf_documents INTEGER DEFAULT 0,
+        last_pdf_generation_at TIMESTAMP WITHOUT TIME ZONE,
+        pdf_templates_created INTEGER DEFAULT 0,
+        max_pdf_templates INTEGER DEFAULT 10,
+        token_version INTEGER DEFAULT 1,
+        created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW(),
+        updated_at TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW()
+    )
+    """
+    
     try:
-        from models import User
-        from werkzeug.security import generate_password_hash
-        admin_email = 'Abigalisticstudious@gmail.com'
-        existing_admin = User.query.filter_by(email=admin_email).first()
-        if not existing_admin:
-            print(f"🔗 [STARTUP] Creating admin: {admin_email}", flush=True)
-            admin = User(
-                email=admin_email,
-                password_hash=generate_password_hash('Adam1234'),
-                name='Abigalistic Safety Pro',
-                user_type='admin',
-                admin_tier='system',
-                is_platform_owner=True,
-                role='Platform Owner',
-                admin_role='System Administrator',
-                admin_level='super',
-                verified=True,
-                is_active=True,
-                approval_status='approved',
-                approved_at=datetime.utcnow(),
-                subscription_plan='platform_owner',
-                subscription_status='active',
-                company_name='Abigalistic Safety Pro Platform',
-                documents_uploaded=True,
-                documents_verified=True,
-                documents_uploaded_at=datetime.utcnow(),
-                platform_permissions=['all'],
-                country='Qatar',
-                phone='+97433251705',
-                employee_count=1,
-                industry='Software Platform',
-                preferred_language='en',
-                login_count=0,
-                activity_count=0,
-                performance_score=100,
-                performance_grade='A+',
-                created_at=datetime.utcnow(),
-                updated_at=datetime.utcnow(),
-            )
-            db.session.add(admin)
-            db.session.commit()
-            print("🔗 [STARTUP] ✅ Admin created", flush=True)
-        else:
-            print(f"🔗 [STARTUP] ✅ Admin exists (id={existing_admin.id})", flush=True)
+        with db.engine.begin() as conn:
+            conn.execute(text(users_table_sql))
+        print("🔗 [STARTUP] ✅ users table created via raw SQL", flush=True)
     except Exception as e:
-        print(f"🔗 [STARTUP] ❌ Admin seed failed: {e}", flush=True)
-        import traceback
-        traceback.print_exc()
+        print(f"🔗 [STARTUP] ❌ users table creation failed: {e}", flush=True)
+    
+    # ✅ STEP 3: Now run db.create_all() for the rest
+    print("🔗 [STARTUP] Running db.create_all() for remaining tables...", flush=True)
+    try:
+        db.create_all()
+        print("🔗 [STARTUP] ✅ db.create_all() complete", flush=True)
+    except Exception as e:
+        print(f"🔗 [STARTUP] ⚠️ Some tables failed (non-critical): {str(e)[:150]}", flush=True)
+    
+    # ✅ STEP 4: Verify users exists
+    inspector = inspect(db.engine)
+    if 'users' in inspector.get_table_names():
+        print("🔗 [STARTUP] ✅✅✅ users table EXISTS", flush=True)
+    else:
+        print("🔗 [STARTUP] ❌❌❌ users table STILL MISSING", flush=True)
 
 @app.route('/api/version', methods=['GET'])
 def version_check():
