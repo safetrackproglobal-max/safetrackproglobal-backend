@@ -38012,8 +38012,8 @@ def login():
         # The super admin email list is removed for security
         
         # Find user
-        user = User.query.filter_by(email=email).first()
-
+        from sqlalchemy import func
+        user = User.query.filter(func.lower(User.email) == email).first()
         # If no user, return error
         if not user:
             logger.warning(f"Failed login attempt - user not found: {email}")
