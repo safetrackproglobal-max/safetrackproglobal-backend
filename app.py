@@ -2354,6 +2354,50 @@ def get_user_country(user):
     
     return country or 'default'
 
+
+# ============================================================================
+# ✅ PATCH db.create_all — must be defined BEFORE setup_application()
+# ============================================================================
+_original_create_all = None
+_create_all_ran = {'count': 0}
+
+def _install_create_all_patch():
+    """Install the patch lazily — after db is defined but before any create_all runs."""
+    global _original_create_all
+    if _original_create_all is not None:
+        return  # already patched
+    _original_create_all = db.create_all
+    
+    def _safe_create_all(*args, **kwargs):
+        _create_all_ran['count'] += 1
+        n = _create_all_ran['count']
+        if n > 1:
+            print(f"🔗 [STARTUP] db.create_all() call #{n} skipped", flush=True)
+            return None
+        print("🔗 [STARTUP] Running db.create_all() (real, only once)", flush=True)
+        try:
+            result = _original_create_all(*args, **kwargs)
+            print("🔗 [STARTUP] ✅ db.create_all() succeeded", flush=True)
+            return result
+        except Exception as e:
+            err = str(e).lower()
+            if 'already exists' in err or 'duplicate' in err:
+                print(f"🔗 [STARTUP] ⚠️ Some tables already exist (safe): {str(e)[:120]}", flush=True)
+            else:
+                print(f"🔗 [STARTUP] ❌ db.create_all failed: {e}", flush=True)
+            return None  # never raise
+    
+    db.create_all = _safe_create_all
+    print("🔗 [STARTUP] db.create_all patched successfully", flush=True)
+
+
+# ✅ NOW call the patch — this must come AFTER the def, and BEFORE setup_application()
+_install_create_all_patch()
+
+
+# ============================================================================
+# setup_application() — existing
+# ============================================================================
 def setup_application():
     """Setup application with AI model configuration"""
     try:
@@ -2369,7 +2413,7 @@ def setup_application():
         create_directories()
         
         with app.app_context():
-            db.create_all()
+            db.create_all()          # ← this call is now intercepted by the patch ✅
             logger.info("Database tables created successfully")
         
         if app.config['AI_MODELS_ENABLED']:
@@ -2387,6 +2431,8 @@ def setup_application():
     except Exception as e:
         logger.error(f"Application setup failed: {e}")
         raise
+
+
 
 # ===== APP FACTORY FUNCTION =====
 def validate_healthcare_headers(f):
@@ -2871,7 +2917,98 @@ def add_cors_headers(response):
     
     return response
 
+with app.app_context():
+    from sqlalchemy import inspect
+    import importlib
 
+    for mod in ['models', 'usermodels', 'classes', 'HSE', 'extensions']:
+        try:
+            importlib.import_module(mod)
+        except Exception as e:
+            print(f"🔗 [STARTUP] ⚠️ Could not import {mod}: {e}", flush=True)
+
+    inspector = inspect(db.engine)
+    existing = set(inspector.get_table_names())
+    print(f"🔗 [STARTUP] Existing tables: {len(existing)}", flush=True)
+
+    created, failed = [], []
+    for table_name, table in db.metadata.tables.items():
+        if table_name in existing:
+            continue
+        try:
+            table.create(bind=db.engine, checkfirst=True)
+            created.append(table_name)
+        except Exception as e:
+            failed.append((table_name, str(e)[:80]))
+
+    print(f"🔗 [STARTUP] ✅ Created {len(created)} new tables", flush=True)
+    if failed:
+        print(f"🔗 [STARTUP] ⚠️ {len(failed)} failed (non-critical):", flush=True)
+        for name, err in failed[:5]:
+            print(f"    - {name}: {err}", flush=True)
+
+    inspector = inspect(db.engine)
+    final = set(inspector.get_table_names())
+    print(f"🔗 [STARTUP] Total tables: {len(final)}", flush=True)
+    if 'users' in final:
+        print("🔗 [STARTUP] ✅ users table exists", flush=True)
+    else:
+        print("🔗 [STARTUP] ❌ users table MISSING", flush=True)
+
+
+# ============================================================================
+# ✅ Seed admin user
+# ============================================================================
+with app.app_context():
+    try:
+        from models import User
+        from werkzeug.security import generate_password_hash
+        admin_email = 'Abigalisticstudious@gmail.com'
+        existing_admin = User.query.filter_by(email=admin_email).first()
+        if not existing_admin:
+            print(f"🔗 [STARTUP] Creating admin: {admin_email}", flush=True)
+            admin = User(
+                email=admin_email,
+                password_hash=generate_password_hash('Adam1234'),
+                name='Abigalistic Safety Pro',
+                user_type='admin',
+                admin_tier='system',
+                is_platform_owner=True,
+                role='Platform Owner',
+                admin_role='System Administrator',
+                admin_level='super',
+                verified=True,
+                is_active=True,
+                approval_status='approved',
+                approved_at=datetime.utcnow(),
+                subscription_plan='platform_owner',
+                subscription_status='active',
+                company_name='Abigalistic Safety Pro Platform',
+                documents_uploaded=True,
+                documents_verified=True,
+                documents_uploaded_at=datetime.utcnow(),
+                platform_permissions=['all'],
+                country='Qatar',
+                phone='+97433251705',
+                employee_count=1,
+                industry='Software Platform',
+                preferred_language='en',
+                login_count=0,
+                activity_count=0,
+                performance_score=100,
+                performance_grade='A+',
+                created_at=datetime.utcnow(),
+                updated_at=datetime.utcnow(),
+            )
+            db.session.add(admin)
+            db.session.commit()
+            print("🔗 [STARTUP] ✅ Admin created", flush=True)
+        else:
+            print(f"🔗 [STARTUP] ✅ Admin exists (id={existing_admin.id})", flush=True)
+    except Exception as e:
+        print(f"🔗 [STARTUP] ❌ Admin seed failed: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
 
 @app.route('/api/version', methods=['GET'])
 def version_check():
