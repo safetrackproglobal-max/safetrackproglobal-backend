@@ -144332,6 +144332,135 @@ def admin_init_everything():
             'traceback': traceback.format_exc()
         }), 500
 
+# ============================================================================
+# ✅ NUCLEAR RESET — drop everything and rebuild from models
+# ⚠️ DESTROYS ALL DATA. Requires ?confirm=YES_DELETE_EVERYTHING
+# ============================================================================
+@app.route('/api/admin/nuke-and-rebuild', methods=['POST', 'GET'])
+def nuke_and_rebuild():
+    """
+    Drops every table in the database and recreates them from SQLAlchemy models.
+    Seeds the admin user. Safe to call repeatedly.
+    
+    Requires: ?confirm=YES_DELETE_EVERYTHING
+    Optional: &secret=YOUR_ADMIN_SECRET (if ADMIN_SECRET env is set)
+    """
+    import traceback
+    import importlib
+    from sqlalchemy import inspect, text
+
+    # --- Safety gate ---
+    if request.args.get('confirm') != 'YES_DELETE_EVERYTHING':
+        return jsonify({
+            'success': False,
+            'error': 'Refusing to run without confirmation',
+            'hint': 'Add ?confirm=YES_DELETE_EVERYTHING to the URL'
+        }), 400
+
+    secret = os.getenv('ADMIN_SECRET', 'change-me')
+    provided = request.headers.get('X-Admin-Secret') or request.args.get('secret')
+    if provided != secret:
+        return jsonify({'success': False, 'error': 'Unauthorized'}), 401
+
+    results = {
+        'dropped': [],
+        'created': [],
+        'errors': [],
+        'admin': None,
+        'total_tables_before': 0,
+        'total_tables_after': 0,
+    }
+
+    try:
+        with app.app_context():
+            # ─── 0. Import ALL model modules so their tables register ───
+            for mod in ['models', 'usermodels', 'classes', 'HSE', 'extensions']:
+                try:
+                    importlib.import_module(mod)
+                except Exception as e:
+                    results['errors'].append(f'import {mod}: {str(e)[:200]}')
+
+            inspector = inspect(db.engine)
+            tables_before = inspector.get_table_names()
+            results['total_tables_before'] = len(tables_before)
+            results['dropped'] = sorted(tables_before)
+
+            # ─── 1. Drop all tables, CASCADE to kill FK deps ───
+            print(f"🔗 [NUKE] Dropping {len(tables_before)} tables...", flush=True)
+            with db.engine.begin() as conn:
+                # Drop the public schema entirely — cleanest way
+                conn.execute(text("DROP SCHEMA public CASCADE"))
+                conn.execute(text("CREATE SCHEMA public"))
+                conn.execute(text("GRANT ALL ON SCHEMA public TO public"))
+            print("🔗 [NUKE] ✅ Schema dropped and recreated", flush=True)
+
+            # ─── 2. Recreate every table from models ───
+            print("🔗 [NUKE] Creating tables from models...", flush=True)
+            try:
+                db.create_all()
+            except Exception as e:
+                results['errors'].append(f'db.create_all: {str(e)[:300]}')
+                print(f"🔗 [NUKE] ⚠️ db.create_all partial: {str(e)[:200]}", flush=True)
+
+            inspector = inspect(db.engine)
+            tables_after = sorted(inspector.get_table_names())
+            results['total_tables_after'] = len(tables_after)
+            results['created'] = tables_after
+            print(f"🔗 [NUKE] ✅ {len(tables_after)} tables created", flush=True)
+
+            # ─── 3. Seed admin user ───
+            try:
+                from models import User
+                from werkzeug.security import generate_password_hash
+                from datetime import datetime as _dt
+
+                admin_email = 'abigalisticstudious@gmail.com'
+                existing = User.query.filter_by(email=admin_email).first()
+                if existing:
+                    results['admin'] = f'exists (id={existing.id})'
+                else:
+                    admin = User(
+                        email=admin_email,
+                        password_hash=generate_password_hash('Adam1234'),
+                        name='Abigalistic Safety Pro',
+                        user_type='super_admin',
+                        role='Super Admin',
+                        admin_role='System Administrator',
+                        admin_level='super',
+                        admin_tier='system',
+                        is_platform_owner=True,
+                        is_super_admin=True,
+                        is_system_team=True,
+                        is_active=True,
+                        verified=True,
+                        is_verified=True,
+                        approval_status='approved',
+                        approved_at=_dt.utcnow(),
+                        subscription_plan='platform_owner',
+                        subscription_status='active',
+                        company_name='Abigalistic Safety Pro Platform',
+                        token_version=1,
+                        created_at=_dt.utcnow(),
+                        updated_at=_dt.utcnow(),
+                    )
+                    db.session.add(admin)
+                    db.session.commit()
+                    results['admin'] = f'created (id={admin.id})'
+                    print(f"🔗 [NUKE] ✅ Admin created: {admin_email}", flush=True)
+            except Exception as e:
+                results['errors'].append(f'admin seed: {str(e)[:300]}')
+                print(f"🔗 [NUKE] ⚠️ Admin seed failed: {e}", flush=True)
+
+        results['success'] = len(results['errors']) == 0
+        return jsonify(results), 200 if results['success'] else 500
+
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e),
+            'traceback': traceback.format_exc(),
+            'partial_results': results,
+        }), 500
 
 def _log_initialization_error(e):
     """Log initialization error and return error results"""
