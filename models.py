@@ -2952,7 +2952,7 @@ class EnvironmentalAlert(db.Model):
     threshold_value = db.Column(db.Float)
     status = db.Column(db.String(20), default='active')
     company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), nullable=True, index=True)
-    site_id = db.Column(db.Integer, db.ForeignKey('sites.id'), nullable=True, index=True)
+    
 
 
 class ComplianceAutomationSettings(db.Model):
