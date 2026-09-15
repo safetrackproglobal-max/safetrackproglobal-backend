@@ -2858,7 +2858,7 @@ class DocumentComment(db.Model):
     # ============================================================
     document = db.relationship('Document', foreign_keys=[document_id], back_populates='comment_items')
     user = db.relationship('User', foreign_keys=[user_id])
-    replies = db.relationship('DocumentComment', backref=db.backref('parent', remote_side=[id]), lazy='dynamic')
+    replies = db.relationship('DocumentComment', foreign_keys=[parent_id], backref=db.backref('parent', remote_side=[id]), lazy='dynamic')
     
     __table_args__ = (
         db.Index('idx_doc_comments_document', 'document_id'),
