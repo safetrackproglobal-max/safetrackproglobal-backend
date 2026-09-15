@@ -8134,7 +8134,20 @@ def register():
                     'error': f'Invalid plan. Individual users can only have: {", ".join(INDIVIDUAL_PLANS)}',
                     'valid_plans': INDIVIDUAL_PLANS
                 }), 400
-            
+
+            # ✅ UPDATED: Normalize plan and derive an explicit subscription_status
+            #    so login never has to guess. Free plan = active immediately.
+            normalized_plan = (plan or 'free').lower()
+            if normalized_plan not in INDIVIDUAL_PLANS:
+                normalized_plan = 'free'
+
+            # Free plan → active right away (no payment required)
+            # Paid plan → pending_payment until checkout completes
+            if normalized_plan == 'free':
+                initial_subscription_status = 'active'
+            else:
+                initial_subscription_status = 'pending_payment'
+
             # ✅ Individual users get their own plan (not from company)
             user = User(
                 email=email,
@@ -8147,7 +8160,8 @@ def register():
                 preferred_language=preferred_language,
                 user_type='user',
                 verified=False,
-                subscription_plan=plan or 'free',  # ✅ Individual plan
+                subscription_plan=normalized_plan,                    # ✅ UPDATED (was plan or 'free')
+                subscription_status=initial_subscription_status,      # ✅ UPDATED (was missing entirely)
                 trial_plan='pro',
                 trial_ends_at=datetime.utcnow() + timedelta(days=14),
                 created_at=datetime.utcnow()
@@ -8155,7 +8169,7 @@ def register():
             db.session.add(user)
             db.session.commit()
             
-            logger.info(f"✅ User registered: {email} (Type: user) | Plan: {user.subscription_plan}")
+            logger.info(f"✅ User registered: {email} (Type: user) | Plan: {user.subscription_plan} | Status: {user.subscription_status}")
 
             # Generate verification code
             code = generate_verification_code()
@@ -8171,7 +8185,7 @@ def register():
             db.session.commit()
 
             # Send verification email
-            email_subject = "Verify Your SafetyTrack Pro Account"
+            email_subject = "Verify Your SafeTrackPro Global Account"
             email_body = f"""
             <!DOCTYPE html>
             <html>
@@ -8189,11 +8203,11 @@ def register():
             <body>
                 <div class="container">
                     <div class="header">
-                        <h1>Welcome to SafetyTrack Pro!</h1>
+                        <h1>Welcome to SafeTrackPro Global!</h1>
                     </div>
                     <div class="content">
                         <p>Dear <strong>{name}</strong>,</p>
-                        <p>Thank you for registering with <strong>SafetyTrack Pro</strong>.</p>
+                        <p>Thank you for registering with <strong>SafeTrackPro Global</strong>.</p>
                         
                         <div class="highlight">
                             <p>📋 <strong>Your verification code is:</strong></p>
@@ -8204,10 +8218,10 @@ def register():
                         <p>🎁 <strong>You have been granted a 14-day free trial</strong> of our Professional plan!</p>
                         
                         <p>If you didn't create an account, please ignore this email.</p>
-                        <p style="margin-top: 30px;">Need help? Contact us at <a href="mailto:support@safetytrack.com">support@safetytrack.com</a></p>
+                        <p style="margin-top: 30px;">Need help? Contact us at <a href="mailto:support@safetrackproglobal.com">support@safetytrack.com</a></p>
                     </div>
                     <div class="footer">
-                        <p>Best regards,<br><strong>SafetyTrack Pro Team</strong></p>
+                        <p>Best regards,<br><strong>SafeTrackPro Global Team</strong></p>
                     </div>
                 </div>
             </body>
@@ -8221,6 +8235,8 @@ def register():
                 'message': 'User registered successfully. Please check your email for verification.',
                 'user_id': user.id,
                 'user_type': user.user_type,
+                'plan': user.subscription_plan,                       # ✅ UPDATED (explicit, so frontend can log it)
+                'subscription_status': user.subscription_status,      # ✅ UPDATED
                 'stage': 'needs_verification',
                 'redirect_to': '/verify-email',
                 'trial_ends_at': user.trial_ends_at.isoformat() if user.trial_ends_at else None,
@@ -8236,8 +8252,6 @@ def register():
             'success': False,
             'error': 'Internal server error during registration'
         }), 500
-
-
     
 # [The remaining routes would follow the same enhanced pattern with comprehensive error handling, validation, and features]
 def _create_violation_notification(self, user_id: int, violation: SafetyViolation, results: Dict, department: str):
@@ -29173,6 +29187,15 @@ def get_current_subscription():
         logger.error(f"Get subscription error: {e}")
         return jsonify({'error': 'Internal server error'}), 500
 
+@app.route('/api/user/update-plan', methods=['POST', 'OPTIONS'])
+
+def update_user_plan_alias():
+    """Alias endpoint — forwards to upgrade_subscription"""
+    if request.method == 'OPTIONS':
+        return jsonify({'status': 'ok'}), 200
+    return upgrade_subscription()
+
+
 @app.route('/api/subscriptions/upgrade', methods=['POST'], endpoint='upgrade_subscription')
 @jwt_required
 def upgrade_subscription():
@@ -38261,17 +38284,34 @@ def login():
 
         # ✅ ===== INDIVIDUAL USER (Regular user) =====
         elif user.user_type == 'user':
-            # Individual users can have their own plan
-            user_plan = getattr(user, 'subscription_plan', 'free')
-            subscription_status = getattr(user, 'subscription_status', 'inactive')
-            
-            if not user_plan or user_plan == 'free':
-                stage = 'needs_plan'
-                redirect_to = '/select-plan'
-                requires_plan_selection = True
-                payment_status = 'no_plan'
+            # ------------------------------------------------------------------
+            # ✅ UPDATED LOGIC:
+            #  - Free plan users go straight to the dashboard after email verify
+            #  - Only users with NO plan at all are asked to select a plan
+            #  - Paid plan users with pending subscription go to /payment
+            # ------------------------------------------------------------------
+            user_plan = getattr(user, 'subscription_plan', None)
+            subscription_status = getattr(user, 'subscription_status', None)
+
+            # Normalize: treat missing/empty plan as 'free' so previously
+            # registered free users are never pushed into plan selection again.
+            if not user_plan:
+                user_plan = 'free'
+                user.subscription_plan = 'free'
+                if not subscription_status:
+                    subscription_status = 'active'
+                    user.subscription_status = 'active'
+                db.session.commit()
+
+            if user_plan == 'free':
+                # ✅ Free users skip plan selection and go straight to dashboard
+                stage = 'complete'
+                redirect_to = '/dashboard'
+                requires_plan_selection = False
+                requires_payment = False
+                payment_status = 'free'
             elif user_plan in ['pro', 'basic']:
-                if subscription_status in ['pending', 'pending_payment', 'inactive']:
+                if subscription_status in ['pending', 'pending_payment', 'inactive', None]:
                     stage = 'needs_payment'
                     redirect_to = '/payment'
                     requires_payment = True
