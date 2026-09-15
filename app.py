@@ -27208,21 +27208,35 @@ def has_document_feature_access(user, feature_name):
     """Check if user has access to document features"""
     if not user:
         return False
-    
-    # Super admin bypass
+
+    # ✅ Super admin bypass
     if getattr(user, 'is_super_admin', False):
         return True
-    
-    # Check plan
-    effective_plan = getattr(user, 'subscription_plan', 'free')
+
+    # ✅ System team / platform owner also bypass (matches the permissions endpoint)
+    if getattr(user, 'is_system_team', False):
+        return True
+    if getattr(user, 'is_platform_owner', False):
+        return True
+
+    # ✅ Company admins inherit paid-tier features from their company
+    user_type = getattr(user, 'user_type', 'user')
+    if user_type in ('admin', 'company_admin', 'hospital_admin', 'safety_manager'):
+        return True
+
+    # ✅ Normalize plan
+    effective_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
+
+    # ✅ Free plan has NO document features at all
     plan_features = {
-        'free': ['view', 'upload', 'download'],
-        'basic': ['view', 'upload', 'download', 'create'],
-        'pro': ['view', 'upload', 'download', 'create', 'edit', 'share', 'versioning'],
-        'business': ['view', 'upload', 'download', 'create', 'edit', 'share', 'versioning', 'approval'],
-        'enterprise': ['view', 'upload', 'download', 'create', 'edit', 'share', 'versioning', 'approval', 'archive']
+        'free':       [],                                                                                          # 🔒 no access
+        'basic':      ['view', 'upload', 'download', 'create'],
+        'pro':        ['view', 'upload', 'download', 'create', 'edit', 'share', 'versioning'],
+        'business':   ['view', 'upload', 'download', 'create', 'edit', 'share', 'versioning', 'approval'],
+        'enterprise': ['view', 'upload', 'download', 'create', 'edit', 'share', 'versioning', 'approval', 'archive'],
+        'custom':     ['view', 'upload', 'download', 'create', 'edit', 'share', 'versioning', 'approval', 'archive'],
     }
-    
+
     available_features = plan_features.get(effective_plan, [])
     return feature_name in available_features
 
@@ -27239,7 +27253,7 @@ def get_documents():
         current_user = request.user
         is_super_admin = check_super_admin()
         
-        # ✅ Check if user has document access
+        # ✅ Check if user has document access (plan gate)
         if not is_super_admin:
             has_access = (
                 has_document_feature_access(current_user, 'view') or
@@ -27250,9 +27264,10 @@ def get_documents():
                 return jsonify({
                     'success': False,
                     'error': 'Document access not available in your plan',
-                    'code': 'FEATURE_NOT_AVAILABLE',
-                    'required_plan': 'free',
-                    'current_plan': getattr(current_user, 'subscription_plan', 'free')
+                    'code': 'plan_upgrade_required',
+                    'current_plan': getattr(current_user, 'subscription_plan', 'free'),
+                    'required_plans': ['basic', 'pro', 'business', 'enterprise'],
+                    'upgrade_url': '/pricing',
                 }), 403
         
         # ==================== QUERY PARAMETERS ====================
@@ -27277,20 +27292,23 @@ def get_documents():
             limit = 10
         
         # ==================== BUILD QUERY WITH SCOPE ====================
+        scope, scope_value = get_document_scope(current_user, is_super_admin)
+
         query = Document.query
-        
-        # ✅ Apply scope based on user role
-        if is_super_admin:
+
+        if scope == 'all':
             # Super admin sees all documents
             pass
-        else:
-            user_company_id = getattr(current_user, 'company_id', None)
-            if user_company_id:
-                # User has company - show company documents
-                query = query.filter_by(company_id=user_company_id)
-            else:
-                # User has no company - show only their own documents
-                query = query.filter_by(user_id=current_user.id)
+        elif scope == 'company':
+            # Company user — all docs belonging to their company
+            query = query.filter(Document.company_id == scope_value)
+        else:  # scope == 'user'  (no company)
+            # ✅ Personal scope: only documents owned by this user
+            #    AND not attached to any company
+            query = query.filter(
+                Document.user_id == scope_value,
+                Document.company_id.is_(None)
+            )
         
         # ==================== APPLY FILTERS ====================
         if search:
@@ -27377,7 +27395,7 @@ def get_documents():
                 'file_name': doc.file_name,
                 'file_size': doc.file_size,
                 'mime_type': doc.mime_type,
-                'tags': doc.tags or [],
+                'tags': doc.get_tags() if hasattr(doc, 'get_tags') else (doc.tags or []),
                 'is_confidential': doc.is_confidential,
                 'requires_approval': doc.requires_approval,
                 'review_status': doc.review_status,
@@ -27398,35 +27416,47 @@ def get_documents():
                     'can_edit': can_edit_document(current_user, doc, is_super_admin),
                     'can_delete': can_delete_document(current_user, doc, is_super_admin),
                     'can_view': True,
-                    'can_download': can_download_document(current_user, doc, is_super_admin)
+                    'can_download': can_download_document(current_user, doc, is_super_admin),
                 }
             }
             documents_data.append(doc_dict)
         
         # ==================== GET STATS ====================
-        if is_super_admin:
-            stats = {
-                'total': Document.query.count(),
-                'draft': Document.query.filter_by(status='draft').count(),
-                'review': Document.query.filter_by(status='review').count(),
-                'approved': Document.query.filter_by(status='approved').count(),
-                'published': Document.query.filter_by(status='published').count(),
-                'archived': Document.query.filter_by(status='archived').count(),
-                'rejected': Document.query.filter_by(status='rejected').count()
-            }
-        else:
-            # Use the same scope for stats
-            stats_query = query  # Reuse the filtered query
-            stats = {
-                'total': stats_query.count(),
-                'draft': stats_query.filter_by(status='draft').count(),
-                'review': stats_query.filter_by(status='review').count(),
-                'approved': stats_query.filter_by(status='approved').count(),
-                'published': stats_query.filter_by(status='published').count(),
-                'archived': stats_query.filter_by(status='archived').count(),
-                'rejected': stats_query.filter_by(status='rejected').count()
-            }
-        
+        # ✅ Stats are computed from an unfiltered scope query (no search/status filters),
+        #    so they reflect the user's whole scope, not the current page filters.
+        if scope == 'all':
+            scope_query = Document.query
+        elif scope == 'company':
+            scope_query = Document.query.filter(Document.company_id == scope_value)
+        else:  # user
+            scope_query = Document.query.filter(
+                Document.user_id == scope_value,
+                Document.company_id.is_(None)
+            )
+
+        stats = {
+            'total':    scope_query.count(),
+            'draft':    scope_query.filter(Document.status == 'draft').count(),
+            'review':   scope_query.filter(Document.status == 'review').count(),
+            'approved': scope_query.filter(Document.status == 'approved').count(),
+            'published':scope_query.filter(Document.status == 'published').count(),
+            'archived': scope_query.filter(Document.status == 'archived').count(),
+            'rejected': scope_query.filter(Document.status == 'rejected').count(),
+        }
+
+        # ✅ Top-level permissions — mirror what /permissions returns
+        top_permissions = {
+            'can_upload': can_upload_document(current_user, is_super_admin),
+            'can_create': can_create_document(current_user, is_super_admin),
+            'can_view': True,
+            'can_edit': can_edit_document(current_user, None, is_super_admin),
+            'can_share': scope == 'company',            # no sharing without a company
+            'can_approve': scope == 'company',          # no approvals without a company
+            'can_manage_users': scope == 'company' and getattr(current_user, 'user_type', None) in (
+                'admin', 'company_admin', 'hospital_admin', 'safety_manager'
+            ),
+        }
+
         return jsonify({
             'success': True,
             'documents': documents_data,
@@ -27437,26 +27467,25 @@ def get_documents():
                 'has_more': offset + limit < total
             },
             'stats': stats,
-            'access_level': 'super_admin' if is_super_admin else 'user',
-            'scope': 'all' if is_super_admin else ('company' if getattr(current_user, 'company_id', None) else 'user'),
-            'permissions': {
-                'can_upload': can_upload_document(current_user, is_super_admin),
-                'can_create': can_create_document(current_user, is_super_admin),
-                'can_view': True,
-                'can_edit': can_edit_document(current_user, None, is_super_admin)
-            }
+            'access_level': 'super_admin' if is_super_admin else (
+                'admin' if getattr(current_user, 'user_type', None) in (
+                    'admin', 'company_admin', 'hospital_admin', 'safety_manager'
+                ) else ('personal' if scope == 'user' else 'user')
+            ),
+            'scope': scope,
+            'company_id': getattr(current_user, 'company_id', None) if scope == 'company' else None,
+            'permissions': top_permissions,
         }), 200
         
     except Exception as e:
         current_app.logger.error(f"Get documents error: {str(e)}")
         import traceback
-        traceback.print_exc()
+        current_app.logger.error(f"Traceback: {traceback.format_exc()}")
         return jsonify({
             'success': False,
             'error': 'Internal server error',
             'details': str(e) if current_app.debug else None
         }), 500
-
 # routes/ai_routes.py - Add these to your existing AI routes file
 
 # ============================================================
@@ -133649,15 +133678,6 @@ def get_paystack_banks():
         return jsonify({'error': str(e)}), 500
 
 
-# Helper function for Paystack signature verification
-# ============================================================
-# DOCUMENT CONTROL ROUTES - COMPLETE FIX
-# ============================================================
-
-# ============================================================
-# HELPER FUNCTIONS
-# ============================================================
-
 def validate_pagination(limit, offset):
     """Validate and sanitize pagination parameters"""
     if limit > 100:
@@ -133780,59 +133800,95 @@ def can_access_document(user, document, is_super_admin=False):
     """Check if user can access a specific document"""
     if is_super_admin:
         return True
-    
+
     if not user or not document:
         return False
-    
+
+    # ✅ Free-plan users (and any plan without 'view') cannot access documents
+    if not has_document_feature_access(user, 'view'):
+        return False
+
     # User owns the document
     if hasattr(document, 'user_id') and document.user_id == user.id:
         return True
-    
+
     # User belongs to same company as document
     if hasattr(document, 'company_id') and document.company_id:
         user_company_id = getattr(user, 'company_id', None)
         if user_company_id and document.company_id == user_company_id:
             return True
-    
+
     # Document is public
     if hasattr(document, 'is_public') and document.is_public:
         return True
-    
+
     return False
+
 
 def can_edit_document(user, document, is_super_admin=False):
     """Check if user can edit a document"""
     if is_super_admin:
         return True
-    
+
     if not user or not document:
         return False
-    
+
+    # ✅ Must have 'edit' feature on their plan (free/basic → False)
+    if not has_document_feature_access(user, 'edit'):
+        return False
+
     # User owns the document
     if hasattr(document, 'user_id') and document.user_id == user.id:
         return True
-    
+
+    # ✅ Company admins can edit any doc within their company
+    user_type = getattr(user, 'user_type', None)
+    if user_type in ('admin', 'company_admin', 'hospital_admin', 'safety_manager'):
+        user_company_id = getattr(user, 'company_id', None)
+        doc_company_id = getattr(document, 'company_id', None)
+        if user_company_id and doc_company_id and user_company_id == doc_company_id:
+            return True
+
     return False
+
 
 def can_delete_document(user, document, is_super_admin=False):
     """Check if user can delete a document"""
     if is_super_admin:
         return True
-    
+
     if not user or not document:
         return False
-    
-    # Only document owner can delete
+
+    # ✅ Must have 'edit' feature on their plan (delete is coupled to edit)
+    # Free users have no features at all → denied
+    if not has_document_feature_access(user, 'edit'):
+        return False
+
+    # Only document owner can delete (own documents)
     if hasattr(document, 'user_id') and document.user_id == user.id:
         return True
-    
+
+    # ✅ Company admins can delete any doc within their company
+    user_type = getattr(user, 'user_type', None)
+    if user_type in ('admin', 'company_admin', 'hospital_admin', 'safety_manager'):
+        user_company_id = getattr(user, 'company_id', None)
+        doc_company_id = getattr(document, 'company_id', None)
+        if user_company_id and doc_company_id and user_company_id == doc_company_id:
+            return True
+
     return False
+
 
 def get_document_scope(user, is_super_admin=False):
     """Get document scope for user"""
     if is_super_admin:
         return 'all', None
-    
+
+    # ✅ Free users have no document scope — caller must treat this as denied
+    if not has_document_feature_access(user, 'view'):
+        return 'none', None
+
     user_company_id = getattr(user, 'company_id', None)
     if user_company_id:
         return 'company', user_company_id
@@ -133843,22 +133899,37 @@ def has_document_feature_access(user, feature_name):
     """Check if user has access to document features"""
     if not user:
         return False
-    
+
+    # ✅ Super admin bypass
     if getattr(user, 'is_super_admin', False):
         return True
-    
-    effective_plan = getattr(user, 'subscription_plan', 'free')
-    plan_features = {
-        'free': ['view', 'upload', 'download'],
-        'basic': ['view', 'upload', 'download', 'create'],
-        'pro': ['view', 'upload', 'download', 'create', 'edit', 'share', 'versioning'],
-        'business': ['view', 'upload', 'download', 'create', 'edit', 'share', 'versioning', 'approval'],
-        'enterprise': ['view', 'upload', 'download', 'create', 'edit', 'share', 'versioning', 'approval', 'archive']
-    }
-    
-    available_features = plan_features.get(effective_plan, ['view'])
-    return feature_name in available_features
 
+    # ✅ System team / platform owner also bypass (matches the permissions endpoint)
+    if getattr(user, 'is_system_team', False):
+        return True
+    if getattr(user, 'is_platform_owner', False):
+        return True
+
+    # ✅ Company admins inherit paid-tier features from their company
+    user_type = getattr(user, 'user_type', 'user')
+    if user_type in ('admin', 'company_admin', 'hospital_admin', 'safety_manager'):
+        return True
+
+    # ✅ Normalize plan
+    effective_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
+
+    # ✅ Free plan has NO document features at all
+    plan_features = {
+        'free':       [],                                                                                          # 🔒 no access
+        'basic':      ['view', 'upload', 'download', 'create'],
+        'pro':        ['view', 'upload', 'download', 'create', 'edit', 'share', 'versioning'],
+        'business':   ['view', 'upload', 'download', 'create', 'edit', 'share', 'versioning', 'approval'],
+        'enterprise': ['view', 'upload', 'download', 'create', 'edit', 'share', 'versioning', 'approval', 'archive'],
+        'custom':     ['view', 'upload', 'download', 'create', 'edit', 'share', 'versioning', 'approval', 'archive'],
+    }
+
+    available_features = plan_features.get(effective_plan, [])
+    return feature_name in available_features
 
 # ============================================================
 # 1. GET ALL DOCUMENTS (with filters)
@@ -136924,7 +136995,10 @@ def get_pending_tasks_control():
                 return jsonify({
                     'success': False,
                     'error': 'Document access not available in your plan',
-                    'code': 'FEATURE_NOT_AVAILABLE'
+                    'code': 'plan_upgrade_required',
+                    'current_plan': getattr(current_user, 'subscription_plan', 'free'),
+                    'required_plans': ['basic', 'pro', 'business', 'enterprise'],
+                    'upgrade_url': '/pricing',
                 }), 403
         
         limit = request.args.get('limit', 10, type=int)
@@ -136934,18 +137008,32 @@ def get_pending_tasks_control():
         # ✅ Build query with scope
         if is_super_admin:
             query = Task.query.filter_by(status='pending')
+            scope = 'all'
         else:
+            # ✅ Normalize company_id — treat None / "" / "null" / "undefined" as no company
+            raw_company = request.args.get('company_id')
+            if raw_company and raw_company.lower() in ('null', 'undefined', 'none', ''):
+                raw_company = None
+
             user_company_id = getattr(current_user, 'company_id', None)
-            if user_company_id:
-                query = Task.query.filter_by(
-                    company_id=user_company_id,
-                    status='pending'
-                )
-            else:
+
+            # ✅ If the user has no company → personal scope (filter by user_id)
+            if not user_company_id:
                 query = Task.query.filter_by(
                     user_id=current_user.id,
                     status='pending'
                 )
+                scope = 'user'
+
+            # ✅ If the user has a company, but the request explicitly asks for
+            #    a different company_id, ignore the request param and use the
+            #    user's real company (never trust the query param for scoping).
+            else:
+                query = Task.query.filter_by(
+                    company_id=user_company_id,
+                    status='pending'
+                )
+                scope = 'company'
         
         tasks = query.limit(limit).all()
         
@@ -136966,11 +137054,14 @@ def get_pending_tasks_control():
             'success': True,
             'tasks': tasks_data,
             'count': len(tasks_data),
-            'scope': 'all' if is_super_admin else ('company' if getattr(current_user, 'company_id', None) else 'user')
+            'scope': scope,
+            'company_id': getattr(current_user, 'company_id', None) if not is_super_admin else None,
         }), 200
         
     except Exception as e:
         current_app.logger.error(f"Get pending tasks error: {str(e)}")
+        import traceback
+        current_app.logger.error(f"Traceback: {traceback.format_exc()}")
         return jsonify({
             'success': False,
             'error': 'Failed to get pending tasks',
@@ -139021,7 +139112,6 @@ def use_template(template_id):
 # ============================================================
 # DOCUMENT PERMISSIONS ENDPOINT
 # ============================================================
-
 @app.route('/api/documents/permissions', methods=['GET'])
 @jwt_required
 def get_document_permissions():
@@ -139255,18 +139345,67 @@ def get_document_permissions():
                 
             permissions['access_level'] = 'user'
             
-        # ✅ FREE PLAN (Regular users)
+        # ✅ FREE PLAN (Regular users) — NO DOCUMENT ACCESS
         else:  # free plan
-            # Users can only edit/delete their own documents
-            permissions['can_edit_own'] = True
-            permissions['can_delete_own'] = True
-            
-            # Company admins from free plan still get some admin features
-            if is_company_admin:
-                permissions['can_manage_users'] = True
-                permissions['can_manage_templates'] = True
-            
-            permissions['access_level'] = 'user'
+            # 🔒 Free users have no access to any document features.
+            # Explicitly deny everything so the frontend can render an
+            # upgrade prompt instead of the document management page.
+            permissions.update({
+                'can_view': False,
+                'can_view_own': False,
+                'can_view_all': False,
+                'can_view_company': False,
+
+                'can_create': False,
+                'can_create_company': False,
+                'can_upload': False,
+                'can_upload_company': False,
+
+                'can_edit': False,
+                'can_edit_own': False,
+                'can_edit_company': False,
+                'can_edit_all': False,
+
+                'can_delete': False,
+                'can_delete_own': False,
+                'can_delete_company': False,
+                'can_delete_all': False,
+
+                'can_share': False,
+                'can_share_own': False,
+                'can_share_company': False,
+                'can_share_all': False,
+
+                'can_version': False,
+                'can_version_own': False,
+                'can_version_company': False,
+                'can_version_all': False,
+
+                'can_approve': False,
+                'can_approve_company': False,
+                'can_approve_all': False,
+
+                'can_archive': False,
+                'can_archive_own': False,
+                'can_archive_company': False,
+                'can_archive_all': False,
+
+                'can_manage_users': False,
+                'can_manage_roles': False,
+                'can_manage_templates': False,
+                'can_manage_categories': False,
+                'can_manage_workflows': False,
+                'can_manage_compliance': False,
+
+                # Metadata for the frontend
+                'is_admin': False,
+                'is_super_admin': False,
+                'is_company_admin': False,
+                'access_level': 'none',
+                'reason': 'plan_upgrade_required',
+                'upgrade_url': '/pricing',
+                'required_plans': ['basic', 'pro', 'business', 'enterprise'],
+            })
         
         # ============================================================
         # ADD USER INFO FOR DEBUGGING
@@ -139298,27 +139437,33 @@ def get_document_permissions():
         import traceback
         traceback.print_exc()
         
-        # Return safe defaults on error
+        # Return safe defaults on error — deny everything for safety
         return jsonify({
             'success': False,
             'error': str(e),
             'permissions': {
-                'can_view': True,
-                'can_create': True,
-                'can_upload': True,
+                'can_view': False,
+                'can_create': False,
+                'can_upload': False,
                 'can_edit': False,
                 'can_delete': False,
                 'can_share': False,
                 'can_version': False,
                 'can_approve': False,
                 'can_archive': False,
+                'can_manage_users': False,
+                'can_manage_roles': False,
+                'can_manage_templates': False,
+                'can_manage_categories': False,
+                'can_manage_workflows': False,
+                'can_manage_compliance': False,
                 'is_admin': False,
                 'is_super_admin': False,
                 'is_company_admin': False,
-                'access_level': 'user'
+                'access_level': 'none',
+                'reason': 'permissions_error'
             }
         }), 200
-
 # -- ERROR HANDLERS --
 
 @app.errorhandler(404)
