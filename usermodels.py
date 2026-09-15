@@ -140,7 +140,7 @@ class User(db.Model):
     improvement_initiatives = db.relationship('ImprovementInitiative', back_populates='proposer', foreign_keys='ImprovementInitiative.proposed_by')
     corrective_actions = db.relationship('CorrectiveAction', back_populates='assignee', foreign_keys='CorrectiveAction.assigned_to')
     
-    approved_admins = db.relationship('User', backref=db.backref('approver', remote_side=[id]))
+    approved_admins = db.relationship('User', foreign_keys=[approved_by], backref=db.backref('approver', remote_side=[id]))
     subscription_history = db.relationship('SubscriptionHistory', backref='user', lazy=True, cascade='all, delete-orphan')
     payment_history = db.relationship('PaymentHistory', backref='user', lazy=True, cascade='all, delete-orphan')
     def to_dict(self):
