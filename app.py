@@ -9304,20 +9304,14 @@ def get_profile():
         }), 500
 # ==================== PLAN DISTRIBUTION ENDPOINT ====================
 
-@app.route('/api/safetypro/user/upgrade', methods=['POST', 'OPTIONS'])
+@app.route('/api/safetypro/user/upgrade', methods=['POST'])
 @safetypro_required
 def upgrade_user_plan():
     """Upgrade a user's subscription plan"""
-    
-    # Handle CORS preflight
-    if request.method == 'OPTIONS':
-        return jsonify({'status': 'ok'}), 200
-    
     try:
         current_user = request.user
         data = request.get_json() or {}
         
-        # Extract fields (matching frontend payload exactly)
         target_user_id = data.get('user_id')
         new_plan = data.get('new_plan')
         billing_cycle = data.get('billing_cycle', '1_month')
@@ -9326,26 +9320,17 @@ def upgrade_user_plan():
         admin_notes = data.get('admin_notes', '')
         custom_price = data.get('custom_price')
         
-        # Log
         app.logger.info(
             f"Upgrade request by {current_user.email}: "
             f"user_id={target_user_id}, new_plan={new_plan}"
         )
         
-        # Validate
         if not target_user_id:
-            return jsonify({
-                'success': False,
-                'error': 'user_id is required'
-            }), 400
+            return jsonify({'success': False, 'error': 'user_id is required'}), 400
         
         if not new_plan:
-            return jsonify({
-                'success': False,
-                'error': 'new_plan is required'
-            }), 400
+            return jsonify({'success': False, 'error': 'new_plan is required'}), 400
         
-        # Find target user
         target_user = User.query.get(target_user_id)
         if not target_user:
             return jsonify({
@@ -9353,10 +9338,8 @@ def upgrade_user_plan():
                 'error': f'User {target_user_id} not found'
             }), 404
         
-        # Store old values
         old_plan = target_user.subscription_plan
         
-        # Update user
         target_user.subscription_plan = new_plan
         target_user.subscription_status = 'active'
         target_user.token_version = (target_user.token_version or 1) + 1
@@ -9372,11 +9355,9 @@ def upgrade_user_plan():
             f"by {current_user.email}"
         )
         
-        # Clear cache
         try:
             for key in redis_client.scan_iter(f"*{target_user_id}*"):
                 redis_client.delete(key)
-            app.logger.info(f"✅ Cache cleared for user {target_user_id}")
         except Exception as cache_error:
             app.logger.warning(f"⚠️ Cache clear error: {cache_error}")
         
@@ -9403,19 +9384,14 @@ def upgrade_user_plan():
         traceback.print_exc()
         return jsonify({
             'success': False,
-            'error': str(e),
-            'message': 'Failed to upgrade user'
+            'error': str(e)
         }), 500
 
 
-@app.route('/api/safetypro/user/<int:user_id>/downgrade', methods=['POST', 'OPTIONS'])
+@app.route('/api/safetypro/user/<int:user_id>/downgrade', methods=['POST'])
 @safetypro_required
 def downgrade_user_plan(user_id):
     """Downgrade user to free plan"""
-    
-    if request.method == 'OPTIONS':
-        return jsonify({'status': 'ok'}), 200
-    
     try:
         current_user = request.user
         
@@ -9440,7 +9416,6 @@ def downgrade_user_plan(user_id):
             f"by {current_user.email}"
         )
         
-        # Clear cache
         try:
             for key in redis_client.scan_iter(f"*{user_id}*"):
                 redis_client.delete(key)
@@ -9466,7 +9441,6 @@ def downgrade_user_plan(user_id):
             'success': False,
             'error': str(e)
         }), 500
-
 
 @app.route('/api/admin/analytics/plan-distribution', methods=['GET'])
 @jwt_required
