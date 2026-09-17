@@ -9325,21 +9325,16 @@ def upgrade_user_plan():
             f"user_id={target_user_id}, new_plan={new_plan}"
         )
         
-        if not target_user_id:
-            return jsonify({'success': False, 'error': 'user_id is required'}), 400
-        
-        if not new_plan:
-            return jsonify({'success': False, 'error': 'new_plan is required'}), 400
+        if not target_user_id or not new_plan:
+            return jsonify({'success': False, 'error': 'user_id and new_plan required'}), 400
         
         target_user = User.query.get(target_user_id)
         if not target_user:
-            return jsonify({
-                'success': False,
-                'error': f'User {target_user_id} not found'
-            }), 404
+            return jsonify({'success': False, 'error': f'User {target_user_id} not found'}), 404
         
         old_plan = target_user.subscription_plan
         
+        # Update
         target_user.subscription_plan = new_plan
         target_user.subscription_status = 'active'
         target_user.token_version = (target_user.token_version or 1) + 1
@@ -9350,20 +9345,34 @@ def upgrade_user_plan():
         
         db.session.commit()
         
-        app.logger.info(
-            f"✅ User {target_user_id} upgraded: {old_plan} → {new_plan} "
-            f"by {current_user.email}"
-        )
+        app.logger.info(f"✅ User {target_user_id} upgraded: {old_plan} → {new_plan}")
         
+        # Clear cache
         try:
             for key in redis_client.scan_iter(f"*{target_user_id}*"):
                 redis_client.delete(key)
         except Exception as cache_error:
             app.logger.warning(f"⚠️ Cache clear error: {cache_error}")
         
+        # ✅ SEND EMAIL
+        email_sent = False
+        if send_notification:
+            try:
+                email_sent = send_plan_upgrade_email(
+                    user=target_user,
+                    old_plan=old_plan,
+                    new_plan=new_plan,
+                    billing_cycle=billing_cycle,
+                    admin_notes=admin_notes
+                )
+                app.logger.info(f"📧 Upgrade email result: {email_sent} for {target_user.email}")
+            except Exception as email_error:
+                app.logger.error(f"❌ Upgrade email failed: {email_error}")
+        
         return jsonify({
             'success': True,
             'message': f'User upgraded from {old_plan} to {new_plan}',
+            'email_sent': email_sent,
             'user': {
                 'id': target_user.id,
                 'email': target_user.email,
@@ -9382,10 +9391,7 @@ def upgrade_user_plan():
         app.logger.error(f"❌ Upgrade error: {str(e)}")
         import traceback
         traceback.print_exc()
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 
 @app.route('/api/safetypro/user/<int:user_id>/downgrade', methods=['POST'])
@@ -9394,13 +9400,13 @@ def downgrade_user_plan(user_id):
     """Downgrade user to free plan"""
     try:
         current_user = request.user
+        data = request.get_json() or {}
+        send_notification = data.get('send_notification', True)
+        admin_notes = data.get('admin_notes', '')
         
         target_user = User.query.get(user_id)
         if not target_user:
-            return jsonify({
-                'success': False,
-                'error': f'User {user_id} not found'
-            }), 404
+            return jsonify({'success': False, 'error': f'User {user_id} not found'}), 404
         
         old_plan = target_user.subscription_plan
         
@@ -9409,12 +9415,12 @@ def downgrade_user_plan(user_id):
         target_user.token_version = (target_user.token_version or 1) + 1
         target_user.updated_at = datetime.utcnow()
         
+        if admin_notes:
+            target_user.admin_notes = admin_notes
+        
         db.session.commit()
         
-        app.logger.info(
-            f"✅ User {user_id} downgraded: {old_plan} → free "
-            f"by {current_user.email}"
-        )
+        app.logger.info(f"✅ User {user_id} downgraded: {old_plan} → free")
         
         try:
             for key in redis_client.scan_iter(f"*{user_id}*"):
@@ -9422,12 +9428,28 @@ def downgrade_user_plan(user_id):
         except Exception as cache_error:
             app.logger.warning(f"⚠️ Cache clear error: {cache_error}")
         
+        # ✅ SEND EMAIL
+        email_sent = False
+        if send_notification:
+            try:
+                email_sent = send_plan_downgrade_email(
+                    user=target_user,
+                    old_plan=old_plan,
+                    new_plan='free',
+                    admin_notes=admin_notes
+                )
+                app.logger.info(f"📧 Downgrade email result: {email_sent} for {target_user.email}")
+            except Exception as email_error:
+                app.logger.error(f"❌ Downgrade email failed: {email_error}")
+        
         return jsonify({
             'success': True,
             'message': f'User downgraded from {old_plan} to free',
+            'email_sent': email_sent,
             'user': {
                 'id': target_user.id,
                 'email': target_user.email,
+                'name': target_user.name,
                 'old_plan': old_plan,
                 'new_plan': 'free',
                 'downgraded_by': current_user.email
@@ -9437,10 +9459,7 @@ def downgrade_user_plan(user_id):
     except Exception as e:
         db.session.rollback()
         app.logger.error(f"❌ Downgrade error: {str(e)}")
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 @app.route('/api/admin/analytics/plan-distribution', methods=['GET'])
 @jwt_required
@@ -42319,8 +42338,267 @@ def send_admin_approval_notification(super_admin_email, admin_user):
         print(f"❌ Failed to send admin approval notification: {e}")
         return False
 
+def send_plan_upgrade_email(user, old_plan, new_plan, billing_cycle='1_month', admin_notes=''):
+    """
+    Send plan upgrade confirmation email to user
+    Uses existing send_email() helper
+    """
+    try:
+        subject = f"🎉 Your SafeTrackPro Global Plan Has Been Upgraded to {new_plan.upper()}"
+        
+        # Format friendly plan names
+        plan_names = {
+            'free': 'Free',
+            'basic': 'Basic',
+            'pro': 'Pro',
+            'enterprise': 'Enterprise',
+            'platform_owner': 'Platform Owner',
+            'custom': 'Custom',
+            'professional': 'Professional'
+        }
+        old_plan_label = plan_names.get(old_plan.lower() if old_plan else 'free', old_plan or 'Free')
+        new_plan_label = plan_names.get(new_plan.lower(), new_plan)
+        
+        # Plan feature highlights
+        plan_features = {
+            'basic': [
+                'Up to 10 users',
+                'Basic safety reports',
+                'Standard support'
+            ],
+            'pro': [
+                'Up to 50 users',
+                'Advanced analytics',
+                'Priority email support',
+                'Custom reports'
+            ],
+            'professional': [
+                'Up to 100 users',
+                'Advanced analytics',
+                'Priority support',
+                'Custom integrations'
+            ],
+            'enterprise': [
+                'Unlimited users',
+                'Full AI features',
+                'Dedicated support',
+                'Custom integrations',
+                'Advanced compliance tools'
+            ],
+            'platform_owner': [
+                'Full platform access',
+                'Unlimited everything',
+                'Admin controls',
+                'Priority everything'
+            ],
+            'custom': [
+                'Custom features',
+                'Custom user limits',
+                'Dedicated support'
+            ]
+        }
+        
+        features = plan_features.get(new_plan.lower(), [
+            'Access to all features',
+            'Standard support'
+        ])
+        
+        features_html = ''.join([f'<li style="margin: 8px 0;">✅ {f}</li>' for f in features])
+        
+        html_content = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <style>
+                body {{ font-family: Arial, sans-serif; line-height: 1.6; color: #333; margin: 0; padding: 0; }}
+                .container {{ max-width: 600px; margin: 0 auto; padding: 20px; }}
+                .header {{ background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 40px 30px; text-align: center; border-radius: 10px 10px 0 0; }}
+                .header h1 {{ margin: 0; font-size: 28px; }}
+                .header p {{ margin: 10px 0 0 0; opacity: 0.9; }}
+                .content {{ background: #f9f9f9; padding: 30px; }}
+                .plan-box {{ background: white; padding: 20px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #667eea; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }}
+                .plan-transition {{ text-align: center; font-size: 18px; margin: 20px 0; }}
+                .old-plan {{ color: #999; text-decoration: line-through; }}
+                .arrow {{ color: #667eea; margin: 0 15px; font-size: 24px; }}
+                .new-plan {{ color: #667eea; font-weight: bold; font-size: 22px; }}
+                .features {{ list-style: none; padding: 0; margin: 15px 0; }}
+                .features li {{ padding: 8px 0; border-bottom: 1px solid #eee; }}
+                .features li:last-child {{ border-bottom: none; }}
+                .button {{ background: #667eea; color: white; padding: 14px 30px; text-decoration: none; border-radius: 5px; display: inline-block; font-weight: bold; margin: 20px 0; }}
+                .button:hover {{ background: #5568d3; }}
+                .footer {{ text-align: center; padding: 20px; font-size: 12px; color: #666; background: #f0f0f0; border-radius: 0 0 10px 10px; }}
+                .admin-note {{ background: #fff8e1; padding: 15px; border-radius: 5px; border-left: 4px solid #ffc107; margin: 15px 0; }}
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <div class="header">
+                    <h1>🎉 Plan Upgraded!</h1>
+                    <p>SafeTrackPro Global</p>
+                </div>
+                <div class="content">
+                    <p>Hi <strong>{user.name or user.email.split('@')[0]}</strong>,</p>
+                    
+                    <p>Great news! Your SafeTrackPro Global account has been upgraded. You now have access to more powerful features to keep your teams safer.</p>
+                    
+                    <div class="plan-box">
+                        <div class="plan-transition">
+                            <span class="old-plan">{old_plan_label}</span>
+                            <span class="arrow">→</span>
+                            <span class="new-plan">{new_plan_label}</span>
+                        </div>
+                    </div>
+                    
+                    <div class="plan-box">
+                        <h3 style="margin-top: 0; color: #667eea;">Your New Plan Includes:</h3>
+                        <ul class="features">
+                            {features_html}
+                        </ul>
+                    </div>
+                    
+                    <p><strong>Billing Cycle:</strong> {billing_cycle.replace('_', ' ').title()}</p>
+                    <p><strong>Effective:</strong> Immediately</p>
+                    
+                    {f'<div class="admin-note"><strong>📝 Note from admin:</strong><br>{admin_notes}</div>' if admin_notes else ''}
+                    
+                    <div style="text-align: center;">
+                        <a href="https://www.safetrackproglobal.com/dashboard" class="button">
+                            Go to Dashboard →
+                        </a>
+                    </div>
+                    
+                    <p style="color: #666; font-size: 13px; margin-top: 30px;">
+                        If you have any questions about your new plan, please contact our support team.
+                    </p>
+                    
+                    <p>Best regards,<br><strong>The SafeTrackPro Global Team</strong></p>
+                </div>
+                <div class="footer">
+                    <p>&copy; 2026 SafeTrackPro Global. All rights reserved.</p>
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+        
+        # Use your existing send_email helper
+        result = send_email(user.email, subject, html_content)
+        
+        if result:
+            logger.info(f"✅ Upgrade email sent to {user.email} ({old_plan} → {new_plan})")
+            print(f"✅ Upgrade email sent to {user.email}")
+        else:
+            logger.warning(f"⚠️ Upgrade email returned False for {user.email}")
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to send upgrade email to {user.email}: {e}")
+        print(f"❌ Failed to send upgrade email: {e}")
+        return False
 
-# backend/routes/auth_routes.py or app.py
+
+def send_plan_downgrade_email(user, old_plan, new_plan, admin_notes=''):
+    """
+    Send plan downgrade notification email to user
+    Uses existing send_email() helper
+    """
+    try:
+        subject = f"Your SafeTrackPro Global Plan Has Changed to {new_plan.upper()}"
+        
+        plan_names = {
+            'free': 'Free',
+            'basic': 'Basic',
+            'pro': 'Pro',
+            'enterprise': 'Enterprise',
+            'platform_owner': 'Platform Owner'
+        }
+        old_plan_label = plan_names.get(old_plan.lower() if old_plan else 'free', old_plan or 'Free')
+        new_plan_label = plan_names.get(new_plan.lower(), new_plan)
+        
+        html_content = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <style>
+                body {{ font-family: Arial, sans-serif; line-height: 1.6; color: #333; margin: 0; padding: 0; }}
+                .container {{ max-width: 600px; margin: 0 auto; padding: 20px; }}
+                .header {{ background: linear-gradient(135deg, #f39c12 0%, #e67e22 100%); color: white; padding: 40px 30px; text-align: center; border-radius: 10px 10px 0 0; }}
+                .header h1 {{ margin: 0; font-size: 28px; }}
+                .header p {{ margin: 10px 0 0 0; opacity: 0.9; }}
+                .content {{ background: #f9f9f9; padding: 30px; }}
+                .plan-box {{ background: white; padding: 20px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #f39c12; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }}
+                .plan-transition {{ text-align: center; font-size: 18px; margin: 20px 0; }}
+                .old-plan {{ color: #999; text-decoration: line-through; }}
+                .arrow {{ color: #f39c12; margin: 0 15px; font-size: 24px; }}
+                .new-plan {{ color: #f39c12; font-weight: bold; font-size: 22px; }}
+                .info-box {{ background: #fff3cd; padding: 15px; border-radius: 5px; border-left: 4px solid #ffc107; margin: 20px 0; }}
+                .button {{ background: #f39c12; color: white; padding: 14px 30px; text-decoration: none; border-radius: 5px; display: inline-block; font-weight: bold; margin: 20px 0; }}
+                .footer {{ text-align: center; padding: 20px; font-size: 12px; color: #666; background: #f0f0f0; border-radius: 0 0 10px 10px; }}
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <div class="header">
+                    <h1>Plan Update Notice</h1>
+                    <p>SafeTrackPro Global</p>
+                </div>
+                <div class="content">
+                    <p>Hi <strong>{user.name or user.email.split('@')[0]}</strong>,</p>
+                    
+                    <p>Your SafeTrackPro Global account plan has been changed. Please review the details below.</p>
+                    
+                    <div class="plan-box">
+                        <div class="plan-transition">
+                            <span class="old-plan">{old_plan_label}</span>
+                            <span class="arrow">→</span>
+                            <span class="new-plan">{new_plan_label}</span>
+                        </div>
+                    </div>
+                    
+                    <div class="info-box">
+                        <h3 style="margin-top: 0;">What This Means:</h3>
+                        <ul style="margin: 10px 0; padding-left: 20px;">
+                            <li>Your account is now on the <strong>{new_plan_label}</strong> plan</li>
+                            <li>Some premium features may no longer be available</li>
+                            <li>Your usage limits have been adjusted accordingly</li>
+                        </ul>
+                    </div>
+                    
+                    {f'<div class="info-box"><strong>📝 Note from admin:</strong><br>{admin_notes}</div>' if admin_notes else ''}
+                    
+                    <p>If you have any questions or would like to discuss upgrading again, please contact our support team — we're happy to help.</p>
+                    
+                    <div style="text-align: center;">
+                        <a href="https://www.safetrackproglobal.com/dashboard" class="button">
+                            Go to Dashboard →
+                        </a>
+                    </div>
+                    
+                    <p>Best regards,<br><strong>The SafeTrackPro Global Team</strong></p>
+                </div>
+                <div class="footer">
+                    <p>&copy; 2026 SafeTrackPro Global. All rights reserved.</p>
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+        
+        result = send_email(user.email, subject, html_content)
+        
+        if result:
+            logger.info(f"✅ Downgrade email sent to {user.email} ({old_plan} → {new_plan})")
+            print(f"✅ Downgrade email sent to {user.email}")
+        else:
+            logger.warning(f"⚠️ Downgrade email returned False for {user.email}")
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to send downgrade email to {user.email}: {e}")
+        print(f"❌ Failed to send downgrade email: {e}")
+        return False
 
 from flask_jwt_extended import create_access_token, get_jwt_identity
 
