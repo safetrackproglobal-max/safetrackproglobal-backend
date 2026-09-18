@@ -101,6 +101,53 @@ from usermodels import (
     ComplianceRequirement,
     ComplianceAuditLog,
     DocumentComplianceLink,
+    DocumentPermission,
+    DocumentSecurity,
+    AccessAuditLog,
+    RetentionPolicy,
+    LegalHold,
+    DispositionCertificate,
+    WatermarkSettings,
+    WatermarkLog,
+    WorkflowExecution,
+    DocumentComplianceReport,
+    DocumentComplianceAssessment,
+    DocumentComplianceSchedule,
+    DocumentBundle,
+    BundleDocument,
+    Share,
+    ShareActivity,
+    IntakeQueueItem,
+    IntakeStats,
+    SearchAlert,
+    AssistantConversation,
+    AssistantMessage,
+    BIDashboard,
+    BIDashboardShare,
+    Anomaly,
+    DetectionRule,
+    UserBaseline,
+    CustomReport,
+    Prediction,
+    PredictiveAlert,
+    QualityRecord,
+    QualityAction,
+    QualityTimeline,
+    QualityMetrics,
+    OfflineDocument,
+    SyncQueueItem,
+    SyncConflict,
+    OfflineSettings,
+    Integration,
+    Webhook,
+    APIKey,
+    IntegrationActivity,
+    CollaborationSession,
+    DocumentLock,
+    DocumentWorkflowDefinition,
+    DocumentWorkflowExecution,
+    MLPredictiveModel,
+    PredictiveAlert,
 
 
 
@@ -2952,7 +2999,7 @@ class EnvironmentalAlert(db.Model):
     threshold_value = db.Column(db.Float)
     status = db.Column(db.String(20), default='active')
     company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), nullable=True, index=True)
-    
+    site_id = db.Column(db.Integer, db.ForeignKey('environmental_sites.id'), nullable=True, index=True)
 
 
 class ComplianceAutomationSettings(db.Model):
@@ -4543,10 +4590,10 @@ class AIPDFVersion(db.Model):
     
     # Indexes for better performance
     __table_args__ = (
-        db.Index('idx_pdf_versions_document', 'pdf_document_id'),
-        db.Index('idx_pdf_versions_created_by', 'created_by'),
-        db.Index('idx_pdf_versions_parent', 'parent_version_id'),
-        db.UniqueConstraint('pdf_document_id', 'version_number', name='uq_document_version')
+        db.Index('idx_ai_pdf_versions_document', 'pdf_document_id'),
+        db.Index('idx_ai_pdf_versions_created_by', 'created_by'),
+        db.Index('idx_ai_pdf_versions_parent', 'parent_version_id'),
+        db.UniqueConstraint('pdf_document_id', 'version_number', name='uq_ai_pdf_versions_doc_ver')
     )
 
 
@@ -5985,6 +6032,55 @@ __all__ = [
     'Emergency',
     'DiseaseSurveillance',
     'EmergencyPreparedness',
+    'DocumentPermission',
+    'DocumentSecurity',
+    'AccessAuditLog',
+    'RetentionPolicy',
+    'LegalHold',
+    'DispositionCertificate',
+    'WatermarkSettings',
+    'WatermarkLog',
+    'WorkflowExecution',
+    'DocumentComplianceReport',
+    'DocumentComplianceAssessment',
+    'DocumentComplianceSchedule',
+    'DocumentBundle',
+    'BundleDocument',
+    'Share',
+    'ShareActivity',
+    'IntakeQueueItem',
+    'IntakeStats',
+    'SearchAlert',
+    'AssistantConversation',
+    'AssistantMessage',
+    'BIDashboard',
+    'BIDashboardShare',
+    'Anomaly',
+    'DetectionRule',
+    'UserBaseline',
+    'CustomReport',
+    'Prediction',
+    'PredictiveAlert',
+    'QualityRecord',
+    'QualityAction',
+    'QualityTimeline',
+    'QualityMetrics',
+    'OfflineDocument',
+    'SyncQueueItem',
+    'SyncConflict',
+    'OfflineSettings',
+    'Integration',
+    'Webhook',
+    'APIKey',
+    'IntegrationActivity',
+    'CollaborationSession',
+    'DocumentLock',
+    
+    'DocumentWorkflowDefinition',
+    'DocumentWorkflowExecution',
+    'MLPredictiveModel',
+    'Prediction',
+    'PredictiveAlert',
 
     
 ]

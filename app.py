@@ -139880,6 +139880,5936 @@ def get_document_permissions():
                 'reason': 'permissions_error'
             }
         }), 200
+
+@app.route('/api/dm-documents/<int:document_id>/permissions', methods=['GET'])
+@jwt_required
+@cross_origin()
+def dm_get_document_permissions(document_id):
+    """Get all permissions for a document"""
+    try:
+        # Super admin check
+        is_super_admin = check_super_admin()
+        current_app.logger.info(f"DM permissions GET - Doc: {document_id}, Super admin: {is_super_admin}")
+
+        # Get current user
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({
+                'success': False,
+                'error': 'Not authenticated',
+                'code': 'NOT_AUTHENTICATED',
+                'timestamp': datetime.now().isoformat()
+            }), 401
+
+        # Feature gate (plan-based)
+        if not is_super_admin:
+            user_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
+            if user_plan not in ['basic', 'pro', 'business', 'enterprise', 'custom']:
+                return jsonify({
+                    'success': False,
+                    'error': 'Your plan does not include document access',
+                    'code': 'FEATURE_NOT_AVAILABLE',
+                    'required_plan': 'basic',
+                    'timestamp': datetime.now().isoformat()
+                }), 403
+
+        # Get document
+        document = Document.query.get(document_id)
+        if not document:
+            return jsonify({
+                'success': False,
+                'error': 'Document not found',
+                'code': 'DOCUMENT_NOT_FOUND',
+                'timestamp': datetime.now().isoformat()
+            }), 404
+
+        # Scope check (company isolation)
+        if not is_super_admin:
+            user_company_id = getattr(user, 'company_id', None)
+            doc_company_id = getattr(document, 'company_id', None)
+
+            is_owner = getattr(document, 'user_id', None) == user.id
+            is_same_company = user_company_id and doc_company_id and user_company_id == doc_company_id
+
+            if not (is_owner or is_same_company):
+                return jsonify({
+                    'success': False,
+                    'error': 'Access denied',
+                    'code': 'ACCESS_DENIED',
+                    'timestamp': datetime.now().isoformat()
+                }), 403
+
+        # Fetch permissions
+        permissions = DocumentPermission.query.filter_by(
+            document_id=document_id
+        ).order_by(DocumentPermission.created_at.desc()).all()
+
+        # Fetch inherited permissions from parent
+        inherited = []
+        parent_id = getattr(document, 'parent_document_id', None)
+        if parent_id:
+            parent_perms = DocumentPermission.query.filter_by(
+                document_id=parent_id
+            ).all()
+            inherited = [p.to_dict() for p in parent_perms]
+
+        return jsonify({
+            'success': True,
+            'document_id': document_id,
+            'document_title': document.title,
+            'permissions': [p.to_dict() for p in permissions],
+            'inherited': inherited,
+            'total': len(permissions),
+            'access_info': {
+                'is_super_admin': is_super_admin,
+                'scope_type': 'all' if is_super_admin else (
+                    'company' if getattr(user, 'company_id', None) else 'user'
+                ),
+                'plan': (getattr(user, 'subscription_plan', None) or 'free').lower()
+            },
+            'timestamp': datetime.now().isoformat()
+        })
+
+    except Exception as e:
+        current_app.logger.error(f"dm_get_document_permissions error: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': f'Failed to fetch permissions: {str(e)}',
+            'code': 'PERMISSIONS_FETCH_ERROR',
+            'timestamp': datetime.now().isoformat()
+        }), 500
+
+
+@app.route('/api/dm-documents/<int:document_id>/permissions', methods=['POST'])
+@jwt_required
+@cross_origin()
+def dm_add_document_permission(document_id):
+    """Add a new permission to a document"""
+    try:
+        is_super_admin = check_super_admin()
+        current_app.logger.info(f"DM permission ADD - Doc: {document_id}, Super admin: {is_super_admin}")
+
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({
+                'success': False,
+                'error': 'Not authenticated',
+                'code': 'NOT_AUTHENTICATED',
+                'timestamp': datetime.now().isoformat()
+            }), 401
+
+        # Feature gate
+        if not is_super_admin:
+            user_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
+            if user_plan not in ['pro', 'business', 'enterprise', 'custom']:
+                return jsonify({
+                    'success': False,
+                    'error': 'Your plan does not include permission management',
+                    'code': 'FEATURE_NOT_AVAILABLE',
+                    'required_plan': 'pro',
+                    'timestamp': datetime.now().isoformat()
+                }), 403
+
+        # Get document
+        document = Document.query.get(document_id)
+        if not document:
+            return jsonify({
+                'success': False,
+                'error': 'Document not found',
+                'code': 'DOCUMENT_NOT_FOUND',
+                'timestamp': datetime.now().isoformat()
+            }), 404
+
+        # Scope check
+        if not is_super_admin:
+            user_company_id = getattr(user, 'company_id', None)
+            doc_company_id = getattr(document, 'company_id', None)
+
+            is_owner = getattr(document, 'user_id', None) == user.id
+            is_same_company = user_company_id and doc_company_id and user_company_id == doc_company_id
+
+            if not (is_owner or is_same_company):
+                return jsonify({
+                    'success': False,
+                    'error': 'Access denied',
+                    'code': 'ACCESS_DENIED',
+                    'timestamp': datetime.now().isoformat()
+                }), 403
+
+        # Parse request body
+        data = request.get_json() or {}
+
+        principal_type = (data.get('principal_type') or '').strip()
+        principal_id = (data.get('principal_id') or '').strip()
+
+        if not principal_type:
+            return jsonify({
+                'success': False,
+                'error': 'principal_type is required',
+                'code': 'VALIDATION_ERROR',
+                'timestamp': datetime.now().isoformat()
+            }), 400
+
+        if not principal_id:
+            return jsonify({
+                'success': False,
+                'error': 'principal_id is required',
+                'code': 'VALIDATION_ERROR',
+                'timestamp': datetime.now().isoformat()
+            }), 400
+
+        # Check for duplicate
+        existing = DocumentPermission.query.filter_by(
+            document_id=document_id,
+            principal_type=principal_type,
+            principal_id=principal_id
+        ).first()
+
+        if existing:
+            return jsonify({
+                'success': False,
+                'error': 'Permission already exists for this principal',
+                'code': 'DUPLICATE_PERMISSION',
+                'existing_id': existing.id,
+                'timestamp': datetime.now().isoformat()
+            }), 409
+
+        # Parse expiry date
+        expires_at = None
+        if data.get('expires_at'):
+            try:
+                expires_at = datetime.fromisoformat(
+                    data['expires_at'].replace('Z', '+00:00')
+                )
+            except Exception:
+                expires_at = None
+
+        # Create permission
+        permission = DocumentPermission(
+            document_id=document_id,
+            principal_type=principal_type,
+            principal_id=principal_id,
+            principal_name=data.get('principal_name'),
+            access_level=data.get('access_level', 'view'),
+            permissions=json.dumps(data.get('permissions', [])),
+            expires_at=expires_at,
+            ip_whitelist=json.dumps(data.get('ip_whitelist', [])),
+            notes=data.get('notes'),
+            company_id=document.company_id,
+            granted_by=user.id
+        )
+
+        db.session.add(permission)
+        db.session.commit()
+
+        # Log to access audit
+        try:
+            log = AccessAuditLog(
+                document_id=document_id,
+                user_id=user.id,
+                user_name=user.name,
+                user_email=user.email,
+                action='grant',
+                actor_id=user.id,
+                actor_name=user.name,
+                description=f'Granted {permission.access_level} access to {principal_type}:{principal_id}',
+                ip_address=request.remote_addr,
+                user_agent=(request.headers.get('User-Agent') or '')[:500],
+                company_id=document.company_id
+            )
+            db.session.add(log)
+            db.session.commit()
+        except Exception as log_err:
+            current_app.logger.warning(f"Failed to write audit log: {log_err}")
+
+        return jsonify({
+            'success': True,
+            'permission': permission.to_dict(),
+            'message': 'Permission granted successfully',
+            'timestamp': datetime.now().isoformat()
+        }), 201
+
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_add_document_permission error: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': f'Failed to add permission: {str(e)}',
+            'code': 'PERMISSION_ADD_ERROR',
+            'timestamp': datetime.now().isoformat()
+        }), 500
+
+
+@app.route('/api/dm-permissions/<int:permission_id>', methods=['PUT'])
+@jwt_required
+@cross_origin()
+def dm_update_document_permission(permission_id):
+    """Update an existing document permission"""
+    try:
+        is_super_admin = check_super_admin()
+        current_app.logger.info(f"DM permission UPDATE - ID: {permission_id}, Super admin: {is_super_admin}")
+
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({
+                'success': False,
+                'error': 'Not authenticated',
+                'code': 'NOT_AUTHENTICATED',
+                'timestamp': datetime.now().isoformat()
+            }), 401
+
+        if not is_super_admin:
+            user_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
+            if user_plan not in ['pro', 'business', 'enterprise', 'custom']:
+                return jsonify({
+                    'success': False,
+                    'error': 'Your plan does not include permission management',
+                    'code': 'FEATURE_NOT_AVAILABLE',
+                    'required_plan': 'pro',
+                    'timestamp': datetime.now().isoformat()
+                }), 403
+
+        permission = DocumentPermission.query.get(permission_id)
+        if not permission:
+            return jsonify({
+                'success': False,
+                'error': 'Permission not found',
+                'code': 'PERMISSION_NOT_FOUND',
+                'timestamp': datetime.now().isoformat()
+            }), 404
+
+        # Scope check
+        if not is_super_admin:
+            user_company_id = getattr(user, 'company_id', None)
+            perm_company_id = getattr(permission, 'company_id', None)
+
+            if not (user_company_id and perm_company_id and user_company_id == perm_company_id):
+                return jsonify({
+                    'success': False,
+                    'error': 'Access denied',
+                    'code': 'ACCESS_DENIED',
+                    'timestamp': datetime.now().isoformat()
+                }), 403
+
+        data = request.get_json() or {}
+
+        # Update fields
+        if 'access_level' in data:
+            permission.access_level = data['access_level']
+        if 'permissions' in data:
+            permission.permissions = json.dumps(data['permissions'])
+        if 'ip_whitelist' in data:
+            permission.ip_whitelist = json.dumps(data['ip_whitelist'])
+        if 'notes' in data:
+            permission.notes = data['notes']
+        if 'expires_at' in data:
+            if data['expires_at']:
+                try:
+                    permission.expires_at = datetime.fromisoformat(
+                        data['expires_at'].replace('Z', '+00:00')
+                    )
+                except Exception:
+                    permission.expires_at = None
+            else:
+                permission.expires_at = None
+
+        permission.updated_at = datetime.now()
+        db.session.commit()
+
+        # Log to audit
+        try:
+            document = Document.query.get(permission.document_id)
+            log = AccessAuditLog(
+                document_id=permission.document_id,
+                user_id=user.id,
+                user_name=user.name,
+                user_email=user.email,
+                action='update',
+                actor_id=user.id,
+                actor_name=user.name,
+                description=f'Updated permission #{permission.id}',
+                ip_address=request.remote_addr,
+                user_agent=(request.headers.get('User-Agent') or '')[:500],
+                company_id=permission.company_id
+            )
+            db.session.add(log)
+            db.session.commit()
+        except Exception as log_err:
+            current_app.logger.warning(f"Audit log failed: {log_err}")
+
+        return jsonify({
+            'success': True,
+            'permission': permission.to_dict(),
+            'message': 'Permission updated successfully',
+            'timestamp': datetime.now().isoformat()
+        })
+
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_update_document_permission error: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': f'Failed to update permission: {str(e)}',
+            'code': 'PERMISSION_UPDATE_ERROR',
+            'timestamp': datetime.now().isoformat()
+        }), 500
+
+
+@app.route('/api/dm-permissions/<int:permission_id>', methods=['DELETE'])
+@jwt_required
+@cross_origin()
+def dm_remove_document_permission(permission_id):
+    """Remove a permission from a document"""
+    try:
+        is_super_admin = check_super_admin()
+        current_app.logger.info(f"DM permission REMOVE - ID: {permission_id}, Super admin: {is_super_admin}")
+
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({
+                'success': False,
+                'error': 'Not authenticated',
+                'code': 'NOT_AUTHENTICATED',
+                'timestamp': datetime.now().isoformat()
+            }), 401
+
+        if not is_super_admin:
+            user_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
+            if user_plan not in ['pro', 'business', 'enterprise', 'custom']:
+                return jsonify({
+                    'success': False,
+                    'error': 'Your plan does not include permission management',
+                    'code': 'FEATURE_NOT_AVAILABLE',
+                    'required_plan': 'pro',
+                    'timestamp': datetime.now().isoformat()
+                }), 403
+
+        permission = DocumentPermission.query.get(permission_id)
+        if not permission:
+            return jsonify({
+                'success': False,
+                'error': 'Permission not found',
+                'code': 'PERMISSION_NOT_FOUND',
+                'timestamp': datetime.now().isoformat()
+            }), 404
+
+        if not is_super_admin:
+            user_company_id = getattr(user, 'company_id', None)
+            perm_company_id = getattr(permission, 'company_id', None)
+            if not (user_company_id and perm_company_id and user_company_id == perm_company_id):
+                return jsonify({
+                    'success': False,
+                    'error': 'Access denied',
+                    'code': 'ACCESS_DENIED',
+                    'timestamp': datetime.now().isoformat()
+                }), 403
+
+        doc_id = permission.document_id
+        principal_info = f"{permission.principal_type}:{permission.principal_id}"
+        company_id = permission.company_id
+
+        db.session.delete(permission)
+        db.session.commit()
+
+        # Log to audit
+        try:
+            log = AccessAuditLog(
+                document_id=doc_id,
+                user_id=user.id,
+                user_name=user.name,
+                user_email=user.email,
+                action='revoke',
+                actor_id=user.id,
+                actor_name=user.name,
+                description=f'Revoked permission for {principal_info}',
+                ip_address=request.remote_addr,
+                user_agent=(request.headers.get('User-Agent') or '')[:500],
+                company_id=company_id
+            )
+            db.session.add(log)
+            db.session.commit()
+        except Exception as log_err:
+            current_app.logger.warning(f"Audit log failed: {log_err}")
+
+        return jsonify({
+            'success': True,
+            'message': 'Permission revoked successfully',
+            'timestamp': datetime.now().isoformat()
+        })
+
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_remove_document_permission error: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': f'Failed to remove permission: {str(e)}',
+            'code': 'PERMISSION_REMOVE_ERROR',
+            'timestamp': datetime.now().isoformat()
+        }), 500
+
+
+@app.route('/api/dm-documents/<int:document_id>/permissions/revoke-all', methods=['POST'])
+@jwt_required
+@cross_origin()
+def dm_revoke_all_document_permissions(document_id):
+    """Revoke all permissions for a document"""
+    try:
+        is_super_admin = check_super_admin()
+        current_app.logger.info(f"DM revoke ALL - Doc: {document_id}, Super admin: {is_super_admin}")
+
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({
+                'success': False,
+                'error': 'Not authenticated',
+                'code': 'NOT_AUTHENTICATED',
+                'timestamp': datetime.now().isoformat()
+            }), 401
+
+        if not is_super_admin:
+            user_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
+            if user_plan not in ['pro', 'business', 'enterprise', 'custom']:
+                return jsonify({
+                    'success': False,
+                    'error': 'Your plan does not include permission management',
+                    'code': 'FEATURE_NOT_AVAILABLE',
+                    'required_plan': 'pro',
+                    'timestamp': datetime.now().isoformat()
+                }), 403
+
+        document = Document.query.get(document_id)
+        if not document:
+            return jsonify({
+                'success': False,
+                'error': 'Document not found',
+                'code': 'DOCUMENT_NOT_FOUND',
+                'timestamp': datetime.now().isoformat()
+            }), 404
+
+        if not is_super_admin:
+            user_company_id = getattr(user, 'company_id', None)
+            doc_company_id = getattr(document, 'company_id', None)
+            is_owner = getattr(document, 'user_id', None) == user.id
+            is_same_company = user_company_id and doc_company_id and user_company_id == doc_company_id
+            if not (is_owner or is_same_company):
+                return jsonify({
+                    'success': False,
+                    'error': 'Access denied',
+                    'code': 'ACCESS_DENIED',
+                    'timestamp': datetime.now().isoformat()
+                }), 403
+
+        count = DocumentPermission.query.filter_by(document_id=document_id).count()
+        DocumentPermission.query.filter_by(document_id=document_id).delete()
+        db.session.commit()
+
+        # Log to audit
+        try:
+            log = AccessAuditLog(
+                document_id=document_id,
+                user_id=user.id,
+                user_name=user.name,
+                user_email=user.email,
+                action='revoke_all',
+                actor_id=user.id,
+                actor_name=user.name,
+                description=f'Revoked {count} permissions',
+                ip_address=request.remote_addr,
+                user_agent=(request.headers.get('User-Agent') or '')[:500],
+                company_id=document.company_id
+            )
+            db.session.add(log)
+            db.session.commit()
+        except Exception as log_err:
+            current_app.logger.warning(f"Audit log failed: {log_err}")
+
+        return jsonify({
+            'success': True,
+            'revoked_count': count,
+            'message': f'{count} permissions revoked',
+            'timestamp': datetime.now().isoformat()
+        })
+
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_revoke_all_document_permissions error: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': f'Failed to revoke all permissions: {str(e)}',
+            'code': 'REVOKE_ALL_ERROR',
+            'timestamp': datetime.now().isoformat()
+        }), 500
+
+
+@app.route('/api/dm-documents/<int:document_id>/security', methods=['GET'])
+@jwt_required
+@cross_origin()
+def dm_get_document_security(document_id):
+    """Get security settings for a document"""
+    try:
+        is_super_admin = check_super_admin()
+        current_app.logger.info(f"DM security GET - Doc: {document_id}, Super admin: {is_super_admin}")
+
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({
+                'success': False,
+                'error': 'Not authenticated',
+                'code': 'NOT_AUTHENTICATED',
+                'timestamp': datetime.now().isoformat()
+            }), 401
+
+        if not is_super_admin:
+            user_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
+            if user_plan not in ['basic', 'pro', 'business', 'enterprise', 'custom']:
+                return jsonify({
+                    'success': False,
+                    'error': 'Your plan does not include document access',
+                    'code': 'FEATURE_NOT_AVAILABLE',
+                    'required_plan': 'basic',
+                    'timestamp': datetime.now().isoformat()
+                }), 403
+
+        document = Document.query.get(document_id)
+        if not document:
+            return jsonify({
+                'success': False,
+                'error': 'Document not found',
+                'code': 'DOCUMENT_NOT_FOUND',
+                'timestamp': datetime.now().isoformat()
+            }), 404
+
+        if not is_super_admin:
+            user_company_id = getattr(user, 'company_id', None)
+            doc_company_id = getattr(document, 'company_id', None)
+            is_owner = getattr(document, 'user_id', None) == user.id
+            is_same_company = user_company_id and doc_company_id and user_company_id == doc_company_id
+            if not (is_owner or is_same_company):
+                return jsonify({
+                    'success': False,
+                    'error': 'Access denied',
+                    'code': 'ACCESS_DENIED',
+                    'timestamp': datetime.now().isoformat()
+                }), 403
+
+        security = DocumentSecurity.query.filter_by(document_id=document_id).first()
+
+        if not security:
+            # Return defaults
+            return jsonify({
+                'success': True,
+                'security': {
+                    'document_id': document_id,
+                    'sensitivity': 'internal',
+                    'masking_rule': 'none',
+                    'masking_config': {},
+                    'inherit_from_parent': True,
+                    'download_restricted': False,
+                    'print_restricted': False,
+                    'watermark_enabled': False,
+                    'expiry_enabled': False,
+                    'expiry_date': None,
+                    'ip_restrictions': [],
+                    'time_restrictions': {},
+                    'is_default': True
+                },
+                'access_info': {
+                    'is_super_admin': is_super_admin,
+                    'scope_type': 'all' if is_super_admin else (
+                        'company' if getattr(user, 'company_id', None) else 'user'
+                    ),
+                    'plan': (getattr(user, 'subscription_plan', None) or 'free').lower()
+                },
+                'timestamp': datetime.now().isoformat()
+            })
+
+        result = security.to_dict()
+        result['is_default'] = False
+
+        return jsonify({
+            'success': True,
+            'security': result,
+            'access_info': {
+                'is_super_admin': is_super_admin,
+                'scope_type': 'all' if is_super_admin else (
+                    'company' if getattr(user, 'company_id', None) else 'user'
+                ),
+                'plan': (getattr(user, 'subscription_plan', None) or 'free').lower()
+            },
+            'timestamp': datetime.now().isoformat()
+        })
+
+    except Exception as e:
+        current_app.logger.error(f"dm_get_document_security error: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': f'Failed to fetch security: {str(e)}',
+            'code': 'SECURITY_FETCH_ERROR',
+            'timestamp': datetime.now().isoformat()
+        }), 500
+
+
+@app.route('/api/dm-documents/<int:document_id>/security', methods=['PUT'])
+@jwt_required
+@cross_origin()
+def dm_update_document_security(document_id):
+    """Update or create security settings for a document"""
+    try:
+        is_super_admin = check_super_admin()
+        current_app.logger.info(f"DM security UPDATE - Doc: {document_id}, Super admin: {is_super_admin}")
+
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({
+                'success': False,
+                'error': 'Not authenticated',
+                'code': 'NOT_AUTHENTICATED',
+                'timestamp': datetime.now().isoformat()
+            }), 401
+
+        if not is_super_admin:
+            user_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
+            if user_plan not in ['pro', 'business', 'enterprise', 'custom']:
+                return jsonify({
+                    'success': False,
+                    'error': 'Your plan does not include security management',
+                    'code': 'FEATURE_NOT_AVAILABLE',
+                    'required_plan': 'pro',
+                    'timestamp': datetime.now().isoformat()
+                }), 403
+
+        document = Document.query.get(document_id)
+        if not document:
+            return jsonify({
+                'success': False,
+                'error': 'Document not found',
+                'code': 'DOCUMENT_NOT_FOUND',
+                'timestamp': datetime.now().isoformat()
+            }), 404
+
+        if not is_super_admin:
+            user_company_id = getattr(user, 'company_id', None)
+            doc_company_id = getattr(document, 'company_id', None)
+            is_owner = getattr(document, 'user_id', None) == user.id
+            is_same_company = user_company_id and doc_company_id and user_company_id == doc_company_id
+            if not (is_owner or is_same_company):
+                return jsonify({
+                    'success': False,
+                    'error': 'Access denied',
+                    'code': 'ACCESS_DENIED',
+                    'timestamp': datetime.now().isoformat()
+                }), 403
+
+        data = request.get_json() or {}
+
+        security = DocumentSecurity.query.filter_by(document_id=document_id).first()
+        is_new = security is None
+
+        if is_new:
+            security = DocumentSecurity(
+                document_id=document_id,
+                company_id=document.company_id
+            )
+            db.session.add(security)
+
+        if 'sensitivity' in data:
+            security.sensitivity = data['sensitivity']
+        if 'masking_rule' in data:
+            security.masking_rule = data['masking_rule']
+        if 'masking_config' in data:
+            security.masking_config = json.dumps(data['masking_config'])
+        if 'inherit_from_parent' in data:
+            security.inherit_from_parent = bool(data['inherit_from_parent'])
+        if 'download_restricted' in data:
+            security.download_restricted = bool(data['download_restricted'])
+        if 'print_restricted' in data:
+            security.print_restricted = bool(data['print_restricted'])
+        if 'watermark_enabled' in data:
+            security.watermark_enabled = bool(data['watermark_enabled'])
+        if 'expiry_enabled' in data:
+            security.expiry_enabled = bool(data['expiry_enabled'])
+        if 'expiry_date' in data:
+            if data['expiry_date']:
+                try:
+                    security.expiry_date = datetime.fromisoformat(
+                        data['expiry_date'].replace('Z', '+00:00')
+                    )
+                except Exception:
+                    security.expiry_date = None
+            else:
+                security.expiry_date = None
+        if 'ip_restrictions' in data:
+            security.ip_restrictions = json.dumps(data['ip_restrictions'])
+        if 'time_restrictions' in data:
+            security.time_restrictions = json.dumps(data['time_restrictions'])
+
+        security.updated_at = datetime.now()
+        db.session.commit()
+
+        # Log to audit
+        try:
+            log = AccessAuditLog(
+                document_id=document_id,
+                user_id=user.id,
+                user_name=user.name,
+                user_email=user.email,
+                action='security_update',
+                actor_id=user.id,
+                actor_name=user.name,
+                description=f'{"Created" if is_new else "Updated"} security settings',
+                ip_address=request.remote_addr,
+                user_agent=(request.headers.get('User-Agent') or '')[:500],
+                company_id=document.company_id
+            )
+            db.session.add(log)
+            db.session.commit()
+        except Exception as log_err:
+            current_app.logger.warning(f"Audit log failed: {log_err}")
+
+        return jsonify({
+            'success': True,
+            'security': security.to_dict(),
+            'is_new': is_new,
+            'message': f'Security settings {"created" if is_new else "updated"} successfully',
+            'timestamp': datetime.now().isoformat()
+        })
+
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_update_document_security error: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': f'Failed to update security: {str(e)}',
+            'code': 'SECURITY_UPDATE_ERROR',
+            'timestamp': datetime.now().isoformat()
+        }), 500
+
+
+@app.route('/api/dm-documents/<int:document_id>/access-audit', methods=['GET'])
+@jwt_required
+@cross_origin()
+def dm_get_access_audit_log(document_id):
+    """Get access audit log entries for a document"""
+    try:
+        is_super_admin = check_super_admin()
+        current_app.logger.info(f"DM access audit GET - Doc: {document_id}, Super admin: {is_super_admin}")
+
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({
+                'success': False,
+                'error': 'Not authenticated',
+                'code': 'NOT_AUTHENTICATED',
+                'timestamp': datetime.now().isoformat()
+            }), 401
+
+        if not is_super_admin:
+            user_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
+            if user_plan not in ['basic', 'pro', 'business', 'enterprise', 'custom']:
+                return jsonify({
+                    'success': False,
+                    'error': 'Your plan does not include document access',
+                    'code': 'FEATURE_NOT_AVAILABLE',
+                    'required_plan': 'basic',
+                    'timestamp': datetime.now().isoformat()
+                }), 403
+
+        document = Document.query.get(document_id)
+        if not document:
+            return jsonify({
+                'success': False,
+                'error': 'Document not found',
+                'code': 'DOCUMENT_NOT_FOUND',
+                'timestamp': datetime.now().isoformat()
+            }), 404
+
+        if not is_super_admin:
+            user_company_id = getattr(user, 'company_id', None)
+            doc_company_id = getattr(document, 'company_id', None)
+            is_owner = getattr(document, 'user_id', None) == user.id
+            is_same_company = user_company_id and doc_company_id and user_company_id == doc_company_id
+            if not (is_owner or is_same_company):
+                return jsonify({
+                    'success': False,
+                    'error': 'Access denied',
+                    'code': 'ACCESS_DENIED',
+                    'timestamp': datetime.now().isoformat()
+                }), 403
+
+        # Query parameters
+        limit = min(int(request.args.get('limit', 50)), 500)
+        offset = int(request.args.get('offset', 0))
+        action_filter = request.args.get('action')
+
+        query = AccessAuditLog.query.filter_by(document_id=document_id)
+
+        if action_filter:
+            query = query.filter_by(action=action_filter)
+
+        total = query.count()
+        logs = query.order_by(
+            AccessAuditLog.created_at.desc()
+        ).limit(limit).offset(offset).all()
+
+        return jsonify({
+            'success': True,
+            'logs': [log.to_dict() for log in logs],
+            'total': total,
+            'limit': limit,
+            'offset': offset,
+            'has_more': (offset + limit) < total,
+            'access_info': {
+                'is_super_admin': is_super_admin,
+                'scope_type': 'all' if is_super_admin else (
+                    'company' if getattr(user, 'company_id', None) else 'user'
+                ),
+                'plan': (getattr(user, 'subscription_plan', None) or 'free').lower()
+            },
+            'timestamp': datetime.now().isoformat()
+        })
+
+    except Exception as e:
+        current_app.logger.error(f"dm_get_access_audit_log error: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': f'Failed to fetch audit log: {str(e)}',
+            'code': 'AUDIT_FETCH_ERROR',
+            'timestamp': datetime.now().isoformat()
+        }), 500
+
+# ============================================================
+# RETENTION POLICY ENDPOINTS
+# ============================================================
+
+@app.route('/api/dm-documents/retention/policies', methods=['GET'])
+@jwt_required
+@cross_origin()
+def dm_get_retention_policies():
+    """List retention policies for the company"""
+    try:
+        is_super_admin = check_super_admin()
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        query = RetentionPolicy.query
+        if not is_super_admin:
+            query = query.filter_by(company_id=user.company_id)
+
+        # Optional filters
+        document_id = request.args.get('document_id')
+        if document_id:
+            query = query.filter_by(document_id=document_id)
+        lifecycle_stage = request.args.get('lifecycle_stage')
+        if lifecycle_stage:
+            query = query.filter_by(lifecycle_stage=lifecycle_stage)
+
+        policies = query.order_by(RetentionPolicy.created_at.desc()).all()
+        return jsonify({
+            'success': True,
+            'policies': [p.to_dict() for p in policies],
+            'total': len(policies)
+        })
+    except Exception as e:
+        current_app.logger.error(f"dm_get_retention_policies error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/<int:document_id>/retention', methods=['GET'])
+@jwt_required
+@cross_origin()
+def dm_get_document_retention(document_id):
+    """Get retention settings for a document"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        document = Document.query.get(document_id)
+        if not document:
+            return jsonify({'success': False, 'error': 'Document not found'}), 404
+
+        is_super_admin = check_super_admin()
+        if not is_super_admin:
+            if document.company_id and user.company_id and document.company_id != user.company_id:
+                if document.user_id != user.id:
+                    return jsonify({'success': False, 'error': 'Access denied'}), 403
+
+        policy = RetentionPolicy.query.filter_by(document_id=document_id).first()
+        if not policy:
+            return jsonify({'success': True, 'retention': None, 'is_default': True})
+        return jsonify({'success': True, 'retention': policy.to_dict(), 'is_default': False})
+    except Exception as e:
+        current_app.logger.error(f"dm_get_document_retention error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/<int:document_id>/retention', methods=['PUT'])
+@jwt_required
+@cross_origin()
+def dm_set_document_retention(document_id):
+    """Create or update retention policy for a document"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        document = Document.query.get(document_id)
+        if not document:
+            return jsonify({'success': False, 'error': 'Document not found'}), 404
+
+        is_super_admin = check_super_admin()
+        if not is_super_admin:
+            user_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
+            if user_plan not in ['pro', 'business', 'enterprise', 'custom']:
+                return jsonify({'success': False, 'error': 'Plan does not include retention', 'code': 'FEATURE_NOT_AVAILABLE'}), 403
+            if document.company_id and user.company_id and document.company_id != user.company_id:
+                if document.user_id != user.id:
+                    return jsonify({'success': False, 'error': 'Access denied'}), 403
+
+        data = request.get_json() or {}
+        policy = RetentionPolicy.query.filter_by(document_id=document_id).first()
+        is_new = policy is None
+        if is_new:
+            policy = RetentionPolicy(document_id=document_id, company_id=document.company_id, created_by=user.id)
+            db.session.add(policy)
+
+        # Update fields
+        for field in ['name', 'schedule', 'custom_days', 'regulatory_framework',
+                      'retention_start_event', 'auto_archive', 'auto_dispose',
+                      'disposal_method', 'notify_before_days', 'require_approval',
+                      'enable_legal_hold', 'lifecycle_stage', 'notes']:
+            if field in data:
+                setattr(policy, field, data[field])
+        if 'notification_emails' in data:
+            policy.notification_emails = json.dumps(data['notification_emails'])
+
+        policy.updated_at = datetime.utcnow()
+        db.session.commit()
+
+        # Audit
+        try:
+            log = AccessAuditLog(
+                document_id=document_id, user_id=user.id, user_name=user.name,
+                user_email=user.email, action='retention_update',
+                actor_id=user.id, actor_name=user.name,
+                description=f'{"Created" if is_new else "Updated"} retention policy',
+                ip_address=request.remote_addr,
+                user_agent=(request.headers.get('User-Agent') or '')[:500],
+                company_id=document.company_id
+            )
+            db.session.add(log)
+            db.session.commit()
+        except Exception as le:
+            current_app.logger.warning(f"Audit log failed: {le}")
+
+        return jsonify({
+            'success': True,
+            'retention': policy.to_dict(),
+            'is_new': is_new,
+            'message': f'Retention policy {"created" if is_new else "updated"}'
+        }), 201 if is_new else 200
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_set_document_retention error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/retention/upcoming-disposals', methods=['GET'])
+@jwt_required
+@cross_origin()
+def dm_get_upcoming_disposals():
+    """List documents approaching disposal"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        days = int(request.args.get('days', 30))
+        cutoff = datetime.utcnow() + timedelta(days=days)
+
+        query = RetentionPolicy.query.filter(
+            RetentionPolicy.auto_dispose == True,
+            RetentionPolicy.lifecycle_stage != 'disposed'
+        )
+        if not is_super_admin:
+            query = query.filter_by(company_id=user.company_id)
+
+        policies = query.all()
+        items = []
+        for p in policies:
+            if not p.document:
+                continue
+            # Compute disposal date (simplified)
+            start = p.document.created_at or p.created_at
+            days_map = {'days_1': 1, 'days_30': 30, 'days_90': 90, 'years_1': 365,
+                        'years_3': 1095, 'years_5': 1825, 'years_7': 2555, 'years_10': 3650}
+            retention_days = p.custom_days or days_map.get(p.schedule, 2555)
+            disposal_date = start + timedelta(days=retention_days)
+            if disposal_date <= cutoff:
+                items.append({
+                    'policy_id': p.id,
+                    'document_id': p.document_id,
+                    'document_title': p.document.title if p.document else None,
+                    'disposal_date': disposal_date.isoformat(),
+                    'days_until': (disposal_date - datetime.utcnow()).days,
+                    'auto_dispose': p.auto_dispose,
+                    'lifecycle_stage': p.lifecycle_stage
+                })
+
+        items.sort(key=lambda x: x['disposal_date'])
+        return jsonify({'success': True, 'items': items, 'total': len(items)})
+    except Exception as e:
+        current_app.logger.error(f"dm_get_upcoming_disposals error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/retention/legal-holds', methods=['GET'])
+@jwt_required
+@cross_origin()
+def dm_get_legal_holds():
+    """List legal holds"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        query = LegalHold.query
+        if not is_super_admin:
+            query = query.filter_by(company_id=user.company_id)
+
+        status_filter = request.args.get('status')
+        if status_filter and status_filter != 'all':
+            query = query.filter_by(status=status_filter)
+
+        holds = query.order_by(LegalHold.created_at.desc()).all()
+        return jsonify({'success': True, 'holds': [h.to_dict() for h in holds], 'total': len(holds)})
+    except Exception as e:
+        current_app.logger.error(f"dm_get_legal_holds error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/retention/legal-holds', methods=['POST'])
+@jwt_required
+@cross_origin()
+def dm_create_legal_hold():
+    """Create a legal hold"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        if not is_super_admin:
+            user_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
+            if user_plan not in ['pro', 'business', 'enterprise', 'custom']:
+                return jsonify({'success': False, 'error': 'Plan does not include legal holds', 'code': 'FEATURE_NOT_AVAILABLE'}), 403
+
+        data = request.get_json() or {}
+        document_ids = data.get('document_ids') or []
+        if not document_ids and data.get('document_id'):
+            document_ids = [data['document_id']]
+
+        if not document_ids:
+            return jsonify({'success': False, 'error': 'document_ids required', 'code': 'VALIDATION_ERROR'}), 400
+
+        # Validate documents exist and user has access
+        valid_ids = []
+        for doc_id in document_ids:
+            doc = Document.query.get(doc_id)
+            if not doc:
+                continue
+            if not is_super_admin and doc.company_id and user.company_id and doc.company_id != user.company_id:
+                if doc.user_id != user.id:
+                    continue
+            valid_ids.append(doc_id)
+
+        if not valid_ids:
+            return jsonify({'success': False, 'error': 'No valid documents found', 'code': 'NO_VALID_DOCUMENTS'}), 400
+
+        hold = LegalHold(
+            document_ids=json.dumps(valid_ids),
+            document_count=len(valid_ids),
+            case_number=data.get('case_number'),
+            reason=data.get('reason'),
+            custodian=data.get('custodian'),
+            expected_duration=data.get('expected_duration'),
+            status='active',
+            applied_by=user.id,
+            applied_by_name=user.name,
+            company_id=user.company_id
+        )
+        db.session.add(hold)
+        db.session.flush()  # Get hold.id
+
+        # Create junction rows
+        for doc_id in valid_ids:
+            j = LegalHoldDocument(
+                hold_id=hold.id,
+                document_id=doc_id,
+                company_id=user.company_id,
+                added_by=user.id
+            )
+            db.session.add(j)
+
+        db.session.commit()
+
+        # Audit
+        for doc_id in valid_ids:
+            try:
+                log = AccessAuditLog(
+                    document_id=doc_id, user_id=user.id, user_name=user.name,
+                    user_email=user.email, action='legal_hold',
+                    actor_id=user.id, actor_name=user.name,
+                    description=f'Legal hold applied (case: {hold.case_number})',
+                    ip_address=request.remote_addr,
+                    user_agent=(request.headers.get('User-Agent') or '')[:500],
+                    company_id=user.company_id
+                )
+                db.session.add(log)
+            except Exception:
+                pass
+        db.session.commit()
+
+        return jsonify({'success': True, 'hold': hold.to_dict(), 'message': 'Legal hold applied'}), 201
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_create_legal_hold error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/retention/legal-holds/<int:hold_id>/release', methods=['POST'])
+@jwt_required
+@cross_origin()
+def dm_release_legal_hold(hold_id):
+    """Release a legal hold"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        hold = LegalHold.query.get(hold_id)
+        if not hold:
+            return jsonify({'success': False, 'error': 'Legal hold not found'}), 404
+
+        is_super_admin = check_super_admin()
+        if not is_super_admin and hold.company_id and user.company_id and hold.company_id != user.company_id:
+            return jsonify({'success': False, 'error': 'Access denied'}), 403
+
+        data = request.get_json() or {}
+        hold.status = 'released'
+        hold.released_by = user.id
+        hold.released_at = datetime.utcnow()
+        hold.release_reason = data.get('release_reason')
+        db.session.commit()
+
+        return jsonify({'success': True, 'hold': hold.to_dict(), 'message': 'Legal hold released'})
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_release_legal_hold error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/retention/certificates', methods=['GET'])
+@jwt_required
+@cross_origin()
+def dm_get_disposition_certificates():
+    """List disposition certificates"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        query = DispositionCertificate.query
+        if not is_super_admin:
+            query = query.filter_by(company_id=user.company_id)
+
+        limit = min(int(request.args.get('limit', 50)), 500)
+        offset = int(request.args.get('offset', 0))
+        total = query.count()
+        certs = query.order_by(DispositionCertificate.created_at.desc()).limit(limit).offset(offset).all()
+
+        return jsonify({
+            'success': True,
+            'certificates': [c.to_dict() for c in certs],
+            'total': total,
+            'limit': limit,
+            'offset': offset
+        })
+    except Exception as e:
+        current_app.logger.error(f"dm_get_disposition_certificates error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/retention/certificates/<int:certificate_id>/download', methods=['GET'])
+@jwt_required
+@cross_origin()
+def dm_download_disposition_certificate(certificate_id):
+    """Download a disposition certificate (PDF placeholder)"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        cert = DispositionCertificate.query.get(certificate_id)
+        if not cert:
+            return jsonify({'success': False, 'error': 'Certificate not found'}), 404
+
+        is_super_admin = check_super_admin()
+        if not is_super_admin and cert.company_id and user.company_id and cert.company_id != user.company_id:
+            return jsonify({'success': False, 'error': 'Access denied'}), 403
+
+        # TODO: Generate actual PDF. Placeholder text response.
+        from io import BytesIO
+        content = f"Disposition Certificate\n\nNumber: {cert.certificate_number}\nDocument: {cert.document_title}\nMethod: {cert.disposal_method}\nDisposed At: {cert.disposed_at}\nDisposed By: {cert.disposed_by_name}\n".encode('utf-8')
+        return Response(
+            content,
+            mimetype='application/pdf',
+            headers={'Content-Disposition': f'attachment; filename="certificate-{cert.certificate_number}.pdf"'}
+        )
+    except Exception as e:
+        current_app.logger.error(f"dm_download_disposition_certificate error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/<int:document_id>/dispose', methods=['POST'])
+@jwt_required
+@cross_origin()
+def dm_dispose_document(document_id):
+    """Dispose a document and create a certificate"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        document = Document.query.get(document_id)
+        if not document:
+            return jsonify({'success': False, 'error': 'Document not found'}), 404
+
+        is_super_admin = check_super_admin()
+        if not is_super_admin:
+            user_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
+            if user_plan not in ['pro', 'business', 'enterprise', 'custom']:
+                return jsonify({'success': False, 'error': 'Plan does not include disposal', 'code': 'FEATURE_NOT_AVAILABLE'}), 403
+            if document.company_id and user.company_id and document.company_id != user.company_id:
+                if document.user_id != user.id:
+                    return jsonify({'success': False, 'error': 'Access denied'}), 403
+
+        # Check for active legal holds
+        active_holds = LegalHoldDocument.query.filter_by(document_id=document_id).join(LegalHold).filter(
+            LegalHold.status == 'active'
+        ).count()
+        if active_holds > 0:
+            return jsonify({
+                'success': False,
+                'error': 'Document is under legal hold and cannot be disposed',
+                'code': 'LEGAL_HOLD_ACTIVE',
+                'active_holds': active_holds
+            }), 409
+
+        data = request.get_json() or {}
+
+        # Generate certificate number
+        import uuid
+        cert_number = f"DISP-{datetime.utcnow().strftime('%Y%m%d')}-{uuid.uuid4().hex[:8].upper()}"
+
+        cert = DispositionCertificate(
+            certificate_number=cert_number,
+            document_id=document_id,
+            document_title=document.title,
+            disposal_method=data.get('disposal_method', 'secure_delete'),
+            disposal_reason=data.get('disposal_reason') or data.get('reason'),
+            disposed_at=datetime.utcnow(),
+            disposed_by=user.id,
+            disposed_by_name=user.name,
+            witnessed_by=data.get('witnessed_by'),
+            metadata_json=json.dumps(data.get('metadata', {})),
+            company_id=document.company_id
+        )
+        db.session.add(cert)
+
+        # Update retention policy lifecycle
+        policy = RetentionPolicy.query.filter_by(document_id=document_id).first()
+        if policy:
+            policy.lifecycle_stage = 'disposed'
+
+        # Soft delete document
+        if hasattr(document, 'is_deleted'):
+            document.is_deleted = True
+        if hasattr(document, 'deleted_at'):
+            document.deleted_at = datetime.utcnow()
+
+        db.session.commit()
+
+        # Audit
+        try:
+            log = AccessAuditLog(
+                document_id=document_id, user_id=user.id, user_name=user.name,
+                user_email=user.email, action='dispose',
+                actor_id=user.id, actor_name=user.name,
+                description=f'Document disposed. Certificate: {cert_number}',
+                ip_address=request.remote_addr,
+                user_agent=(request.headers.get('User-Agent') or '')[:500],
+                company_id=document.company_id
+            )
+            db.session.add(log)
+            db.session.commit()
+        except Exception as le:
+            current_app.logger.warning(f"Audit log failed: {le}")
+
+        return jsonify({'success': True, 'certificate': cert.to_dict(), 'message': 'Document disposed'}), 201
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_dispose_document error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/<int:document_id>/retention/extend', methods=['POST'])
+@jwt_required
+@cross_origin()
+def dm_extend_retention(document_id):
+    """Extend retention period for a document"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        document = Document.query.get(document_id)
+        if not document:
+            return jsonify({'success': False, 'error': 'Document not found'}), 404
+
+        is_super_admin = check_super_admin()
+        if not is_super_admin and document.company_id and user.company_id and document.company_id != user.company_id:
+            if document.user_id != user.id:
+                return jsonify({'success': False, 'error': 'Access denied'}), 403
+
+        data = request.get_json() or {}
+        policy = RetentionPolicy.query.filter_by(document_id=document_id).first()
+        if not policy:
+            policy = RetentionPolicy(document_id=document_id, company_id=document.company_id, created_by=user.id)
+            db.session.add(policy)
+
+        if 'custom_days' in data:
+            policy.custom_days = data['custom_days']
+        if 'schedule' in data:
+            policy.schedule = data['schedule']
+        if 'notes' in data:
+            policy.notes = data['notes']
+
+        policy.updated_at = datetime.utcnow()
+        db.session.commit()
+
+        return jsonify({'success': True, 'retention': policy.to_dict(), 'message': 'Retention extended'})
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_extend_retention error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+# ============================================================
+# WATERMARK ENDPOINTS
+# ============================================================
+
+@app.route('/api/dm-documents/<int:document_id>/watermark', methods=['GET'])
+@jwt_required
+@cross_origin()
+def dm_get_watermark_settings(document_id):
+    """Get watermark settings for a document"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        document = Document.query.get(document_id)
+        if not document:
+            return jsonify({'success': False, 'error': 'Document not found'}), 404
+
+        is_super_admin = check_super_admin()
+        if not is_super_admin and document.company_id and user.company_id and document.company_id != user.company_id:
+            if document.user_id != user.id:
+                return jsonify({'success': False, 'error': 'Access denied'}), 403
+
+        wm = WatermarkSettings.query.filter_by(document_id=document_id).first()
+        if not wm:
+            return jsonify({'success': True, 'watermark': None, 'is_default': True})
+        return jsonify({'success': True, 'watermark': wm.to_dict(), 'is_default': False})
+    except Exception as e:
+        current_app.logger.error(f"dm_get_watermark_settings error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/<int:document_id>/watermark', methods=['POST'])
+@jwt_required
+@cross_origin()
+def dm_save_watermark_settings(document_id):
+    """Create or update watermark settings"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        document = Document.query.get(document_id)
+        if not document:
+            return jsonify({'success': False, 'error': 'Document not found'}), 404
+
+        is_super_admin = check_super_admin()
+        if not is_super_admin:
+            user_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
+            if user_plan not in ['pro', 'business', 'enterprise', 'custom']:
+                return jsonify({'success': False, 'error': 'Plan does not include watermarking', 'code': 'FEATURE_NOT_AVAILABLE'}), 403
+            if document.company_id and user.company_id and document.company_id != user.company_id:
+                if document.user_id != user.id:
+                    return jsonify({'success': False, 'error': 'Access denied'}), 403
+
+        data = request.get_json() or {}
+        wm = WatermarkSettings.query.filter_by(document_id=document_id).first()
+        is_new = wm is None
+        if is_new:
+            wm = WatermarkSettings(document_id=document_id, company_id=document.company_id)
+            db.session.add(wm)
+
+        for field in ['enabled', 'watermark_type', 'template', 'text', 'color',
+                      'opacity', 'font_size', 'rotation', 'position', 'font_family',
+                      'font_weight', 'tile_spacing', 'image_url', 'apply_to_pages',
+                      'apply_on_view', 'apply_on_download', 'apply_on_print',
+                      'apply_on_share', 'dynamic_user_tracking', 'include_qr_code',
+                      'include_barcode']:
+            if field in data:
+                setattr(wm, field, data[field])
+        if 'page_range' in data:
+            wm.page_range = json.dumps(data['page_range'])
+
+        wm.updated_at = datetime.utcnow()
+        db.session.commit()
+
+        return jsonify({'success': True, 'watermark': wm.to_dict(), 'is_new': is_new,
+                        'message': f'Watermark {"created" if is_new else "updated"}'}), 201 if is_new else 200
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_save_watermark_settings error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/<int:document_id>/watermark', methods=['DELETE'])
+@jwt_required
+@cross_origin()
+def dm_remove_watermark(document_id):
+    """Remove watermark settings"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        wm = WatermarkSettings.query.filter_by(document_id=document_id).first()
+        if not wm:
+            return jsonify({'success': False, 'error': 'Watermark not found'}), 404
+
+        is_super_admin = check_super_admin()
+        if not is_super_admin and wm.company_id and user.company_id and wm.company_id != user.company_id:
+            return jsonify({'success': False, 'error': 'Access denied'}), 403
+
+        db.session.delete(wm)
+        db.session.commit()
+        return jsonify({'success': True, 'message': 'Watermark removed'})
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_remove_watermark error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/<int:document_id>/watermark/apply', methods=['POST'])
+@jwt_required
+@cross_origin()
+def dm_apply_watermark(document_id):
+    """Apply watermark to document (logs the action)"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        document = Document.query.get(document_id)
+        if not document:
+            return jsonify({'success': False, 'error': 'Document not found'}), 404
+
+        data = request.get_json() or {}
+        log = WatermarkLog(
+            document_id=document_id,
+            watermark_template=data.get('template'),
+            action='apply',
+            target=data.get('target', 'view'),
+            user_id=user.id,
+            user_name=user.name,
+            ip_address=request.remote_addr,
+            company_id=document.company_id
+        )
+        db.session.add(log)
+        db.session.commit()
+
+        return jsonify({'success': True, 'log': log.to_dict(), 'message': 'Watermark applied'})
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_apply_watermark error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/<int:document_id>/watermark/preview', methods=['POST'])
+@jwt_required
+@cross_origin()
+def dm_generate_watermark_preview(document_id):
+    """Generate a watermark preview (placeholder)"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        document = Document.query.get(document_id)
+        if not document:
+            return jsonify({'success': False, 'error': 'Document not found'}), 404
+
+        # TODO: Generate actual preview image. Placeholder SVG.
+        data = request.get_json() or {}
+        text = data.get('text', 'CONFIDENTIAL')
+        color = data.get('color', '#f5222d')
+        opacity = data.get('opacity', 0.15)
+
+        svg = f'''<svg xmlns="http://www.w3.org/2000/svg" width="600" height="400">
+  <rect width="100%" height="100%" fill="#ffffff"/>
+  <text x="50%" y="50%" font-family="Arial" font-size="60" font-weight="bold"
+        fill="{color}" fill-opacity="{opacity}" text-anchor="middle"
+        transform="rotate(-45 300 200)">{text}</text>
+</svg>'''
+        return Response(svg, mimetype='image/svg+xml')
+    except Exception as e:
+        current_app.logger.error(f"dm_generate_watermark_preview error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/watermark/upload-image', methods=['POST'])
+@jwt_required
+@cross_origin()
+def dm_upload_watermark_image():
+    """Upload watermark image/logo"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        if 'image' not in request.files:
+            return jsonify({'success': False, 'error': 'No image provided', 'code': 'NO_FILE'}), 400
+
+        file = request.files['image']
+        if not file.filename:
+            return jsonify({'success': False, 'error': 'Empty filename', 'code': 'EMPTY_FILENAME'}), 400
+
+        # TODO: Save file to storage. Placeholder URL.
+        import uuid
+        filename = f"watermark_{uuid.uuid4().hex}_{file.filename}"
+        # upload_path = save_file(file, filename)  # your storage logic
+        url = f"/uploads/watermarks/{filename}"
+
+        return jsonify({'success': True, 'url': url, 'filename': filename})
+    except Exception as e:
+        current_app.logger.error(f"dm_upload_watermark_image error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/<int:document_id>/watermark/log', methods=['GET'])
+@jwt_required
+@cross_origin()
+def dm_get_watermark_log(document_id):
+    """Get watermark log for a document"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        query = WatermarkLog.query.filter_by(document_id=document_id)
+        if not is_super_admin:
+            query = query.filter_by(company_id=user.company_id)
+
+        limit = min(int(request.args.get('limit', 50)), 500)
+        offset = int(request.args.get('offset', 0))
+        total = query.count()
+        logs = query.order_by(WatermarkLog.created_at.desc()).limit(limit).offset(offset).all()
+
+        return jsonify({
+            'success': True,
+            'logs': [l.to_dict() for l in logs],
+            'total': total, 'limit': limit, 'offset': offset
+        })
+    except Exception as e:
+        current_app.logger.error(f"dm_get_watermark_log error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+# ============================================================
+# WORKFLOW BUILDER ENDPOINTS
+# ============================================================
+
+@app.route('/api/dm-documents/workflows', methods=['GET'])
+@jwt_required
+@cross_origin()
+def dm_get_workflows():
+    """List workflow definitions"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        query = DocumentWorkflowDefinition.query
+        if not is_super_admin:
+            query = query.filter_by(company_id=user.company_id)
+
+        is_active = request.args.get('is_active')
+        if is_active is not None:
+            query = query.filter_by(is_active=is_active.lower() in ('true', '1'))
+        category = request.args.get('category')
+        if category:
+            query = query.filter_by(category=category)
+
+        workflows = query.order_by(DocumentWorkflowDefinition.updated_at.desc()).all()
+        return jsonify({'success': True, 'workflows': [w.to_dict() for w in workflows], 'total': len(workflows)})
+    except Exception as e:
+        current_app.logger.error(f"dm_get_workflows error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/workflows/<int:workflow_id>', methods=['GET'])
+@jwt_required
+@cross_origin()
+def dm_get_workflow(workflow_id):
+    """Get a single workflow"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        wf = DocumentWorkflowDefinition.query.get(workflow_id)
+        if not wf:
+            return jsonify({'success': False, 'error': 'Workflow not found'}), 404
+
+        is_super_admin = check_super_admin()
+        if not is_super_admin and wf.company_id and user.company_id and wf.company_id != user.company_id:
+            return jsonify({'success': False, 'error': 'Access denied'}), 403
+
+        return jsonify({'success': True, 'workflow': wf.to_dict()})
+    except Exception as e:
+        current_app.logger.error(f"dm_get_workflow error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/workflows', methods=['POST'])
+@jwt_required
+@cross_origin()
+def dm_create_workflow():
+    """Create a workflow definition"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        if not is_super_admin:
+            user_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
+            if user_plan not in ['pro', 'business', 'enterprise', 'custom']:
+                return jsonify({'success': False, 'error': 'Plan does not include workflow builder', 'code': 'FEATURE_NOT_AVAILABLE'}), 403
+
+        data = request.get_json() or {}
+        if not data.get('name'):
+            return jsonify({'success': False, 'error': 'name is required', 'code': 'VALIDATION_ERROR'}), 400
+
+        wf = DocumentWorkflowDefinition(
+            name=data['name'],
+            description=data.get('description'),
+            category=data.get('category', 'general'),
+            is_active=data.get('is_active', True),
+            is_default=data.get('is_default', False),
+            applicable_to=json.dumps(data.get('applicable_to', [])),
+            nodes=json.dumps(data.get('nodes', [])),
+            connections=json.dumps(data.get('connections', [])),
+            version=data.get('version', 1),
+            company_id=user.company_id,
+            created_by=user.id
+        )
+        db.session.add(wf)
+        db.session.commit()
+        return jsonify({'success': True, 'workflow': wf.to_dict(), 'message': 'Workflow created'}), 201
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_create_workflow error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/workflows/<int:workflow_id>', methods=['PUT'])
+@jwt_required
+@cross_origin()
+def dm_update_workflow(workflow_id):
+    """Update a workflow definition"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        wf = DocumentWorkflowDefinition.query.get(workflow_id)
+        if not wf:
+            return jsonify({'success': False, 'error': 'Workflow not found'}), 404
+
+        is_super_admin = check_super_admin()
+        if not is_super_admin and wf.company_id and user.company_id and wf.company_id != user.company_id:
+            return jsonify({'success': False, 'error': 'Access denied'}), 403
+
+        data = request.get_json() or {}
+        for field in ['name', 'description', 'category', 'is_active', 'is_default', 'version']:
+            if field in data:
+                setattr(wf, field, data[field])
+        if 'applicable_to' in data:
+            wf.applicable_to = json.dumps(data['applicable_to'])
+        if 'nodes' in data:
+            wf.nodes = json.dumps(data['nodes'])
+        if 'connections' in data:
+            wf.connections = json.dumps(data['connections'])
+
+        wf.updated_at = datetime.utcnow()
+        db.session.commit()
+        return jsonify({'success': True, 'workflow': wf.to_dict(), 'message': 'Workflow updated'})
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_update_workflow error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/workflows/<int:workflow_id>', methods=['DELETE'])
+@jwt_required
+@cross_origin()
+def dm_delete_workflow(workflow_id):
+    """Delete a workflow definition"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        wf = DocumentWorkflowDefinition.query.get(workflow_id)
+        if not wf:
+            return jsonify({'success': False, 'error': 'Workflow not found'}), 404
+
+        is_super_admin = check_super_admin()
+        if not is_super_admin and wf.company_id and user.company_id and wf.company_id != user.company_id:
+            return jsonify({'success': False, 'error': 'Access denied'}), 403
+
+        db.session.delete(wf)
+        db.session.commit()
+        return jsonify({'success': True, 'message': 'Workflow deleted'})
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_delete_workflow error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/workflows/<int:workflow_id>/trigger', methods=['POST'])
+@jwt_required
+@cross_origin()
+def dm_trigger_workflow(workflow_id):
+    """Trigger a workflow execution for a document"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        wf = DocumentWorkflowDefinition.query.get(workflow_id)
+        if not wf:
+            return jsonify({'success': False, 'error': 'Workflow not found'}), 404
+
+        is_super_admin = check_super_admin()
+        if not is_super_admin and wf.company_id and user.company_id and wf.company_id != user.company_id:
+            return jsonify({'success': False, 'error': 'Access denied'}), 403
+
+        data = request.get_json() or {}
+        document_id = data.get('document_id')
+        if not document_id:
+            return jsonify({'success': False, 'error': 'document_id required', 'code': 'VALIDATION_ERROR'}), 400
+
+        document = Document.query.get(document_id)
+        if not document:
+            return jsonify({'success': False, 'error': 'Document not found'}), 404
+
+        nodes = json.loads(wf.nodes) if isinstance(wf.nodes, str) else (wf.nodes or [])
+        first_node_id = nodes[0].get('id') if nodes else None
+
+        execution = DocumentWorkflowExecution(
+            workflow_id=workflow_id,
+            document_id=document_id,
+            status='running',
+            current_node_id=first_node_id,
+            context=json.dumps(data.get('context', {})),
+            execution_log=json.dumps([{
+                'timestamp': datetime.utcnow().isoformat(),
+                'action': 'started',
+                'by': user.name,
+                'node_id': first_node_id
+            }]),
+            company_id=wf.company_id
+        )
+        db.session.add(execution)
+        db.session.commit()
+
+        return jsonify({'success': True, 'execution': execution.to_dict(), 'message': 'Workflow triggered'}), 201
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_trigger_workflow error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+# ============================================================
+# COMPLIANCE REPORTS ENDPOINTS
+# ============================================================
+
+@app.route('/api/dm-documents/compliance/assessments', methods=['GET'])
+@jwt_required
+@cross_origin()
+def dm_get_compliance_assessments():
+    """List compliance assessments"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        query = DocumentComplianceAssessment.query
+        if not is_super_admin:
+            query = query.filter_by(company_id=user.company_id)
+
+        for f in ['document_id', 'framework_id', 'status']:
+            v = request.args.get(f)
+            if v:
+                query = query.filter_by(**{f: v})
+
+        assessments = query.order_by(DocumentComplianceAssessment.updated_at.desc()).all()
+        return jsonify({'success': True, 'assessments': [a.to_dict() for a in assessments], 'total': len(assessments)})
+    except Exception as e:
+        current_app.logger.error(f"dm_get_compliance_assessments error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/compliance/reports', methods=['GET'])
+@jwt_required
+@cross_origin()
+def dm_get_compliance_reports():
+    """List generated compliance reports"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        query = DocumentComplianceReport.query
+        if not is_super_admin:
+            query = query.filter_by(company_id=user.company_id)
+
+        reports = query.order_by(DocumentComplianceReport.created_at.desc()).all()
+        return jsonify({'success': True, 'reports': [r.to_dict() for r in reports], 'total': len(reports)})
+    except Exception as e:
+        current_app.logger.error(f"dm_get_compliance_reports error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/compliance/reports/generate', methods=['POST'])
+@jwt_required
+@cross_origin()
+def dm_generate_compliance_report():
+    """Generate a compliance report"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        if not is_super_admin:
+            user_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
+            if user_plan not in ['pro', 'business', 'enterprise', 'custom']:
+                return jsonify({'success': False, 'error': 'Plan does not include compliance reports', 'code': 'FEATURE_NOT_AVAILABLE'}), 403
+
+        data = request.get_json() or {}
+        title = data.get('title') or f"Compliance Report {datetime.utcnow().strftime('%Y-%m-%d')}"
+
+        report = DocumentComplianceReport(
+            title=title,
+            report_type=data.get('report_type', 'compliance_status'),
+            frameworks=json.dumps(data.get('frameworks', [])),
+            format=data.get('format', 'pdf'),
+            date_from=datetime.fromisoformat(data['date_from']).date() if data.get('date_from') else None,
+            date_to=datetime.fromisoformat(data['date_to']).date() if data.get('date_to') else None,
+            include_charts=data.get('include_charts', True),
+            include_evidence=data.get('include_evidence', True),
+            include_recommendations=data.get('include_recommendations', True),
+            notes=data.get('notes'),
+            company_id=user.company_id,
+            generated_by=user.id
+        )
+        db.session.add(report)
+        db.session.commit()
+
+        return jsonify({'success': True, 'report': report.to_dict(), 'message': 'Report generated'}), 201
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_generate_compliance_report error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/compliance/reports/preview', methods=['POST'])
+@jwt_required
+@cross_origin()
+def dm_preview_compliance_report():
+    """Preview compliance report data (no persistence)"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        query = DocumentComplianceAssessment.query
+        if not is_super_admin:
+            query = query.filter_by(company_id=user.company_id)
+
+        data = request.get_json() or {}
+        frameworks = data.get('frameworks', [])
+        if frameworks:
+            query = query.filter(DocumentComplianceAssessment.framework_id.in_(frameworks))
+
+        assessments = query.all()
+        total = len(assessments)
+        compliant = sum(1 for a in assessments if a.status in ('compliant', 'pass'))
+        score = round((compliant / total * 100)) if total else 0
+
+        return jsonify({
+            'success': True,
+            'preview': {
+                'total_assessments': total,
+                'compliant': compliant,
+                'overall_score': score,
+                'frameworks': frameworks,
+                'assessments': [a.to_dict() for a in assessments[:50]]
+            }
+        })
+    except Exception as e:
+        current_app.logger.error(f"dm_preview_compliance_report error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/compliance/reports/<int:report_id>/download', methods=['GET'])
+@jwt_required
+@cross_origin()
+def dm_download_compliance_report(report_id):
+    """Download a compliance report (placeholder PDF)"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        report = DocumentComplianceReport.query.get(report_id)
+        if not report:
+            return jsonify({'success': False, 'error': 'Report not found'}), 404
+
+        is_super_admin = check_super_admin()
+        if not is_super_admin and report.company_id and user.company_id and report.company_id != user.company_id:
+            return jsonify({'success': False, 'error': 'Access denied'}), 403
+
+        content = f"Compliance Report\n\nTitle: {report.title}\nType: {report.report_type}\nGenerated: {report.created_at}\n".encode('utf-8')
+        return Response(content, mimetype='application/pdf',
+                        headers={'Content-Disposition': f'attachment; filename="compliance-report-{report_id}.pdf"'})
+    except Exception as e:
+        current_app.logger.error(f"dm_download_compliance_report error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/compliance/reports/<int:report_id>', methods=['DELETE'])
+@jwt_required
+@cross_origin()
+def dm_delete_compliance_report(report_id):
+    """Delete a compliance report"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        report = DocumentComplianceReport.query.get(report_id)
+        if not report:
+            return jsonify({'success': False, 'error': 'Report not found'}), 404
+
+        is_super_admin = check_super_admin()
+        if not is_super_admin and report.company_id and user.company_id and report.company_id != user.company_id:
+            return jsonify({'success': False, 'error': 'Access denied'}), 403
+
+        db.session.delete(report)
+        db.session.commit()
+        return jsonify({'success': True, 'message': 'Report deleted'})
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_delete_compliance_report error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/compliance/reports/schedule', methods=['POST'])
+@jwt_required
+@cross_origin()
+def dm_schedule_compliance_report():
+    """Schedule a recurring compliance report"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        if not is_super_admin:
+            user_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
+            if user_plan not in ['pro', 'business', 'enterprise', 'custom']:
+                return jsonify({'success': False, 'error': 'Plan does not include scheduling', 'code': 'FEATURE_NOT_AVAILABLE'}), 403
+
+        data = request.get_json() or {}
+        sched = DocumentComplianceSchedule(
+            name=data.get('name', 'Scheduled Compliance Report'),
+            report_config=json.dumps(data.get('report_config', {})),
+            frequency=data.get('frequency', 'monthly'),
+            recipients=json.dumps(data.get('recipients', [])),
+            enabled=data.get('enabled', True),
+            next_send_at=datetime.utcnow() + timedelta(days=1),
+            company_id=user.company_id,
+            created_by=user.id
+        )
+        db.session.add(sched)
+        db.session.commit()
+        return jsonify({'success': True, 'schedule': sched.to_dict(), 'message': 'Report scheduled'}), 201
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_schedule_compliance_report error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+# ============================================================
+# DOCUMENT BUNDLES ENDPOINTS
+# ============================================================
+
+@app.route('/api/dm-documents/bundles', methods=['GET'])
+@jwt_required
+@cross_origin()
+def dm_get_bundles():
+    """List document bundles"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        query = DocumentBundle.query
+        if not is_super_admin:
+            query = query.filter_by(company_id=user.company_id)
+
+        for f in ['status', 'type']:
+            v = request.args.get(f)
+            if v and v != 'all':
+                query = query.filter_by(**{f: v})
+
+        bundles = query.order_by(DocumentBundle.updated_at.desc()).all()
+        return jsonify({'success': True, 'bundles': [b.to_dict() for b in bundles], 'total': len(bundles)})
+    except Exception as e:
+        current_app.logger.error(f"dm_get_bundles error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/bundles/<int:bundle_id>', methods=['GET'])
+@jwt_required
+@cross_origin()
+def dm_get_bundle(bundle_id):
+    """Get a single bundle"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        bundle = DocumentBundle.query.get(bundle_id)
+        if not bundle:
+            return jsonify({'success': False, 'error': 'Bundle not found'}), 404
+
+        is_super_admin = check_super_admin()
+        if not is_super_admin and bundle.company_id and user.company_id and bundle.company_id != user.company_id:
+            return jsonify({'success': False, 'error': 'Access denied'}), 403
+
+        return jsonify({'success': True, 'bundle': bundle.to_dict()})
+    except Exception as e:
+        current_app.logger.error(f"dm_get_bundle error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/bundles/<int:bundle_id>/documents', methods=['GET'])
+@jwt_required
+@cross_origin()
+def dm_get_bundle_documents(bundle_id):
+    """Get documents in a bundle"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        bundle = DocumentBundle.query.get(bundle_id)
+        if not bundle:
+            return jsonify({'success': False, 'error': 'Bundle not found'}), 404
+
+        is_super_admin = check_super_admin()
+        if not is_super_admin and bundle.company_id and user.company_id and bundle.company_id != user.company_id:
+            return jsonify({'success': False, 'error': 'Access denied'}), 403
+
+        items = BundleDocument.query.filter_by(bundle_id=bundle_id).order_by(BundleDocument.position).all()
+        return jsonify({'success': True, 'documents': [i.to_dict() for i in items], 'total': len(items)})
+    except Exception as e:
+        current_app.logger.error(f"dm_get_bundle_documents error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/bundles', methods=['POST'])
+@jwt_required
+@cross_origin()
+def dm_create_bundle():
+    """Create a bundle"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        if not is_super_admin:
+            user_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
+            if user_plan not in ['pro', 'business', 'enterprise', 'custom']:
+                return jsonify({'success': False, 'error': 'Plan does not include bundles', 'code': 'FEATURE_NOT_AVAILABLE'}), 403
+
+        data = request.get_json() or {}
+        if not data.get('name'):
+            return jsonify({'success': False, 'error': 'name is required', 'code': 'VALIDATION_ERROR'}), 400
+
+        bundle = DocumentBundle(
+            name=data['name'],
+            type=data.get('type', 'custom'),
+            description=data.get('description'),
+            tags=json.dumps(data.get('tags', [])),
+            is_confidential=data.get('is_confidential', False),
+            is_locked=data.get('is_locked', False),
+            expires_at=datetime.fromisoformat(data['expires_at'].replace('Z', '+00:00')) if data.get('expires_at') else None,
+            status=data.get('status', 'draft'),
+            company_id=user.company_id,
+            created_by=user.id,
+            created_by_name=user.name
+        )
+        db.session.add(bundle)
+        db.session.commit()
+        return jsonify({'success': True, 'bundle': bundle.to_dict(), 'message': 'Bundle created'}), 201
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_create_bundle error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/bundles/<int:bundle_id>', methods=['PUT'])
+@jwt_required
+@cross_origin()
+def dm_update_bundle(bundle_id):
+    """Update a bundle"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        bundle = DocumentBundle.query.get(bundle_id)
+        if not bundle:
+            return jsonify({'success': False, 'error': 'Bundle not found'}), 404
+
+        is_super_admin = check_super_admin()
+        if not is_super_admin and bundle.company_id and user.company_id and bundle.company_id != user.company_id:
+            return jsonify({'success': False, 'error': 'Access denied'}), 403
+        if bundle.is_locked and not is_super_admin:
+            return jsonify({'success': False, 'error': 'Bundle is locked', 'code': 'BUNDLE_LOCKED'}), 409
+
+        data = request.get_json() or {}
+        for f in ['name', 'type', 'description', 'is_confidential', 'is_locked', 'status']:
+            if f in data:
+                setattr(bundle, f, data[f])
+        if 'tags' in data:
+            bundle.tags = json.dumps(data['tags'])
+        if 'expires_at' in data:
+            bundle.expires_at = datetime.fromisoformat(data['expires_at'].replace('Z', '+00:00')) if data['expires_at'] else None
+
+        bundle.updated_at = datetime.utcnow()
+        db.session.commit()
+        return jsonify({'success': True, 'bundle': bundle.to_dict(), 'message': 'Bundle updated'})
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_update_bundle error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/bundles/<int:bundle_id>', methods=['DELETE'])
+@jwt_required
+@cross_origin()
+def dm_delete_bundle(bundle_id):
+    """Delete a bundle"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        bundle = DocumentBundle.query.get(bundle_id)
+        if not bundle:
+            return jsonify({'success': False, 'error': 'Bundle not found'}), 404
+
+        is_super_admin = check_super_admin()
+        if not is_super_admin and bundle.company_id and user.company_id and bundle.company_id != user.company_id:
+            return jsonify({'success': False, 'error': 'Access denied'}), 403
+
+        db.session.delete(bundle)
+        db.session.commit()
+        return jsonify({'success': True, 'message': 'Bundle deleted'})
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_delete_bundle error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/bundles/<int:bundle_id>/documents', methods=['POST'])
+@jwt_required
+@cross_origin()
+def dm_add_documents_to_bundle(bundle_id):
+    """Add documents to a bundle"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        bundle = DocumentBundle.query.get(bundle_id)
+        if not bundle:
+            return jsonify({'success': False, 'error': 'Bundle not found'}), 404
+
+        is_super_admin = check_super_admin()
+        if not is_super_admin and bundle.company_id and user.company_id and bundle.company_id != user.company_id:
+            return jsonify({'success': False, 'error': 'Access denied'}), 403
+        if bundle.is_locked and not is_super_admin:
+            return jsonify({'success': False, 'error': 'Bundle is locked', 'code': 'BUNDLE_LOCKED'}), 409
+
+        data = request.get_json() or {}
+        document_ids = data.get('document_ids') or []
+        if not document_ids:
+            return jsonify({'success': False, 'error': 'document_ids required', 'code': 'VALIDATION_ERROR'}), 400
+
+        added = 0
+        max_pos = db.session.query(db.func.max(BundleDocument.position)).filter_by(bundle_id=bundle_id).scalar() or 0
+        for doc_id in document_ids:
+            doc = Document.query.get(doc_id)
+            if not doc:
+                continue
+            if not is_super_admin and doc.company_id and user.company_id and doc.company_id != user.company_id:
+                continue
+            existing = BundleDocument.query.filter_by(bundle_id=bundle_id, document_id=doc_id).first()
+            if existing:
+                continue
+            max_pos += 1
+            bd = BundleDocument(
+                bundle_id=bundle_id,
+                document_id=doc_id,
+                position=max_pos,
+                added_by=user.id
+            )
+            db.session.add(bd)
+            added += 1
+
+        bundle.document_count = BundleDocument.query.filter_by(bundle_id=bundle_id).count()
+        bundle.updated_at = datetime.utcnow()
+        db.session.commit()
+        return jsonify({'success': True, 'added': added, 'message': f'{added} documents added'})
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_add_documents_to_bundle error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/bundles/<int:bundle_id>/documents/<int:document_id>', methods=['DELETE'])
+@jwt_required
+@cross_origin()
+def dm_remove_document_from_bundle(bundle_id, document_id):
+    """Remove a document from a bundle"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        bundle = DocumentBundle.query.get(bundle_id)
+        if not bundle:
+            return jsonify({'success': False, 'error': 'Bundle not found'}), 404
+
+        is_super_admin = check_super_admin()
+        if not is_super_admin and bundle.company_id and user.company_id and bundle.company_id != user.company_id:
+            return jsonify({'success': False, 'error': 'Access denied'}), 403
+        if bundle.is_locked and not is_super_admin:
+            return jsonify({'success': False, 'error': 'Bundle is locked', 'code': 'BUNDLE_LOCKED'}), 409
+
+        bd = BundleDocument.query.filter_by(bundle_id=bundle_id, document_id=document_id).first()
+        if not bd:
+            return jsonify({'success': False, 'error': 'Document not in bundle'}), 404
+
+        db.session.delete(bd)
+        bundle.document_count = BundleDocument.query.filter_by(bundle_id=bundle_id).count() - 1
+        bundle.updated_at = datetime.utcnow()
+        db.session.commit()
+        return jsonify({'success': True, 'message': 'Document removed'})
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_remove_document_from_bundle error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/bundles/<int:bundle_id>/export', methods=['POST'])
+@jwt_required
+@cross_origin()
+def dm_export_bundle(bundle_id):
+    """Export bundle as ZIP/PDF (placeholder)"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        bundle = DocumentBundle.query.get(bundle_id)
+        if not bundle:
+            return jsonify({'success': False, 'error': 'Bundle not found'}), 404
+
+        is_super_admin = check_super_admin()
+        if not is_super_admin and bundle.company_id and user.company_id and bundle.company_id != user.company_id:
+            return jsonify({'success': False, 'error': 'Access denied'}), 403
+
+        # TODO: Build actual ZIP. Return metadata.
+        data = request.get_json() or {}
+        items = BundleDocument.query.filter_by(bundle_id=bundle_id).all()
+        return jsonify({
+            'success': True,
+            'export': {
+                'bundle_id': bundle_id,
+                'bundle_name': bundle.name,
+                'format': data.get('format', 'zip'),
+                'document_count': len(items),
+                'download_url': f"/api/dm-documents/bundles/{bundle_id}/export/download",
+                'message': 'Export queued'
+            }
+        })
+    except Exception as e:
+        current_app.logger.error(f"dm_export_bundle error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/bundles/<int:bundle_id>/share', methods=['POST'])
+@jwt_required
+@cross_origin()
+def dm_share_bundle(bundle_id):
+    """Share a bundle (creates a Share row)"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        bundle = DocumentBundle.query.get(bundle_id)
+        if not bundle:
+            return jsonify({'success': False, 'error': 'Bundle not found'}), 404
+
+        is_super_admin = check_super_admin()
+        if not is_super_admin and bundle.company_id and user.company_id and bundle.company_id != user.company_id:
+            return jsonify({'success': False, 'error': 'Access denied'}), 403
+
+        data = request.get_json() or {}
+        share = Share(
+            bundle_id=bundle_id,
+            share_type=data.get('share_type', 'link'),
+            access_level=data.get('access_level', 'view'),
+            recipient=data.get('recipient'),
+            recipient_email=data.get('recipient_email'),
+            recipients=json.dumps(data.get('recipients', [])),
+            share_token=data.get('share_token') or __import__('uuid').uuid4().hex,
+            expires_at=datetime.fromisoformat(data['expires_at'].replace('Z', '+00:00')) if data.get('expires_at') else None,
+            expiry_days=data.get('expiry_days'),
+            has_password=bool(data.get('password')),
+            require_nda=data.get('require_nda', False),
+            require_email=data.get('require_email', True),
+            watermark=data.get('watermark', True),
+            allow_print=data.get('allow_print', False),
+            status='active',
+            company_id=user.company_id,
+            created_by=user.id
+        )
+        if data.get('password'):
+            from werkzeug.security import generate_password_hash
+            share.password_hash = generate_password_hash(data['password'])
+        db.session.add(share)
+        db.session.commit()
+        return jsonify({'success': True, 'share': share.to_dict(), 'message': 'Bundle shared'}), 201
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_share_bundle error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/bundles/<int:bundle_id>/lock', methods=['PUT'])
+@jwt_required
+@cross_origin()
+def dm_lock_bundle(bundle_id):
+    """Lock/unlock a bundle"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        bundle = DocumentBundle.query.get(bundle_id)
+        if not bundle:
+            return jsonify({'success': False, 'error': 'Bundle not found'}), 404
+
+        is_super_admin = check_super_admin()
+        if not is_super_admin and bundle.company_id and user.company_id and bundle.company_id != user.company_id:
+            return jsonify({'success': False, 'error': 'Access denied'}), 403
+
+        data = request.get_json() or {}
+        bundle.is_locked = bool(data.get('locked', True))
+        bundle.updated_at = datetime.utcnow()
+        db.session.commit()
+        return jsonify({'success': True, 'bundle': bundle.to_dict(),
+                        'message': f'Bundle {"locked" if bundle.is_locked else "unlocked"}'})
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_lock_bundle error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+# ============================================================
+# SHARE PORTAL ENDPOINTS
+# ============================================================
+
+@app.route('/api/dm-documents/shares', methods=['GET'])
+@jwt_required
+@cross_origin()
+def dm_get_shares():
+    """List shares"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        query = Share.query
+        if not is_super_admin:
+            query = query.filter_by(company_id=user.company_id)
+
+        for f in ['status', 'share_type']:
+            v = request.args.get(f)
+            if v and v != 'all':
+                query = query.filter_by(**{f: v})
+        doc_id = request.args.get('document_id')
+        if doc_id:
+            query = query.filter_by(document_id=doc_id)
+        bundle_id = request.args.get('bundle_id')
+        if bundle_id:
+            query = query.filter_by(bundle_id=bundle_id)
+
+        limit = min(int(request.args.get('limit', 50)), 500)
+        offset = int(request.args.get('offset', 0))
+        total = query.count()
+        shares = query.order_by(Share.created_at.desc()).limit(limit).offset(offset).all()
+        return jsonify({'success': True, 'shares': [s.to_dict() for s in shares],
+                        'total': total, 'limit': limit, 'offset': offset})
+    except Exception as e:
+        current_app.logger.error(f"dm_get_shares error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/shares', methods=['POST'])
+@jwt_required
+@cross_origin()
+def dm_create_share():
+    """Create a share link"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        if not is_super_admin:
+            user_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
+            if user_plan not in ['basic', 'pro', 'business', 'enterprise', 'custom']:
+                return jsonify({'success': False, 'error': 'Plan does not include sharing', 'code': 'FEATURE_NOT_AVAILABLE'}), 403
+
+        data = request.get_json() or {}
+        document_id = data.get('document_id')
+        bundle_id = data.get('bundle_id')
+
+        if not document_id and not bundle_id:
+            return jsonify({'success': False, 'error': 'document_id or bundle_id required', 'code': 'VALIDATION_ERROR'}), 400
+        if document_id and bundle_id:
+            return jsonify({'success': False, 'error': 'Provide only one of document_id or bundle_id', 'code': 'VALIDATION_ERROR'}), 400
+
+        if document_id:
+            doc = Document.query.get(document_id)
+            if not doc:
+                return jsonify({'success': False, 'error': 'Document not found'}), 404
+            if not is_super_admin and doc.company_id and user.company_id and doc.company_id != user.company_id:
+                if doc.user_id != user.id:
+                    return jsonify({'success': False, 'error': 'Access denied'}), 403
+        else:
+            bundle = DocumentBundle.query.get(bundle_id)
+            if not bundle:
+                return jsonify({'success': False, 'error': 'Bundle not found'}), 404
+            if not is_super_admin and bundle.company_id and user.company_id and bundle.company_id != user.company_id:
+                return jsonify({'success': False, 'error': 'Access denied'}), 403
+
+        import uuid
+        token = uuid.uuid4().hex
+
+        share = Share(
+            document_id=document_id,
+            bundle_id=bundle_id,
+            share_type=data.get('share_type', 'link'),
+            access_level=data.get('access_level', 'view'),
+            recipient=data.get('recipient'),
+            recipient_email=data.get('recipient_email'),
+            recipients=json.dumps(data.get('recipients', [])),
+            share_url=data.get('share_url') or f"{request.host_url}share/{token}",
+            share_token=token,
+            expires_at=datetime.fromisoformat(data['expires_at'].replace('Z', '+00:00')) if data.get('expires_at') else None,
+            expiry_days=data.get('expiry_days'),
+            max_downloads=data.get('max_downloads'),
+            has_password=bool(data.get('password')),
+            require_nda=data.get('require_nda', False),
+            require_email=data.get('require_email', True),
+            send_notification=data.get('send_notification', True),
+            custom_message=data.get('custom_message'),
+            watermark=data.get('watermark', True),
+            allow_print=data.get('allow_print', False),
+            status='active',
+            company_id=user.company_id,
+            created_by=user.id
+        )
+        if data.get('password'):
+            from werkzeug.security import generate_password_hash
+            share.password_hash = generate_password_hash(data['password'])
+        db.session.add(share)
+        db.session.commit()
+        return jsonify({'success': True, 'share': share.to_dict(), 'message': 'Share created'}), 201
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_create_share error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/shares/<int:share_id>/revoke', methods=['POST'])
+@jwt_required
+@cross_origin()
+def dm_revoke_share(share_id):
+    """Revoke a share"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        share = Share.query.get(share_id)
+        if not share:
+            return jsonify({'success': False, 'error': 'Share not found'}), 404
+
+        is_super_admin = check_super_admin()
+        if not is_super_admin and share.company_id and user.company_id and share.company_id != user.company_id:
+            return jsonify({'success': False, 'error': 'Access denied'}), 403
+
+        share.status = 'revoked'
+        db.session.commit()
+        return jsonify({'success': True, 'share': share.to_dict(), 'message': 'Share revoked'})
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_revoke_share error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/shares/<int:share_id>/extend', methods=['POST'])
+@jwt_required
+@cross_origin()
+def dm_extend_share_expiry(share_id):
+    """Extend share expiry"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        share = Share.query.get(share_id)
+        if not share:
+            return jsonify({'success': False, 'error': 'Share not found'}), 404
+
+        is_super_admin = check_super_admin()
+        if not is_super_admin and share.company_id and user.company_id and share.company_id != user.company_id:
+            return jsonify({'success': False, 'error': 'Access denied'}), 403
+
+        data = request.get_json() or {}
+        days = int(data.get('days', 7))
+        base = share.expires_at or datetime.utcnow()
+        share.expires_at = base + timedelta(days=days)
+        if share.status == 'expired':
+            share.status = 'active'
+        db.session.commit()
+        return jsonify({'success': True, 'share': share.to_dict(), 'message': f'Expiry extended by {days} days'})
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_extend_share_expiry error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/shares/activity', methods=['GET'])
+@jwt_required
+@cross_origin()
+def dm_get_share_activity():
+    """Get share activity log"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        query = ShareActivity.query
+        if not is_super_admin:
+            query = query.filter_by(company_id=user.company_id)
+
+        share_id = request.args.get('share_id')
+        if share_id:
+            query = query.filter_by(share_id=share_id)
+
+        limit = min(int(request.args.get('limit', 50)), 500)
+        offset = int(request.args.get('offset', 0))
+        total = query.count()
+        activities = query.order_by(ShareActivity.created_at.desc()).limit(limit).offset(offset).all()
+        return jsonify({'success': True, 'activities': [a.to_dict() for a in activities],
+                        'total': total, 'limit': limit, 'offset': offset})
+    except Exception as e:
+        current_app.logger.error(f"dm_get_share_activity error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/shares/analytics', methods=['GET'])
+@jwt_required
+@cross_origin()
+def dm_get_share_analytics():
+    """Get share analytics"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        q = Share.query
+        if not is_super_admin:
+            q = q.filter_by(company_id=user.company_id)
+
+        shares = q.all()
+        total_views = sum(s.view_count or 0 for s in shares)
+        total_downloads = sum(s.download_count or 0 for s in shares)
+        unique_visitors = sum(s.unique_users or 0 for s in shares)
+        active = sum(1 for s in shares if s.status == 'active')
+        expired = sum(1 for s in shares if s.status == 'expired')
+        revoked = sum(1 for s in shares if s.status == 'revoked')
+
+        return jsonify({
+            'success': True,
+            'total_views': total_views,
+            'total_downloads': total_downloads,
+            'unique_visitors': unique_visitors,
+            'total_accesses': total_views + total_downloads,
+            'total_shares': len(shares),
+            'active_shares': active,
+            'expired_shares': expired,
+            'revoked_shares': revoked
+        })
+    except Exception as e:
+        current_app.logger.error(f"dm_get_share_analytics error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+# ============================================================
+# SMART INTAKE ENDPOINTS
+# ============================================================
+
+@app.route('/api/dm-documents/intake/submit', methods=['POST'])
+@jwt_required
+@cross_origin()
+def dm_submit_smart_intake():
+    """Submit a file for smart intake processing"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        if not is_super_admin:
+            user_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
+            if user_plan not in ['pro', 'business', 'enterprise', 'custom']:
+                return jsonify({'success': False, 'error': 'Plan does not include smart intake', 'code': 'FEATURE_NOT_AVAILABLE'}), 403
+
+        if 'file' not in request.files:
+            return jsonify({'success': False, 'error': 'No file provided', 'code': 'NO_FILE'}), 400
+
+        file = request.files['file']
+        if not file.filename:
+            return jsonify({'success': False, 'error': 'Empty filename', 'code': 'EMPTY_FILENAME'}), 400
+
+        file.seek(0, 2)
+        size = file.tell()
+        file.seek(0)
+
+        # TODO: Save file to storage. Placeholder URL.
+        import uuid
+        filename = f"intake_{uuid.uuid4().hex}_{file.filename}"
+        url = f"/uploads/intake/{filename}"
+
+        item = IntakeQueueItem(
+            file_name=file.filename,
+            file_size=size,
+            file_url=url,
+            status='processing',
+            stage='analysis',
+            progress=10,
+            company_id=user.company_id,
+            uploaded_by=user.id,
+            uploaded_at=datetime.utcnow()
+        )
+        db.session.add(item)
+        db.session.commit()
+
+        return jsonify({'success': True, 'item': item.to_dict(),
+                        'message': 'File submitted for processing'}), 201
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_submit_smart_intake error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/intake/queue', methods=['GET'])
+@jwt_required
+@cross_origin()
+def dm_get_intake_queue():
+    """Get intake queue items"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        query = IntakeQueueItem.query
+        if not is_super_admin:
+            query = query.filter_by(company_id=user.company_id)
+
+        for f in ['status', 'stage']:
+            v = request.args.get(f)
+            if v and v != 'all':
+                query = query.filter_by(**{f: v})
+        if request.args.get('needs_review') in ('true', '1'):
+            query = query.filter_by(needs_review=True)
+
+        limit = min(int(request.args.get('limit', 50)), 500)
+        offset = int(request.args.get('offset', 0))
+        total = query.count()
+        items = query.order_by(IntakeQueueItem.uploaded_at.desc()).limit(limit).offset(offset).all()
+        return jsonify({'success': True, 'items': [i.to_dict() for i in items],
+                        'total': total, 'limit': limit, 'offset': offset})
+    except Exception as e:
+        current_app.logger.error(f"dm_get_intake_queue error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/intake/<int:item_id>/status', methods=['GET'])
+@jwt_required
+@cross_origin()
+def dm_get_intake_status(item_id):
+    """Get intake item status"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        item = IntakeQueueItem.query.get(item_id)
+        if not item:
+            return jsonify({'success': False, 'error': 'Item not found'}), 404
+
+        is_super_admin = check_super_admin()
+        if not is_super_admin and item.company_id and user.company_id and item.company_id != user.company_id:
+            return jsonify({'success': False, 'error': 'Access denied'}), 403
+
+        return jsonify({'success': True, 'item': item.to_dict()})
+    except Exception as e:
+        current_app.logger.error(f"dm_get_intake_status error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/intake/stats', methods=['GET'])
+@jwt_required
+@cross_origin()
+def dm_get_intake_stats():
+    """Get intake statistics"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        company_id = user.company_id if not is_super_admin else request.args.get('company_id', user.company_id)
+
+        stats = IntakeStats.query.filter_by(company_id=company_id).first()
+        if not stats:
+            return jsonify({
+                'success': True,
+                'total_processed': 0, 'auto_approved': 0,
+                'needs_review': 0, 'duplicates_found': 0, 'avg_confidence': 0
+            })
+        return jsonify({'success': True, **stats.to_dict()})
+    except Exception as e:
+        current_app.logger.error(f"dm_get_intake_stats error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/intake/<int:item_id>/approve', methods=['POST'])
+@jwt_required
+@cross_origin()
+def dm_approve_intake_item(item_id):
+    """Approve an intake item (optionally create document)"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        item = IntakeQueueItem.query.get(item_id)
+        if not item:
+            return jsonify({'success': False, 'error': 'Item not found'}), 404
+
+        is_super_admin = check_super_admin()
+        if not is_super_admin and item.company_id and user.company_id and item.company_id != user.company_id:
+            return jsonify({'success': False, 'error': 'Access denied'}), 403
+
+        data = request.get_json() or {}
+        item.status = 'approved'
+        item.stage = 'completed'
+        item.needs_review = False
+        item.progress = 100
+        if 'predicted_type' in data:
+            item.predicted_type = data['predicted_type']
+        if 'extracted_data' in data:
+            item.extracted_data = json.dumps(data['extracted_data'])
+        if 'suggested_tags' in data:
+            item.suggested_tags = json.dumps(data['suggested_tags'])
+        item.processed_at = datetime.utcnow()
+        db.session.commit()
+
+        return jsonify({'success': True, 'item': item.to_dict(), 'message': 'Item approved'})
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_approve_intake_item error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/intake/<int:item_id>/reject', methods=['POST'])
+@jwt_required
+@cross_origin()
+def dm_reject_intake_item(item_id):
+    """Reject an intake item"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        item = IntakeQueueItem.query.get(item_id)
+        if not item:
+            return jsonify({'success': False, 'error': 'Item not found'}), 404
+
+        is_super_admin = check_super_admin()
+        if not is_super_admin and item.company_id and user.company_id and item.company_id != user.company_id:
+            return jsonify({'success': False, 'error': 'Access denied'}), 403
+
+        data = request.get_json() or {}
+        item.status = 'rejected'
+        item.stage = 'completed'
+        item.needs_review = False
+        item.error = data.get('reason')
+        item.processed_at = datetime.utcnow()
+        db.session.commit()
+        return jsonify({'success': True, 'item': item.to_dict(), 'message': 'Item rejected'})
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_reject_intake_item error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+# ============================================================
+# ADVANCED SEARCH ENDPOINTS
+# ============================================================
+
+@app.route('/api/dm-documents/advanced-search', methods=['POST'])
+@jwt_required
+@cross_origin()
+def dm_advanced_search():
+    """Advanced search with filters + facets"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        data = request.get_json() or {}
+        query_text = (data.get('query') or data.get('q') or '').strip()
+        mode = data.get('mode', 'fulltext')
+
+        q = Document.query
+        is_super_admin = check_super_admin()
+        if not is_super_admin and user.company_id:
+            q = q.filter_by(company_id=user.company_id)
+
+        if query_text:
+            like = f"%{query_text}%"
+            q = q.filter(db.or_(
+                Document.title.ilike(like),
+                Document.description.ilike(like),
+                Document.content.ilike(like) if hasattr(Document, 'content') else False
+            ))
+
+        # Simple filters
+        for f in ['document_type', 'module', 'category', 'status', 'priority']:
+            v = data.get(f)
+            if v and v != 'all' and hasattr(Document, f):
+                q = q.filter(getattr(Document, f) == v)
+
+        limit = min(int(data.get('limit', 25)), 200)
+        offset = int(data.get('offset', 0))
+        total = q.count()
+        results = q.order_by(Document.updated_at.desc()).limit(limit).offset(offset).all()
+
+        return jsonify({
+            'success': True,
+            'results': [d.to_dict() if hasattr(d, 'to_dict') else {'id': d.id, 'title': d.title} for d in results],
+            'total': total, 'limit': limit, 'offset': offset,
+            'facets': {},
+            'did_you_mean': None
+        })
+    except Exception as e:
+        current_app.logger.error(f"dm_advanced_search error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/search/suggestions', methods=['GET'])
+@jwt_required
+@cross_origin()
+def dm_get_search_suggestions():
+    """Search suggestions"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        q = (request.args.get('q') or '').strip()
+        if not q:
+            return jsonify({'success': True, 'suggestions': []})
+
+        like = f"%{q}%"
+        doc_q = Document.query.filter(Document.title.ilike(like))
+        is_super_admin = check_super_admin()
+        if not is_super_admin and user.company_id:
+            doc_q = doc_q.filter_by(company_id=user.company_id)
+
+        docs = doc_q.limit(10).all()
+        suggestions = [{'text': d.title, 'type': 'document', 'id': d.id} for d in docs]
+        return jsonify({'success': True, 'suggestions': suggestions})
+    except Exception as e:
+        current_app.logger.error(f"dm_get_search_suggestions error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/search/alerts', methods=['POST'])
+@jwt_required
+@cross_origin()
+def dm_create_search_alert():
+    """Create a search alert"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        if not is_super_admin:
+            user_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
+            if user_plan not in ['pro', 'business', 'enterprise', 'custom']:
+                return jsonify({'success': False, 'error': 'Plan does not include search alerts', 'code': 'FEATURE_NOT_AVAILABLE'}), 403
+
+        data = request.get_json() or {}
+        alert = SearchAlert(
+            name=data.get('name') or 'Search Alert',
+            query=data.get('query'),
+            mode=data.get('mode', 'fulltext'),
+            filters=json.dumps(data.get('filters', {})),
+            frequency=data.get('frequency', 'daily'),
+            recipients=json.dumps(data.get('recipients', [])),
+            enabled=data.get('enabled', True),
+            next_send_at=datetime.utcnow() + timedelta(days=1),
+            company_id=user.company_id,
+            created_by=user.id
+        )
+        db.session.add(alert)
+        db.session.commit()
+        return jsonify({'success': True, 'alert': alert.to_dict(), 'message': 'Alert created'}), 201
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_create_search_alert error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/search/alerts', methods=['GET'])
+@jwt_required
+@cross_origin()
+def dm_get_search_alerts():
+    """List search alerts"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        q = SearchAlert.query
+        if not is_super_admin:
+            q = q.filter_by(company_id=user.company_id)
+        alerts = q.order_by(SearchAlert.created_at.desc()).all()
+        return jsonify({'success': True, 'alerts': [a.to_dict() for a in alerts], 'total': len(alerts)})
+    except Exception as e:
+        current_app.logger.error(f"dm_get_search_alerts error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+# ============================================================
+# AI ASSISTANT ENDPOINTS
+# ============================================================
+
+@app.route('/api/dm-documents/assistant/ask', methods=['POST'])
+@jwt_required
+@cross_origin()
+def dm_ask_assistant():
+    """Ask the AI assistant a question"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        if not is_super_admin:
+            user_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
+            if user_plan not in ['pro', 'business', 'enterprise', 'custom']:
+                return jsonify({'success': False, 'error': 'Plan does not include AI assistant', 'code': 'FEATURE_NOT_AVAILABLE'}), 403
+
+        data = request.get_json() or {}
+        question = (data.get('question') or '').strip()
+        if not question:
+            return jsonify({'success': False, 'error': 'question required', 'code': 'VALIDATION_ERROR'}), 400
+
+        conversation_id = data.get('conversation_id')
+        if conversation_id:
+            conv = AssistantConversation.query.filter_by(id=conversation_id, user_id=user.id).first()
+        else:
+            conv = None
+        if not conv:
+            conv = AssistantConversation(
+                user_id=user.id,
+                title=question[:60],
+                company_id=user.company_id
+            )
+            db.session.add(conv)
+            db.session.flush()
+
+        # Store user message
+        user_msg = AssistantMessage(
+            conversation_id=conv.id,
+            user_id=user.id,
+            company_id=user.company_id,
+            role='user',
+            content=question
+        )
+        db.session.add(user_msg)
+
+        # TODO: Integrate actual LLM. Placeholder response.
+        answer = f"I received your question: '{question}'. (AI integration pending.)"
+        assistant_msg = AssistantMessage(
+            conversation_id=conv.id,
+            user_id=user.id,
+            company_id=user.company_id,
+            role='assistant',
+            content=answer,
+            sources=json.dumps([]),
+            suggestions=json.dumps([]),
+            tokens_used=0
+        )
+        db.session.add(assistant_msg)
+        conv.message_count = (conv.message_count or 0) + 2
+        conv.updated_at = datetime.utcnow()
+        db.session.commit()
+
+        return jsonify({
+            'success': True,
+            'conversation_id': conv.id,
+            'answer': answer,
+            'message': assistant_msg.to_dict()
+        })
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_ask_assistant error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/assistant/conversations', methods=['GET'])
+@jwt_required
+@cross_origin()
+def dm_get_assistant_conversations():
+    """List assistant conversations for current user"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        convs = AssistantConversation.query.filter_by(user_id=user.id)\
+            .order_by(AssistantConversation.updated_at.desc()).all()
+        return jsonify({'success': True, 'conversations': [c.to_dict() for c in convs], 'total': len(convs)})
+    except Exception as e:
+        current_app.logger.error(f"dm_get_assistant_conversations error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/assistant/conversations/<int:conversation_id>', methods=['GET'])
+@jwt_required
+@cross_origin()
+def dm_get_assistant_conversation(conversation_id):
+    """Get a single conversation with messages"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        conv = AssistantConversation.query.filter_by(id=conversation_id, user_id=user.id).first()
+        if not conv:
+            return jsonify({'success': False, 'error': 'Conversation not found'}), 404
+
+        messages = AssistantMessage.query.filter_by(conversation_id=conversation_id)\
+            .order_by(AssistantMessage.created_at.asc()).all()
+        return jsonify({'success': True, 'conversation': conv.to_dict(),
+                        'messages': [m.to_dict() for m in messages]})
+    except Exception as e:
+        current_app.logger.error(f"dm_get_assistant_conversation error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/assistant/conversations/<int:conversation_id>', methods=['DELETE'])
+@jwt_required
+@cross_origin()
+def dm_delete_assistant_conversation(conversation_id):
+    """Delete a conversation"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        conv = AssistantConversation.query.filter_by(id=conversation_id, user_id=user.id).first()
+        if not conv:
+            return jsonify({'success': False, 'error': 'Conversation not found'}), 404
+
+        db.session.delete(conv)
+        db.session.commit()
+        return jsonify({'success': True, 'message': 'Conversation deleted'})
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_delete_assistant_conversation error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+# ============================================================
+# ANOMALY DETECTION ENDPOINTS
+# ============================================================
+
+@app.route('/api/dm-documents/anomalies', methods=['GET'])
+@jwt_required
+@cross_origin()
+def dm_get_anomalies():
+    """List anomalies"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        q = Anomaly.query
+        if not is_super_admin:
+            q = q.filter_by(company_id=user.company_id)
+
+        for f in ['type', 'severity', 'status']:
+            v = request.args.get(f)
+            if v and v != 'all':
+                q = q.filter_by(**{f: v})
+
+        limit = min(int(request.args.get('limit', 50)), 500)
+        offset = int(request.args.get('offset', 0))
+        total = q.count()
+        items = q.order_by(Anomaly.created_at.desc()).limit(limit).offset(offset).all()
+        return jsonify({'success': True, 'anomalies': [a.to_dict() for a in items],
+                        'total': total, 'limit': limit, 'offset': offset})
+    except Exception as e:
+        current_app.logger.error(f"dm_get_anomalies error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/anomalies/stats', methods=['GET'])
+@jwt_required
+@cross_origin()
+def dm_get_anomaly_stats():
+    """Get anomaly stats"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        q = Anomaly.query
+        if not is_super_admin:
+            q = q.filter_by(company_id=user.company_id)
+
+        items = q.all()
+        total = len(items)
+        by_severity = {}
+        by_type = {}
+        for a in items:
+            by_severity[a.severity] = by_severity.get(a.severity, 0) + 1
+            by_type[a.type] = by_type.get(a.type, 0) + 1
+
+        unresolved = sum(1 for a in items if a.status == 'new')
+        resolved = sum(1 for a in items if a.status in ('resolved', 'false_positive'))
+        avg_risk = round(sum(a.risk_score or 0 for a in items) / total, 1) if total else 0
+
+        return jsonify({
+            'success': True,
+            'total': total,
+            'by_severity': by_severity,
+            'by_type': by_type,
+            'unresolved': unresolved,
+            'resolved': resolved,
+            'avg_risk_score': avg_risk
+        })
+    except Exception as e:
+        current_app.logger.error(f"dm_get_anomaly_stats error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/anomalies/patterns', methods=['GET'])
+@jwt_required
+@cross_origin()
+def dm_get_anomaly_patterns():
+    """Get anomaly patterns"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        q = Anomaly.query
+        if not is_super_admin:
+            q = q.filter_by(company_id=user.company_id)
+
+        items = q.all()
+        by_hour = {}
+        for a in items:
+            h = a.created_at.hour if a.created_at else 0
+            by_hour[h] = by_hour.get(h, 0) + 1
+
+        return jsonify({'success': True, 'patterns': {'by_hour': by_hour, 'total': len(items)}})
+    except Exception as e:
+        current_app.logger.error(f"dm_get_anomaly_patterns error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/anomalies/timeline', methods=['GET'])
+@jwt_required
+@cross_origin()
+def dm_get_anomaly_timeline():
+    """Get anomaly timeline grouped by day"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        q = Anomaly.query
+        if not is_super_admin:
+            q = q.filter_by(company_id=user.company_id)
+
+        items = q.all()
+        by_day = {}
+        for a in items:
+            d = a.created_at.date().isoformat() if a.created_at else None
+            if d:
+                by_day[d] = by_day.get(d, 0) + 1
+        timeline = [{'date': k, 'count': v} for k, v in sorted(by_day.items())]
+        return jsonify({'success': True, 'timeline': timeline})
+    except Exception as e:
+        current_app.logger.error(f"dm_get_anomaly_timeline error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/anomalies/top-offenders', methods=['GET'])
+@jwt_required
+@cross_origin()
+def dm_get_top_offenders():
+    """Top offenders by anomaly count"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        q = Anomaly.query
+        if not is_super_admin:
+            q = q.filter_by(company_id=user.company_id)
+
+        items = q.all()
+        counts = {}
+        for a in items:
+            key = a.user_id or a.user_email or 'unknown'
+            if key not in counts:
+                counts[key] = {'user_id': a.user_id, 'user_name': a.user_name,
+                               'user_email': a.user_email, 'count': 0, 'max_risk': 0}
+            counts[key]['count'] += 1
+            counts[key]['max_risk'] = max(counts[key]['max_risk'], a.risk_score or 0)
+
+        offenders = sorted(counts.values(), key=lambda x: x['count'], reverse=True)[:20]
+        return jsonify({'success': True, 'offenders': offenders})
+    except Exception as e:
+        current_app.logger.error(f"dm_get_top_offenders error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/anomalies/baselines', methods=['GET'])
+@jwt_required
+@cross_origin()
+def dm_get_user_baselines():
+    """List user behavior baselines"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        q = UserBaseline.query
+        if not is_super_admin:
+            q = q.filter_by(company_id=user.company_id)
+
+        items = q.all()
+        return jsonify({'success': True, 'baselines': [b.to_dict() for b in items], 'total': len(items)})
+    except Exception as e:
+        current_app.logger.error(f"dm_get_user_baselines error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/anomalies/rules', methods=['GET'])
+@jwt_required
+@cross_origin()
+def dm_get_detection_rules():
+    """List detection rules"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        q = DetectionRule.query
+        if not is_super_admin:
+            q = q.filter_by(company_id=user.company_id)
+
+        rules = q.order_by(DetectionRule.created_at.desc()).all()
+        return jsonify({'success': True, 'rules': [r.to_dict() for r in rules], 'total': len(rules)})
+    except Exception as e:
+        current_app.logger.error(f"dm_get_detection_rules error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/anomalies/rules', methods=['POST'])
+@jwt_required
+@cross_origin()
+def dm_save_detection_rule():
+    """Create or update a detection rule"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        if not is_super_admin:
+            user_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
+            if user_plan not in ['pro', 'business', 'enterprise', 'custom']:
+                return jsonify({'success': False, 'error': 'Plan does not include detection rules', 'code': 'FEATURE_NOT_AVAILABLE'}), 403
+
+        data = request.get_json() or {}
+        rule_id = data.get('id')
+        if rule_id:
+            rule = DetectionRule.query.get(rule_id)
+            if not rule:
+                return jsonify({'success': False, 'error': 'Rule not found'}), 404
+            if not is_super_admin and rule.company_id and user.company_id and rule.company_id != user.company_id:
+                return jsonify({'success': False, 'error': 'Access denied'}), 403
+            is_new = False
+        else:
+            rule = DetectionRule(company_id=user.company_id, created_by=user.id)
+            db.session.add(rule)
+            is_new = True
+
+        for f in ['name', 'description', 'type', 'severity', 'condition', 'enabled']:
+            if f in data:
+                setattr(rule, f, data[f])
+        if 'actions' in data:
+            rule.actions = json.dumps(data['actions'])
+        rule.updated_at = datetime.utcnow()
+        db.session.commit()
+        return jsonify({'success': True, 'rule': rule.to_dict(), 'is_new': is_new}), 201 if is_new else 200
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_save_detection_rule error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/anomalies/rules/<int:rule_id>/toggle', methods=['PUT'])
+@jwt_required
+@cross_origin()
+def dm_toggle_detection_rule(rule_id):
+    """Enable/disable a detection rule"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        rule = DetectionRule.query.get(rule_id)
+        if not rule:
+            return jsonify({'success': False, 'error': 'Rule not found'}), 404
+
+        is_super_admin = check_super_admin()
+        if not is_super_admin and rule.company_id and user.company_id and rule.company_id != user.company_id:
+            return jsonify({'success': False, 'error': 'Access denied'}), 403
+
+        data = request.get_json() or {}
+        rule.enabled = bool(data.get('enabled', not rule.enabled))
+        rule.updated_at = datetime.utcnow()
+        db.session.commit()
+        return jsonify({'success': True, 'rule': rule.to_dict()})
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_toggle_detection_rule error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/anomalies/rules/<int:rule_id>', methods=['DELETE'])
+@jwt_required
+@cross_origin()
+def dm_delete_detection_rule(rule_id):
+    """Delete a detection rule"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        rule = DetectionRule.query.get(rule_id)
+        if not rule:
+            return jsonify({'success': False, 'error': 'Rule not found'}), 404
+
+        is_super_admin = check_super_admin()
+        if not is_super_admin and rule.company_id and user.company_id and rule.company_id != user.company_id:
+            return jsonify({'success': False, 'error': 'Access denied'}), 403
+
+        db.session.delete(rule)
+        db.session.commit()
+        return jsonify({'success': True, 'message': 'Rule deleted'})
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_delete_detection_rule error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/anomalies/detect', methods=['POST'])
+@jwt_required
+@cross_origin()
+def dm_run_anomaly_detection():
+    """Run anomaly detection (placeholder)"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        if not is_super_admin:
+            user_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
+            if user_plan not in ['pro', 'business', 'enterprise', 'custom']:
+                return jsonify({'success': False, 'error': 'Plan does not include anomaly detection', 'code': 'FEATURE_NOT_AVAILABLE'}), 403
+
+        data = request.get_json() or {}
+        # TODO: Implement real detection logic. Placeholder.
+        return jsonify({'success': True, 'detected': 0, 'message': 'Detection run queued'})
+    except Exception as e:
+        current_app.logger.error(f"dm_run_anomaly_detection error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/anomalies/<int:anomaly_id>/resolve', methods=['POST'])
+@jwt_required
+@cross_origin()
+def dm_resolve_anomaly(anomaly_id):
+    """Resolve an anomaly"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        anomaly = Anomaly.query.get(anomaly_id)
+        if not anomaly:
+            return jsonify({'success': False, 'error': 'Anomaly not found'}), 404
+
+        is_super_admin = check_super_admin()
+        if not is_super_admin and anomaly.company_id and user.company_id and anomaly.company_id != user.company_id:
+            return jsonify({'success': False, 'error': 'Access denied'}), 403
+
+        anomaly.status = 'resolved'
+        anomaly.resolved_at = datetime.utcnow()
+        anomaly.resolved_by = user.id
+        db.session.commit()
+        return jsonify({'success': True, 'anomaly': anomaly.to_dict(), 'message': 'Anomaly resolved'})
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_resolve_anomaly error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/anomalies/<int:anomaly_id>/false-positive', methods=['POST'])
+@jwt_required
+@cross_origin()
+def dm_mark_false_positive(anomaly_id):
+    """Mark an anomaly as false positive"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        anomaly = Anomaly.query.get(anomaly_id)
+        if not anomaly:
+            return jsonify({'success': False, 'error': 'Anomaly not found'}), 404
+
+        is_super_admin = check_super_admin()
+        if not is_super_admin and anomaly.company_id and user.company_id and anomaly.company_id != user.company_id:
+            return jsonify({'success': False, 'error': 'Access denied'}), 403
+
+        anomaly.status = 'false_positive'
+        anomaly.resolved_at = datetime.utcnow()
+        anomaly.resolved_by = user.id
+        db.session.commit()
+        return jsonify({'success': True, 'anomaly': anomaly.to_dict(), 'message': 'Marked as false positive'})
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_mark_false_positive error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/users/<int:user_id>/block', methods=['POST'])
+@jwt_required
+@cross_origin()
+def dm_block_user(user_id):
+    """Block a user (placeholder)"""
+    try:
+        admin = getattr(request, 'user', None)
+        if not admin:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        if not is_super_admin:
+            user_plan = (getattr(admin, 'subscription_plan', None) or 'free').lower()
+            if user_plan not in ['business', 'enterprise', 'custom']:
+                return jsonify({'success': False, 'error': 'Plan does not include user blocking', 'code': 'FEATURE_NOT_AVAILABLE'}), 403
+
+        target = User.query.get(user_id)
+        if not target:
+            return jsonify({'success': False, 'error': 'Target user not found'}), 404
+
+        if not is_super_admin and target.company_id and admin.company_id and target.company_id != admin.company_id:
+            return jsonify({'success': False, 'error': 'Access denied'}), 403
+
+        data = request.get_json() or {}
+        # TODO: actually block. Placeholder.
+        return jsonify({'success': True, 'message': 'User blocked', 'user_id': user_id,
+                        'reason': data.get('reason')})
+    except Exception as e:
+        current_app.logger.error(f"dm_block_user error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/anomalies/bulk-action', methods=['POST'])
+@jwt_required
+@cross_origin()
+def dm_bulk_anomaly_action():
+    """Bulk action on anomalies"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        if not is_super_admin:
+            user_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
+            if user_plan not in ['pro', 'business', 'enterprise', 'custom']:
+                return jsonify({'success': False, 'error': 'Plan does not include bulk actions', 'code': 'FEATURE_NOT_AVAILABLE'}), 403
+
+        data = request.get_json() or {}
+        ids = data.get('ids') or []
+        action = data.get('action')
+        if not ids or not action:
+            return jsonify({'success': False, 'error': 'ids and action required', 'code': 'VALIDATION_ERROR'}), 400
+
+        affected = 0
+        for aid in ids:
+            a = Anomaly.query.get(aid)
+            if not a:
+                continue
+            if not is_super_admin and a.company_id and user.company_id and a.company_id != user.company_id:
+                continue
+            if action == 'resolve':
+                a.status = 'resolved'
+                a.resolved_at = datetime.utcnow()
+                a.resolved_by = user.id
+            elif action == 'false_positive':
+                a.status = 'false_positive'
+                a.resolved_at = datetime.utcnow()
+                a.resolved_by = user.id
+            elif action == 'ignore':
+                a.status = 'ignored'
+            affected += 1
+        db.session.commit()
+        return jsonify({'success': True, 'affected': affected, 'message': f'{affected} anomalies updated'})
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_bulk_anomaly_action error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/anomalies/settings', methods=['POST'])
+@jwt_required
+@cross_origin()
+def dm_save_anomaly_settings():
+    """Save anomaly detection settings (placeholder - no model)"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        if not is_super_admin:
+            user_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
+            if user_plan not in ['pro', 'business', 'enterprise', 'custom']:
+                return jsonify({'success': False, 'error': 'Plan does not include anomaly settings', 'code': 'FEATURE_NOT_AVAILABLE'}), 403
+
+        data = request.get_json() or {}
+        # TODO: Persist to a settings model or company config
+        return jsonify({'success': True, 'settings': data, 'message': 'Settings saved'})
+    except Exception as e:
+        current_app.logger.error(f"dm_save_anomaly_settings error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+# ============================================================
+# PREDICTIVE ANALYTICS ENDPOINTS
+# ============================================================
+
+@app.route('/api/dm-documents/predictive/forecast', methods=['GET'])
+@jwt_required
+@cross_origin()
+def dm_get_predictive_forecast():
+    """Get predictive forecast"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        q = Prediction.query
+        if not is_super_admin:
+            q = q.filter_by(company_id=user.company_id)
+
+        ptype = request.args.get('type')
+        if ptype:
+            q = q.filter_by(type=ptype)
+
+        preds = q.order_by(Prediction.created_at.desc()).limit(100).all()
+        timeline = [p.to_dict() for p in preds]
+        summary = {
+            'count': len(timeline),
+            'avg_confidence': round(sum(p.confidence or 0 for p in preds) / len(preds), 2) if preds else 0,
+            'avg_risk': round(sum(p.risk_score or 0 for p in preds) / len(preds), 1) if preds else 0
+        }
+        return jsonify({'success': True, 'timeline': timeline, 'summary': summary})
+    except Exception as e:
+        current_app.logger.error(f"dm_get_predictive_forecast error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/predictive/risk-scores', methods=['GET'])
+@jwt_required
+@cross_origin()
+def dm_get_risk_scores():
+    """Get risk scores from predictions"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        q = Prediction.query
+        if not is_super_admin:
+            q = q.filter_by(company_id=user.company_id)
+
+        preds = q.order_by(Prediction.risk_score.desc()).limit(50).all()
+        risks = [{'id': p.id, 'title': p.title, 'type': p.type,
+                  'risk_score': p.risk_score, 'confidence': p.confidence,
+                  'timeframe': p.timeframe, 'created_at': p.created_at.isoformat() if p.created_at else None}
+                 for p in preds]
+        return jsonify({'success': True, 'risks': risks})
+    except Exception as e:
+        current_app.logger.error(f"dm_get_risk_scores error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/predictive/trends', methods=['GET'])
+@jwt_required
+@cross_origin()
+def dm_get_predictive_trends():
+    """Get predictive trends (grouped by type/timeframe)"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        q = Prediction.query
+        if not is_super_admin:
+            q = q.filter_by(company_id=user.company_id)
+
+        preds = q.all()
+        by_type = {}
+        for p in preds:
+            by_type.setdefault(p.type, []).append(p.value or 0)
+        trends = [{'type': k, 'avg_value': round(sum(v) / len(v), 2), 'count': len(v)}
+                  for k, v in by_type.items()]
+        return jsonify({'success': True, 'trends': trends})
+    except Exception as e:
+        current_app.logger.error(f"dm_get_predictive_trends error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/predictive/recommendations', methods=['GET'])
+@jwt_required
+@cross_origin()
+def dm_get_predictive_recommendations():
+    """Get recommendations based on predictions"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        q = Prediction.query
+        if not is_super_admin:
+            q = q.filter_by(company_id=user.company_id)
+        q = q.filter(Prediction.risk_score >= 50).order_by(Prediction.risk_score.desc()).limit(20)
+
+        recs = []
+        for p in q.all():
+            recs.append({
+                'id': p.id,
+                'title': f"Address: {p.title}",
+                'description': p.description,
+                'priority': 'high' if (p.risk_score or 0) >= 80 else 'medium',
+                'risk_score': p.risk_score,
+                'type': p.type
+            })
+        return jsonify({'success': True, 'recommendations': recs})
+    except Exception as e:
+        current_app.logger.error(f"dm_get_predictive_recommendations error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/predictive/models', methods=['GET'])
+@jwt_required
+@cross_origin()
+def dm_get_predictive_models():
+    """List ML models"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        q = MLPredictiveModel.query
+        if not is_super_admin:
+            q = q.filter_by(company_id=user.company_id)
+
+        models = q.order_by(MLPredictiveModel.updated_at.desc()).all()
+        accuracy = {}
+        for m in models:
+            accuracy[m.id] = m.accuracy or 0
+        return jsonify({'success': True, 'models': [m.to_dict() for m in models], 'accuracy': accuracy})
+    except Exception as e:
+        current_app.logger.error(f"dm_get_predictive_models error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/predictive/predictions', methods=['GET'])
+@jwt_required
+@cross_origin()
+def dm_get_predictions():
+    """List predictions"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        q = Prediction.query
+        if not is_super_admin:
+            q = q.filter_by(company_id=user.company_id)
+
+        for f in ['type']:
+            v = request.args.get(f)
+            if v:
+                q = q.filter_by(**{f: v})
+
+        limit = min(int(request.args.get('limit', 50)), 500)
+        offset = int(request.args.get('offset', 0))
+        total = q.count()
+        preds = q.order_by(Prediction.created_at.desc()).limit(limit).offset(offset).all()
+        return jsonify({'success': True, 'predictions': [p.to_dict() for p in preds],
+                        'total': total, 'limit': limit, 'offset': offset})
+    except Exception as e:
+        current_app.logger.error(f"dm_get_predictions error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/predictive/train', methods=['POST'])
+@jwt_required
+@cross_origin()
+def dm_train_predictive_model():
+    """Train a predictive model (placeholder)"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        if not is_super_admin:
+            user_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
+            if user_plan not in ['business', 'enterprise', 'custom']:
+                return jsonify({'success': False, 'error': 'Plan does not include model training', 'code': 'FEATURE_NOT_AVAILABLE'}), 403
+
+        data = request.get_json() or {}
+        model = MLPredictiveModel(
+            name=data.get('name') or 'New Model',
+            type=data.get('type') or 'regression',
+            status='training',
+            model_metadata=json.dumps(data.get('metadata', {})),
+            company_id=user.company_id,
+            created_by=user.id
+        )
+        db.session.add(model)
+        db.session.commit()
+        return jsonify({'success': True, 'model': model.to_dict(), 'message': 'Training started'}), 201
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_train_predictive_model error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/predictive/generate-forecast', methods=['POST'])
+@jwt_required
+@cross_origin()
+def dm_generate_forecast():
+    """Generate a forecast (placeholder)"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        if not is_super_admin:
+            user_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
+            if user_plan not in ['pro', 'business', 'enterprise', 'custom']:
+                return jsonify({'success': False, 'error': 'Plan does not include forecasts', 'code': 'FEATURE_NOT_AVAILABLE'}), 403
+
+        data = request.get_json() or {}
+        # TODO: actual forecast logic. Return a stub prediction.
+        pred = Prediction(
+            title=data.get('title') or 'Generated Forecast',
+            type=data.get('type') or 'document_volume',
+            description=data.get('description'),
+            value=float(data.get('value', 0)),
+            unit=data.get('unit'),
+            timeframe=data.get('timeframe'),
+            confidence=float(data.get('confidence', 0.8)),
+            risk_score=int(data.get('risk_score', 0)),
+            supporting_data=json.dumps(data.get('supporting_data', [])),
+            company_id=user.company_id
+        )
+        db.session.add(pred)
+        db.session.commit()
+        return jsonify({'success': True, 'prediction': pred.to_dict(), 'message': 'Forecast generated'}), 201
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_generate_forecast error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/predictive/export', methods=['POST'])
+@jwt_required
+@cross_origin()
+def dm_export_predictive_report():
+    """Export predictive report (placeholder)"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        if not is_super_admin:
+            user_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
+            if user_plan not in ['pro', 'business', 'enterprise', 'custom']:
+                return jsonify({'success': False, 'error': 'Plan does not include predictive exports', 'code': 'FEATURE_NOT_AVAILABLE'}), 403
+
+        data = request.get_json() or {}
+        content = f"Predictive Analytics Report\n\nGenerated: {datetime.utcnow()}\n".encode('utf-8')
+        return Response(content, mimetype='application/pdf',
+                        headers={'Content-Disposition': 'attachment; filename="predictive-report.pdf"'})
+    except Exception as e:
+        current_app.logger.error(f"dm_export_predictive_report error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/predictive/alerts', methods=['POST'])
+@jwt_required
+@cross_origin()
+def dm_create_predictive_alert():
+    """Create a predictive alert"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        if not is_super_admin:
+            user_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
+            if user_plan not in ['pro', 'business', 'enterprise', 'custom']:
+                return jsonify({'success': False, 'error': 'Plan does not include predictive alerts', 'code': 'FEATURE_NOT_AVAILABLE'}), 403
+
+        data = request.get_json() or {}
+        alert = PredictiveAlert(
+            name=data.get('name') or 'Predictive Alert',
+            prediction_type=data.get('prediction_type'),
+            threshold=float(data.get('threshold', 0)),
+            recipients=json.dumps(data.get('recipients', [])),
+            enabled=data.get('enabled', True),
+            company_id=user.company_id,
+            created_by=user.id
+        )
+        db.session.add(alert)
+        db.session.commit()
+        return jsonify({'success': True, 'alert': alert.to_dict(), 'message': 'Alert created'}), 201
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_create_predictive_alert error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/predictive/settings', methods=['POST'])
+@jwt_required
+@cross_origin()
+def dm_save_predictive_settings():
+    """Save predictive settings (placeholder)"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        if not is_super_admin:
+            user_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
+            if user_plan not in ['pro', 'business', 'enterprise', 'custom']:
+                return jsonify({'success': False, 'error': 'Plan does not include predictive settings', 'code': 'FEATURE_NOT_AVAILABLE'}), 403
+
+        data = request.get_json() or {}
+        return jsonify({'success': True, 'settings': data, 'message': 'Settings saved'})
+    except Exception as e:
+        current_app.logger.error(f"dm_save_predictive_settings error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+# ============================================================
+# QUALITY MANAGEMENT ENDPOINTS
+# ============================================================
+
+@app.route('/api/dm-documents/qms/records', methods=['GET'])
+@jwt_required
+@cross_origin()
+def dm_get_quality_records():
+    """List quality records"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        q = QualityRecord.query
+        if not is_super_admin:
+            q = q.filter_by(company_id=user.company_id)
+
+        for f in ['type', 'severity', 'status', 'department']:
+            v = request.args.get(f)
+            if v and v != 'all':
+                q = q.filter_by(**{f: v})
+        assigned = request.args.get('assigned_to')
+        if assigned:
+            q = q.filter_by(assigned_to=assigned)
+
+        limit = min(int(request.args.get('limit', 50)), 500)
+        offset = int(request.args.get('offset', 0))
+        total = q.count()
+        items = q.order_by(QualityRecord.created_at.desc()).limit(limit).offset(offset).all()
+        return jsonify({'success': True, 'records': [r.to_dict() for r in items],
+                        'total': total, 'limit': limit, 'offset': offset})
+    except Exception as e:
+        current_app.logger.error(f"dm_get_quality_records error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/qms/records/<int:record_id>', methods=['GET'])
+@jwt_required
+@cross_origin()
+def dm_get_quality_record(record_id):
+    """Get a single quality record"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        rec = QualityRecord.query.get(record_id)
+        if not rec:
+            return jsonify({'success': False, 'error': 'Record not found'}), 404
+
+        is_super_admin = check_super_admin()
+        if not is_super_admin and rec.company_id and user.company_id and rec.company_id != user.company_id:
+            return jsonify({'success': False, 'error': 'Access denied'}), 403
+
+        return jsonify({'success': True, 'record': rec.to_dict()})
+    except Exception as e:
+        current_app.logger.error(f"dm_get_quality_record error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/qms/records', methods=['POST'])
+@jwt_required
+@cross_origin()
+def dm_create_quality_record():
+    """Create a quality record"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        if not is_super_admin:
+            user_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
+            if user_plan not in ['pro', 'business', 'enterprise', 'custom']:
+                return jsonify({'success': False, 'error': 'Plan does not include QMS', 'code': 'FEATURE_NOT_AVAILABLE'}), 403
+
+        data = request.get_json() or {}
+        if not data.get('title') or not data.get('type'):
+            return jsonify({'success': False, 'error': 'title and type are required', 'code': 'VALIDATION_ERROR'}), 400
+
+        import uuid
+        rec_number = data.get('record_number') or f"QR-{datetime.utcnow().strftime('%Y%m%d')}-{uuid.uuid4().hex[:6].upper()}"
+
+        rec = QualityRecord(
+            record_number=rec_number,
+            type=data['type'],
+            title=data['title'],
+            description=data.get('description'),
+            severity=data.get('severity', 'minor'),
+            department=data.get('department'),
+            assigned_to=data.get('assigned_to'),
+            assigned_to_name=data.get('assigned_to_name'),
+            due_date=datetime.fromisoformat(data['due_date'].replace('Z', '+00:00')) if data.get('due_date') else None,
+            source=data.get('source'),
+            attachments=json.dumps(data.get('attachments', [])),
+            rca=json.dumps(data.get('rca', {})),
+            status=data.get('status', 'draft'),
+            company_id=user.company_id,
+            created_by=user.id
+        )
+        db.session.add(rec)
+        db.session.commit()
+        return jsonify({'success': True, 'record': rec.to_dict(), 'message': 'Record created'}), 201
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_create_quality_record error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/qms/records/<int:record_id>', methods=['PUT'])
+@jwt_required
+@cross_origin()
+def dm_update_quality_record(record_id):
+    """Update a quality record"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        rec = QualityRecord.query.get(record_id)
+        if not rec:
+            return jsonify({'success': False, 'error': 'Record not found'}), 404
+
+        is_super_admin = check_super_admin()
+        if not is_super_admin and rec.company_id and user.company_id and rec.company_id != user.company_id:
+            return jsonify({'success': False, 'error': 'Access denied'}), 403
+
+        data = request.get_json() or {}
+        for f in ['title', 'description', 'severity', 'department', 'assigned_to',
+                  'assigned_to_name', 'source', 'status', 'record_number', 'type']:
+            if f in data:
+                setattr(rec, f, data[f])
+        if 'due_date' in data:
+            rec.due_date = datetime.fromisoformat(data['due_date'].replace('Z', '+00:00')) if data['due_date'] else None
+        if 'attachments' in data:
+            rec.attachments = json.dumps(data['attachments'])
+        if 'rca' in data:
+            rec.rca = json.dumps(data['rca'])
+
+        rec.updated_at = datetime.utcnow()
+        db.session.commit()
+        return jsonify({'success': True, 'record': rec.to_dict(), 'message': 'Record updated'})
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_update_quality_record error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/qms/records/<int:record_id>/status', methods=['PUT'])
+@jwt_required
+@cross_origin()
+def dm_update_quality_record_status(record_id):
+    """Update just the status of a quality record"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        rec = QualityRecord.query.get(record_id)
+        if not rec:
+            return jsonify({'success': False, 'error': 'Record not found'}), 404
+
+        is_super_admin = check_super_admin()
+        if not is_super_admin and rec.company_id and user.company_id and rec.company_id != user.company_id:
+            return jsonify({'success': False, 'error': 'Access denied'}), 403
+
+        data = request.get_json() or {}
+        status = data.get('status')
+        if not status:
+            return jsonify({'success': False, 'error': 'status required', 'code': 'VALIDATION_ERROR'}), 400
+
+        old = rec.status
+        rec.status = status
+        rec.updated_at = datetime.utcnow()
+        db.session.commit()
+
+        # Timeline entry
+        try:
+            t = QualityTimeline(
+                record_id=rec.id, company_id=rec.company_id,
+                action='status_change', type='status',
+                description=f"Status changed from {old} to {status}",
+                user_id=user.id, user_name=user.name,
+                action_metadata=json.dumps({'from': old, 'to': status})
+            )
+            db.session.add(t)
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+
+        return jsonify({'success': True, 'record': rec.to_dict(), 'message': 'Status updated'})
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_update_quality_record_status error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/qms/records/<int:record_id>', methods=['DELETE'])
+@jwt_required
+@cross_origin()
+def dm_delete_quality_record(record_id):
+    """Delete a quality record"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        rec = QualityRecord.query.get(record_id)
+        if not rec:
+            return jsonify({'success': False, 'error': 'Record not found'}), 404
+
+        is_super_admin = check_super_admin()
+        if not is_super_admin and rec.company_id and user.company_id and rec.company_id != user.company_id:
+            return jsonify({'success': False, 'error': 'Access denied'}), 403
+
+        db.session.delete(rec)
+        db.session.commit()
+        return jsonify({'success': True, 'message': 'Record deleted'})
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_delete_quality_record error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/qms/dashboard', methods=['GET'])
+@jwt_required
+@cross_origin()
+def dm_get_quality_dashboard():
+    """QMS dashboard data"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        q = QualityRecord.query
+        if not is_super_admin:
+            q = q.filter_by(company_id=user.company_id)
+
+        records = q.all()
+        total = len(records)
+        by_status = {}
+        by_severity = {}
+        by_type = {}
+        for r in records:
+            by_status[r.status] = by_status.get(r.status, 0) + 1
+            by_severity[r.severity] = by_severity.get(r.severity, 0) + 1
+            by_type[r.type] = by_type.get(r.type, 0) + 1
+
+        open_count = sum(1 for r in records if r.status not in ('closed', 'completed'))
+        closed_count = total - open_count
+        overdue = sum(1 for r in records if r.due_date and r.due_date < datetime.utcnow()
+                      and r.status not in ('closed', 'completed'))
+
+        return jsonify({
+            'success': True,
+            'total': total,
+            'open': open_count,
+            'closed': closed_count,
+            'overdue': overdue,
+            'by_status': by_status,
+            'by_severity': by_severity,
+            'by_type': by_type
+        })
+    except Exception as e:
+        current_app.logger.error(f"dm_get_quality_dashboard error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/qms/metrics', methods=['GET'])
+@jwt_required
+@cross_origin()
+def dm_get_quality_metrics():
+    """QMS metrics"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        company_id = user.company_id if not is_super_admin else request.args.get('company_id', user.company_id)
+        period = request.args.get('period')
+
+        q = QualityMetrics.query.filter_by(company_id=company_id)
+        if period:
+            q = q.filter_by(period=period)
+        metrics = q.order_by(QualityMetrics.updated_at.desc()).first()
+        return jsonify({'success': True, 'metrics': metrics.to_dict() if metrics else {}})
+    except Exception as e:
+        current_app.logger.error(f"dm_get_quality_metrics error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/qms/trends', methods=['GET'])
+@jwt_required
+@cross_origin()
+def dm_get_quality_trends():
+    """QMS trends over time"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        q = QualityRecord.query
+        if not is_super_admin:
+            q = q.filter_by(company_id=user.company_id)
+
+        records = q.all()
+        by_day = {}
+        for r in records:
+            d = r.created_at.date().isoformat() if r.created_at else None
+            if d:
+                by_day[d] = by_day.get(d, 0) + 1
+        trends = [{'date': k, 'count': v} for k, v in sorted(by_day.items())]
+        return jsonify({'success': True, 'trends': trends})
+    except Exception as e:
+        current_app.logger.error(f"dm_get_quality_trends error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/qms/distribution', methods=['GET'])
+@jwt_required
+@cross_origin()
+def dm_get_quality_distribution():
+    """QMS distribution by type/severity/status"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        q = QualityRecord.query
+        if not is_super_admin:
+            q = q.filter_by(company_id=user.company_id)
+
+        records = q.all()
+        by_type = {}
+        by_severity = {}
+        by_status = {}
+        for r in records:
+            by_type[r.type] = by_type.get(r.type, 0) + 1
+            by_severity[r.severity] = by_severity.get(r.severity, 0) + 1
+            by_status[r.status] = by_status.get(r.status, 0) + 1
+        return jsonify({'success': True, 'distributions': {
+            'by_type': by_type, 'by_severity': by_severity, 'by_status': by_status
+        }})
+    except Exception as e:
+        current_app.logger.error(f"dm_get_quality_distribution error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/qms/records/<int:record_id>/rca', methods=['POST'])
+@jwt_required
+@cross_origin()
+def dm_save_rca(record_id):
+    """Save root cause analysis"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        rec = QualityRecord.query.get(record_id)
+        if not rec:
+            return jsonify({'success': False, 'error': 'Record not found'}), 404
+
+        is_super_admin = check_super_admin()
+        if not is_super_admin and rec.company_id and user.company_id and rec.company_id != user.company_id:
+            return jsonify({'success': False, 'error': 'Access denied'}), 403
+
+        data = request.get_json() or {}
+        rec.rca = json.dumps(data)
+        rec.updated_at = datetime.utcnow()
+        db.session.commit()
+
+        try:
+            t = QualityTimeline(
+                record_id=rec.id, company_id=rec.company_id,
+                action='rca_saved', type='rca',
+                description='Root cause analysis saved',
+                user_id=user.id, user_name=user.name
+            )
+            db.session.add(t)
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+
+        return jsonify({'success': True, 'record': rec.to_dict(), 'message': 'RCA saved'})
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_save_rca error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/qms/records/<int:record_id>/actions', methods=['POST'])
+@jwt_required
+@cross_origin()
+def dm_add_quality_action(record_id):
+    """Add a quality action item"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        rec = QualityRecord.query.get(record_id)
+        if not rec:
+            return jsonify({'success': False, 'error': 'Record not found'}), 404
+
+        is_super_admin = check_super_admin()
+        if not is_super_admin and rec.company_id and user.company_id and rec.company_id != user.company_id:
+            return jsonify({'success': False, 'error': 'Access denied'}), 403
+
+        data = request.get_json() or {}
+        action = QualityAction(
+            record_id=record_id,
+            company_id=rec.company_id,
+            action_type=data.get('action_type', 'corrective'),
+            description=data.get('description'),
+            assigned_to=data.get('assigned_to'),
+            assigned_to_name=data.get('assigned_to_name'),
+            due_date=datetime.fromisoformat(data['due_date'].replace('Z', '+00:00')) if data.get('due_date') else None,
+            priority=data.get('priority', 'medium'),
+            status=data.get('status', 'pending')
+        )
+        db.session.add(action)
+        db.session.commit()
+
+        try:
+            t = QualityTimeline(
+                record_id=rec.id, company_id=rec.company_id,
+                action='action_added', type='action',
+                description=f"Action added: {action.description}",
+                user_id=user.id, user_name=user.name
+            )
+            db.session.add(t)
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+
+        return jsonify({'success': True, 'action': action.to_dict(), 'message': 'Action added'}), 201
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_add_quality_action error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/qms/records/<int:record_id>/verify', methods=['POST'])
+@jwt_required
+@cross_origin()
+def dm_verify_quality_action(record_id):
+    """Verify a quality action"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        rec = QualityRecord.query.get(record_id)
+        if not rec:
+            return jsonify({'success': False, 'error': 'Record not found'}), 404
+
+        is_super_admin = check_super_admin()
+        if not is_super_admin and rec.company_id and user.company_id and rec.company_id != user.company_id:
+            return jsonify({'success': False, 'error': 'Access denied'}), 403
+
+        data = request.get_json() or {}
+        action_id = data.get('action_id')
+        if not action_id:
+            return jsonify({'success': False, 'error': 'action_id required', 'code': 'VALIDATION_ERROR'}), 400
+
+        action = QualityAction.query.filter_by(id=action_id, record_id=record_id).first()
+        if not action:
+            return jsonify({'success': False, 'error': 'Action not found'}), 404
+
+        action.verified_at = datetime.utcnow()
+        action.verification_notes = data.get('verification_notes')
+        action.effectiveness_score = data.get('effectiveness_score')
+        if action.effectiveness_score is not None and action.effectiveness_score >= 70:
+            action.status = 'verified'
+        else:
+            action.status = 'completed' if data.get('completed', True) else action.status
+        if data.get('completed'):
+            action.completed_at = action.completed_at or datetime.utcnow()
+        db.session.commit()
+
+        return jsonify({'success': True, 'action': action.to_dict(), 'message': 'Action verified'})
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_verify_quality_action error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/qms/bulk-action', methods=['POST'])
+@jwt_required
+@cross_origin()
+def dm_bulk_quality_action():
+    """Bulk action on quality records"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        if not is_super_admin:
+            user_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
+            if user_plan not in ['pro', 'business', 'enterprise', 'custom']:
+                return jsonify({'success': False, 'error': 'Plan does not include bulk actions', 'code': 'FEATURE_NOT_AVAILABLE'}), 403
+
+        data = request.get_json() or {}
+        ids = data.get('ids') or []
+        action = data.get('action')
+        if not ids or not action:
+            return jsonify({'success': False, 'error': 'ids and action required', 'code': 'VALIDATION_ERROR'}), 400
+
+        affected = 0
+        for rid in ids:
+            rec = QualityRecord.query.get(rid)
+            if not rec:
+                continue
+            if not is_super_admin and rec.company_id and user.company_id and rec.company_id != user.company_id:
+                continue
+            if action == 'close':
+                rec.status = 'closed'
+            elif action == 'reopen':
+                rec.status = 'open'
+            elif action in ('delete', 'archive'):
+                rec.status = 'archived' if action == 'archive' else rec.status
+            elif action == 'assign' and data.get('assigned_to'):
+                rec.assigned_to = data['assigned_to']
+                rec.assigned_to_name = data.get('assigned_to_name')
+            rec.updated_at = datetime.utcnow()
+            affected += 1
+        db.session.commit()
+        return jsonify({'success': True, 'affected': affected, 'message': f'{affected} records updated'})
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_bulk_quality_action error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+# ============================================================
+# OFFLINE MANAGER ENDPOINTS
+# ============================================================
+
+@app.route('/api/dm-documents/offline', methods=['GET'])
+@jwt_required
+@cross_origin()
+def dm_get_offline_documents():
+    """List user's offline cached documents"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        q = OfflineDocument.query.filter_by(user_id=user.id)
+        sync_status = request.args.get('sync_status')
+        if sync_status and sync_status != 'all':
+            q = q.filter_by(sync_status=sync_status)
+
+        items = q.order_by(OfflineDocument.cached_at.desc()).all()
+        return jsonify({'success': True, 'documents': [d.to_dict() for d in items], 'total': len(items)})
+    except Exception as e:
+        current_app.logger.error(f"dm_get_offline_documents error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/offline/download', methods=['POST'])
+@jwt_required
+@cross_origin()
+def dm_download_for_offline():
+    """Mark documents for offline download"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        if not is_super_admin:
+            user_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
+            if user_plan not in ['basic', 'pro', 'business', 'enterprise', 'custom']:
+                return jsonify({'success': False, 'error': 'Plan does not include offline', 'code': 'FEATURE_NOT_AVAILABLE'}), 403
+
+        data = request.get_json() or {}
+        document_ids = data.get('document_ids') or []
+        if not document_ids:
+            return jsonify({'success': False, 'error': 'document_ids required', 'code': 'VALIDATION_ERROR'}), 400
+
+        queued = 0
+        for doc_id in document_ids:
+            doc = Document.query.get(doc_id)
+            if not doc:
+                continue
+            if not is_super_admin and doc.company_id and user.company_id and doc.company_id != user.company_id:
+                if doc.user_id != user.id:
+                    continue
+            existing = OfflineDocument.query.filter_by(user_id=user.id, document_id=doc_id).first()
+            if existing:
+                continue
+            od = OfflineDocument(
+                user_id=user.id, document_id=doc_id,
+                file_size=getattr(doc, 'file_size', 0) or 0,
+                hash_value=getattr(doc, 'hash_value', None),
+                sync_status='pending',
+                company_id=user.company_id
+            )
+            db.session.add(od)
+            queued += 1
+        db.session.commit()
+        return jsonify({'success': True, 'queued': queued, 'message': f'{queued} documents queued'})
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_download_for_offline error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/offline/remove', methods=['POST'])
+@jwt_required
+@cross_origin()
+def dm_remove_from_offline():
+    """Remove documents from offline cache"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        data = request.get_json() or {}
+        document_ids = data.get('document_ids') or []
+        if not document_ids:
+            return jsonify({'success': False, 'error': 'document_ids required', 'code': 'VALIDATION_ERROR'}), 400
+
+        removed = OfflineDocument.query.filter(
+            OfflineDocument.user_id == user.id,
+            OfflineDocument.document_id.in_(document_ids)
+        ).delete(synchronize_session=False)
+        db.session.commit()
+        return jsonify({'success': True, 'removed': removed, 'message': f'{removed} removed'})
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_remove_from_offline error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/offline/sync-queue', methods=['GET'])
+@jwt_required
+@cross_origin()
+def dm_get_sync_queue():
+    """Get sync queue items for current user"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        q = SyncQueueItem.query.filter_by(user_id=user.id)
+        status = request.args.get('status')
+        if status and status != 'all':
+            q = q.filter_by(status=status)
+
+        items = q.order_by(SyncQueueItem.created_at.desc()).all()
+        return jsonify({'success': True, 'queue': [i.to_dict() for i in items], 'total': len(items)})
+    except Exception as e:
+        current_app.logger.error(f"dm_get_sync_queue error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/offline/conflicts', methods=['GET'])
+@jwt_required
+@cross_origin()
+def dm_get_sync_conflicts():
+    """Get sync conflicts for current user"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        q = SyncConflict.query.filter_by(user_id=user.id)
+        resolved = request.args.get('resolved')
+        if resolved is not None:
+            q = q.filter_by(resolved=resolved.lower() in ('true', '1'))
+
+        items = q.order_by(SyncConflict.created_at.desc()).all()
+        return jsonify({'success': True, 'conflicts': [c.to_dict() for c in items], 'total': len(items)})
+    except Exception as e:
+        current_app.logger.error(f"dm_get_sync_conflicts error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/offline/sync', methods=['POST'])
+@jwt_required
+@cross_origin()
+def dm_sync_offline_changes():
+    """Process sync queue items (placeholder)"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        data = request.get_json() or {}
+        changes = data.get('changes') or []
+        processed = 0
+        failed = 0
+        for change in changes:
+            try:
+                item = SyncQueueItem(
+                    user_id=user.id,
+                    document_id=change.get('document_id'),
+                    action=change.get('action', 'update'),
+                    description=change.get('description'),
+                    payload=json.dumps(change.get('payload', {})),
+                    status='pending',
+                    company_id=user.company_id
+                )
+                db.session.add(item)
+                processed += 1
+            except Exception:
+                failed += 1
+        db.session.commit()
+        return jsonify({'success': True, 'processed': processed, 'failed': failed,
+                        'message': f'{processed} changes queued'})
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_sync_offline_changes error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/offline/conflicts/<int:conflict_id>/resolve', methods=['POST'])
+@jwt_required
+@cross_origin()
+def dm_resolve_conflict(conflict_id):
+    """Resolve a sync conflict"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        conflict = SyncConflict.query.filter_by(id=conflict_id, user_id=user.id).first()
+        if not conflict:
+            return jsonify({'success': False, 'error': 'Conflict not found'}), 404
+
+        data = request.get_json() or {}
+        resolution = data.get('resolution')  # 'local' or 'remote'
+        if resolution not in ('local', 'remote', 'merge'):
+            return jsonify({'success': False, 'error': 'resolution must be local/remote/merge', 'code': 'VALIDATION_ERROR'}), 400
+
+        conflict.resolved = True
+        conflict.resolution = resolution
+        conflict.resolved_at = datetime.utcnow()
+        conflict.resolved_by = user.id
+        db.session.commit()
+        return jsonify({'success': True, 'conflict': conflict.to_dict(), 'message': 'Conflict resolved'})
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_resolve_conflict error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/offline/sync-queue/<int:item_id>', methods=['DELETE'])
+@jwt_required
+@cross_origin()
+def dm_remove_from_sync_queue(item_id):
+    """Remove an item from the sync queue"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        item = SyncQueueItem.query.filter_by(id=item_id, user_id=user.id).first()
+        if not item:
+            return jsonify({'success': False, 'error': 'Item not found'}), 404
+
+        db.session.delete(item)
+        db.session.commit()
+        return jsonify({'success': True, 'message': 'Item removed'})
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_remove_from_sync_queue error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/offline/stats', methods=['GET'])
+@jwt_required
+@cross_origin()
+def dm_get_offline_stats():
+    """Get offline statistics for current user"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        docs = OfflineDocument.query.filter_by(user_id=user.id).all()
+        queue = SyncQueueItem.query.filter_by(user_id=user.id).all()
+        conflicts = SyncConflict.query.filter_by(user_id=user.id, resolved=False).all()
+
+        total_size = sum(d.file_size or 0 for d in docs)
+        by_sync = {}
+        for d in docs:
+            by_sync[d.sync_status] = by_sync.get(d.sync_status, 0) + 1
+
+        return jsonify({
+            'success': True,
+            'cached_documents': len(docs),
+            'total_size': total_size,
+            'pending_sync': sum(1 for q in queue if q.status == 'pending'),
+            'failed_sync': sum(1 for q in queue if q.status == 'failed'),
+            'unresolved_conflicts': len(conflicts),
+            'by_sync_status': by_sync
+        })
+    except Exception as e:
+        current_app.logger.error(f"dm_get_offline_stats error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/offline/settings', methods=['GET'])
+@jwt_required
+@cross_origin()
+def dm_get_offline_settings():
+    """Get offline settings for current user"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        settings = OfflineSettings.query.filter_by(user_id=user.id).first()
+        if not settings:
+            return jsonify({'success': True, 'settings': None, 'is_default': True})
+        return jsonify({'success': True, 'settings': settings.to_dict(), 'is_default': False})
+    except Exception as e:
+        current_app.logger.error(f"dm_get_offline_settings error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/offline/settings', methods=['POST'])
+@jwt_required
+@cross_origin()
+def dm_save_offline_settings():
+    """Create/update offline settings"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        data = request.get_json() or {}
+        settings = OfflineSettings.query.filter_by(user_id=user.id).first()
+        is_new = settings is None
+        if is_new:
+            settings = OfflineSettings(user_id=user.id, company_id=user.company_id)
+            db.session.add(settings)
+
+        for f in ['cache_strategy', 'auto_sync', 'sync_interval', 'wifi_only',
+                  'max_cache_size', 'encrypt_cache', 'auto_download']:
+            if f in data:
+                setattr(settings, f, data[f])
+        settings.updated_at = datetime.utcnow()
+        db.session.commit()
+        return jsonify({'success': True, 'settings': settings.to_dict(), 'is_new': is_new})
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_save_offline_settings error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/offline/clear-cache', methods=['POST'])
+@jwt_required
+@cross_origin()
+def dm_clear_offline_cache():
+    """Clear offline cache for current user"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        data = request.get_json() or {}
+        document_ids = data.get('document_ids')
+        q = OfflineDocument.query.filter_by(user_id=user.id)
+        if document_ids:
+            q = q.filter(OfflineDocument.document_id.in_(document_ids))
+        removed = q.delete(synchronize_session=False)
+        db.session.commit()
+        return jsonify({'success': True, 'removed': removed, 'message': f'{removed} cache entries removed'})
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_clear_offline_cache error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+# ============================================================
+# INTEGRATION HUB ENDPOINTS
+# ============================================================
+
+@app.route('/api/dm-documents/integrations', methods=['GET'])
+@jwt_required
+@cross_origin()
+def dm_get_integrations():
+    """List integrations"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        q = Integration.query
+        if not is_super_admin:
+            q = q.filter_by(company_id=user.company_id)
+
+        for f in ['category', 'status']:
+            v = request.args.get(f)
+            if v and v != 'all':
+                q = q.filter_by(**{f: v})
+
+        items = q.order_by(Integration.updated_at.desc()).all()
+        return jsonify({'success': True, 'integrations': [i.to_dict() for i in items], 'total': len(items)})
+    except Exception as e:
+        current_app.logger.error(f"dm_get_integrations error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/integrations/connect', methods=['POST'])
+@jwt_required
+@cross_origin()
+def dm_connect_integration():
+    """Connect an integration"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        if not is_super_admin:
+            user_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
+            if user_plan not in ['pro', 'business', 'enterprise', 'custom']:
+                return jsonify({'success': False, 'error': 'Plan does not include integrations', 'code': 'FEATURE_NOT_AVAILABLE'}), 403
+
+        data = request.get_json() or {}
+        if not data.get('integration_id'):
+            return jsonify({'success': False, 'error': 'integration_id required', 'code': 'VALIDATION_ERROR'}), 400
+
+        existing = Integration.query.filter_by(
+            integration_id=data['integration_id'], company_id=user.company_id
+        ).first()
+
+        if existing:
+            existing.config = json.dumps(data.get('config', {}))
+            existing.status = 'connected'
+            existing.connected_at = datetime.utcnow()
+            existing.connected_by = user.id
+            existing.updated_at = datetime.utcnow()
+            db.session.commit()
+            return jsonify({'success': True, 'integration': existing.to_dict(),
+                            'message': 'Integration reconnected'})
+
+        integ = Integration(
+            integration_id=data['integration_id'],
+            name=data.get('name'),
+            category=data.get('category'),
+            config=json.dumps(data.get('config', {})),
+            status='connected',
+            connected_at=datetime.utcnow(),
+            company_id=user.company_id,
+            connected_by=user.id
+        )
+        db.session.add(integ)
+        db.session.commit()
+        return jsonify({'success': True, 'integration': integ.to_dict(), 'message': 'Integration connected'}), 201
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_connect_integration error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/integrations/<integration_id>/disconnect', methods=['POST'])
+@jwt_required
+@cross_origin()
+def dm_disconnect_integration(integration_id):
+    """Disconnect an integration"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        q = Integration.query.filter_by(integration_id=integration_id)
+        if not is_super_admin:
+            q = q.filter_by(company_id=user.company_id)
+        integ = q.first()
+        if not integ:
+            return jsonify({'success': False, 'error': 'Integration not found'}), 404
+
+        integ.status = 'disconnected'
+        integ.updated_at = datetime.utcnow()
+        db.session.commit()
+        return jsonify({'success': True, 'integration': integ.to_dict(), 'message': 'Integration disconnected'})
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_disconnect_integration error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/integrations/<integration_id>/test', methods=['POST'])
+@jwt_required
+@cross_origin()
+def dm_test_integration(integration_id):
+    """Test an integration connection (placeholder)"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        q = Integration.query.filter_by(integration_id=integration_id)
+        if not is_super_admin:
+            q = q.filter_by(company_id=user.company_id)
+        integ = q.first()
+        if not integ:
+            return jsonify({'success': False, 'error': 'Integration not found'}), 404
+
+        # TODO: real connection test. Placeholder success.
+        return jsonify({'success': True, 'message': 'Connection test passed',
+                        'integration_id': integration_id, 'status': 'ok'})
+    except Exception as e:
+        current_app.logger.error(f"dm_test_integration error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/integrations/<integration_id>/sync', methods=['POST'])
+@jwt_required
+@cross_origin()
+def dm_trigger_integration_sync(integration_id):
+    """Trigger a sync for an integration (placeholder)"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        q = Integration.query.filter_by(integration_id=integration_id)
+        if not is_super_admin:
+            q = q.filter_by(company_id=user.company_id)
+        integ = q.first()
+        if not integ:
+            return jsonify({'success': False, 'error': 'Integration not found'}), 404
+
+        data = request.get_json() or {}
+        integ.last_sync_at = datetime.utcnow()
+        db.session.commit()
+
+        # Activity log
+        try:
+            act = IntegrationActivity(
+                integration_id=integration_id,
+                integration_name=integ.name,
+                action='sync',
+                description=data.get('description') or 'Manual sync triggered',
+                status='success',
+                company_id=integ.company_id
+            )
+            db.session.add(act)
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+
+        return jsonify({'success': True, 'integration': integ.to_dict(), 'message': 'Sync triggered'})
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_trigger_integration_sync error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+# ---- Webhooks ----
+
+@app.route('/api/dm-documents/webhooks', methods=['GET'])
+@jwt_required
+@cross_origin()
+def dm_get_webhooks():
+    """List webhooks"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        q = Webhook.query
+        if not is_super_admin:
+            q = q.filter_by(company_id=user.company_id)
+        items = q.order_by(Webhook.created_at.desc()).all()
+        return jsonify({'success': True, 'webhooks': [w.to_dict() for w in items], 'total': len(items)})
+    except Exception as e:
+        current_app.logger.error(f"dm_get_webhooks error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/webhooks', methods=['POST'])
+@jwt_required
+@cross_origin()
+def dm_create_webhook():
+    """Create a webhook"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        if not is_super_admin:
+            user_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
+            if user_plan not in ['pro', 'business', 'enterprise', 'custom']:
+                return jsonify({'success': False, 'error': 'Plan does not include webhooks', 'code': 'FEATURE_NOT_AVAILABLE'}), 403
+
+        data = request.get_json() or {}
+        if not data.get('name') or not data.get('url'):
+            return jsonify({'success': False, 'error': 'name and url required', 'code': 'VALIDATION_ERROR'}), 400
+
+        wh = Webhook(
+            name=data['name'],
+            url=data['url'],
+            events=json.dumps(data.get('events', [])),
+            secret=data.get('secret'),
+            enabled=data.get('enabled', True),
+            company_id=user.company_id,
+            created_by=user.id
+        )
+        db.session.add(wh)
+        db.session.commit()
+        return jsonify({'success': True, 'webhook': wh.to_dict(), 'message': 'Webhook created'}), 201
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_create_webhook error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/webhooks/<int:webhook_id>/toggle', methods=['PUT'])
+@jwt_required
+@cross_origin()
+def dm_toggle_webhook(webhook_id):
+    """Enable/disable a webhook"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        wh = Webhook.query.get(webhook_id)
+        if not wh:
+            return jsonify({'success': False, 'error': 'Webhook not found'}), 404
+
+        is_super_admin = check_super_admin()
+        if not is_super_admin and wh.company_id and user.company_id and wh.company_id != user.company_id:
+            return jsonify({'success': False, 'error': 'Access denied'}), 403
+
+        data = request.get_json() or {}
+        wh.enabled = bool(data.get('enabled', not wh.enabled))
+        wh.updated_at = datetime.utcnow()
+        db.session.commit()
+        return jsonify({'success': True, 'webhook': wh.to_dict()})
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_toggle_webhook error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/webhooks/<int:webhook_id>', methods=['DELETE'])
+@jwt_required
+@cross_origin()
+def dm_delete_webhook(webhook_id):
+    """Delete a webhook"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        wh = Webhook.query.get(webhook_id)
+        if not wh:
+            return jsonify({'success': False, 'error': 'Webhook not found'}), 404
+
+        is_super_admin = check_super_admin()
+        if not is_super_admin and wh.company_id and user.company_id and wh.company_id != user.company_id:
+            return jsonify({'success': False, 'error': 'Access denied'}), 403
+
+        db.session.delete(wh)
+        db.session.commit()
+        return jsonify({'success': True, 'message': 'Webhook deleted'})
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_delete_webhook error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/webhooks/<int:webhook_id>/test', methods=['POST'])
+@jwt_required
+@cross_origin()
+def dm_test_webhook(webhook_id):
+    """Test a webhook (placeholder)"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        wh = Webhook.query.get(webhook_id)
+        if not wh:
+            return jsonify({'success': False, 'error': 'Webhook not found'}), 404
+
+        is_super_admin = check_super_admin()
+        if not is_super_admin and wh.company_id and user.company_id and wh.company_id != user.company_id:
+            return jsonify({'success': False, 'error': 'Access denied'}), 403
+
+        # TODO: actual HTTP POST. Placeholder.
+        wh.last_triggered_at = datetime.utcnow()
+        wh.trigger_count = (wh.trigger_count or 0) + 1
+        db.session.commit()
+        return jsonify({'success': True, 'message': 'Test delivered', 'webhook': wh.to_dict()})
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_test_webhook error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+# ---- API Keys ----
+
+@app.route('/api/dm-documents/api-keys', methods=['GET'])
+@jwt_required
+@cross_origin()
+def dm_get_api_keys():
+    """List API keys"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        q = APIKey.query
+        if not is_super_admin:
+            q = q.filter_by(company_id=user.company_id)
+        items = q.order_by(APIKey.created_at.desc()).all()
+        return jsonify({'success': True, 'api_keys': [k.to_dict() for k in items], 'total': len(items)})
+    except Exception as e:
+        current_app.logger.error(f"dm_get_api_keys error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/api-keys', methods=['POST'])
+@jwt_required
+@cross_origin()
+def dm_create_api_key():
+    """Create an API key"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        if not is_super_admin:
+            user_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
+            if user_plan not in ['business', 'enterprise', 'custom']:
+                return jsonify({'success': False, 'error': 'Plan does not include API keys', 'code': 'FEATURE_NOT_AVAILABLE'}), 403
+
+        data = request.get_json() or {}
+        if not data.get('name'):
+            return jsonify({'success': False, 'error': 'name required', 'code': 'VALIDATION_ERROR'}), 400
+
+        import uuid, hashlib
+        raw_key = uuid.uuid4().hex + uuid.uuid4().hex
+        prefix = raw_key[:8]
+        key_hash = hashlib.sha256(raw_key.encode('utf-8')).hexdigest()
+
+        key = APIKey(
+            name=data['name'],
+            key_hash=key_hash,
+            prefix=prefix,
+            scopes=json.dumps(data.get('scopes', [])),
+            expires_at=datetime.fromisoformat(data['expires_at'].replace('Z', '+00:00')) if data.get('expires_at') else None,
+            company_id=user.company_id,
+            created_by=user.id
+        )
+        db.session.add(key)
+        db.session.commit()
+
+        result = key.to_dict()
+        # ⚠️ Return raw key ONCE
+        result['key'] = raw_key
+        return jsonify({'success': True, 'api_key': result, 'message': 'API key created. Save it now.'}), 201
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_create_api_key error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/api-keys/<int:key_id>', methods=['DELETE'])
+@jwt_required
+@cross_origin()
+def dm_revoke_api_key(key_id):
+    """Revoke an API key"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        key = APIKey.query.get(key_id)
+        if not key:
+            return jsonify({'success': False, 'error': 'API key not found'}), 404
+
+        is_super_admin = check_super_admin()
+        if not is_super_admin and key.company_id and user.company_id and key.company_id != user.company_id:
+            return jsonify({'success': False, 'error': 'Access denied'}), 403
+
+        key.revoked = True
+        db.session.commit()
+        return jsonify({'success': True, 'message': 'API key revoked'})
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_revoke_api_key error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/integrations/activity', methods=['GET'])
+@jwt_required
+@cross_origin()
+def dm_get_integration_activity():
+    """Get integration activity log"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        q = IntegrationActivity.query
+        if not is_super_admin:
+            q = q.filter_by(company_id=user.company_id)
+
+        iid = request.args.get('integration_id')
+        if iid:
+            q = q.filter_by(integration_id=iid)
+
+        limit = min(int(request.args.get('limit', 50)), 500)
+        offset = int(request.args.get('offset', 0))
+        total = q.count()
+        items = q.order_by(IntegrationActivity.created_at.desc()).limit(limit).offset(offset).all()
+        return jsonify({'success': True, 'activities': [a.to_dict() for a in items],
+                        'total': total, 'limit': limit, 'offset': offset})
+    except Exception as e:
+        current_app.logger.error(f"dm_get_integration_activity error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/integrations/stats', methods=['GET'])
+@jwt_required
+@cross_origin()
+def dm_get_integration_stats():
+    """Integration statistics"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        iq = Integration.query
+        if not is_super_admin:
+            iq = iq.filter_by(company_id=user.company_id)
+
+        ints = iq.all()
+        by_status = {}
+        for i in ints:
+            by_status[i.status] = by_status.get(i.status, 0) + 1
+
+        aq = IntegrationActivity.query
+        if not is_super_admin:
+            aq = aq.filter_by(company_id=user.company_id)
+        acts = aq.all()
+        success = sum(1 for a in acts if a.status == 'success')
+        failed = sum(1 for a in acts if a.status == 'failed')
+
+        return jsonify({
+            'success': True,
+            'total_integrations': len(ints),
+            'by_status': by_status,
+            'total_activities': len(acts),
+            'success_count': success,
+            'failed_count': failed
+        })
+    except Exception as e:
+        current_app.logger.error(f"dm_get_integration_stats error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+# ============================================================
+# CUSTOM REPORT BUILDER ENDPOINTS
+# ============================================================
+
+@app.route('/api/dm-documents/custom-reports', methods=['GET'])
+@jwt_required
+@cross_origin()
+def dm_get_custom_reports():
+    """List custom reports"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        q = CustomReport.query
+        if not is_super_admin:
+            q = q.filter_by(company_id=user.company_id)
+        items = q.order_by(CustomReport.updated_at.desc()).all()
+        return jsonify({'success': True, 'reports': [r.to_dict() for r in items], 'total': len(items)})
+    except Exception as e:
+        current_app.logger.error(f"dm_get_custom_reports error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/custom-reports/run', methods=['POST'])
+@jwt_required
+@cross_origin()
+def dm_run_custom_report():
+    """Run a custom report configuration (placeholder data source)"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        data = request.get_json() or {}
+        data_source = data.get('data_source', 'documents')
+
+        q = Document.query
+        if not is_super_admin and user.company_id:
+            q = q.filter_by(company_id=user.company_id)
+        limit = min(int(data.get('limit', 100)), 1000)
+
+        docs = q.order_by(Document.updated_at.desc()).limit(limit).all()
+        rows = []
+        for d in docs:
+            rows.append({
+                'id': d.id,
+                'title': d.title,
+                'document_type': getattr(d, 'document_type', None),
+                'module': getattr(d, 'module', None),
+                'category': getattr(d, 'category', None),
+                'status': getattr(d, 'status', None),
+                'priority': getattr(d, 'priority', None),
+                'created_at': d.created_at.isoformat() if d.created_at else None,
+                'updated_at': d.updated_at.isoformat() if d.updated_at else None
+            })
+        return jsonify({'success': True, 'rows': rows, 'total': len(rows),
+                        'data_source': data_source})
+    except Exception as e:
+        current_app.logger.error(f"dm_run_custom_report error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/custom-reports', methods=['POST'])
+@jwt_required
+@cross_origin()
+def dm_save_custom_report():
+    """Create or update a custom report"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        if not is_super_admin:
+            user_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
+            if user_plan not in ['pro', 'business', 'enterprise', 'custom']:
+                return jsonify({'success': False, 'error': 'Plan does not include custom reports', 'code': 'FEATURE_NOT_AVAILABLE'}), 403
+
+        data = request.get_json() or {}
+        report_id = data.get('id')
+        if report_id:
+            report = CustomReport.query.get(report_id)
+            if not report:
+                return jsonify({'success': False, 'error': 'Report not found'}), 404
+            if not is_super_admin and report.company_id and user.company_id and report.company_id != user.company_id:
+                return jsonify({'success': False, 'error': 'Access denied'}), 403
+            is_new = False
+        else:
+            if not data.get('name'):
+                return jsonify({'success': False, 'error': 'name required', 'code': 'VALIDATION_ERROR'}), 400
+            report = CustomReport(company_id=user.company_id, created_by=user.id)
+            db.session.add(report)
+            is_new = True
+
+        for f in ['name', 'description', 'data_source', 'limit',
+                  'visualization_type', 'is_public']:
+            if f in data:
+                setattr(report, f, data[f])
+        for jf in ['fields', 'group_by', 'aggregations', 'filters', 'sort_by', 'chart_config', 'schedule']:
+            if jf in data:
+                setattr(report, jf, json.dumps(data[jf]))
+
+        report.updated_at = datetime.utcnow()
+        db.session.commit()
+        return jsonify({'success': True, 'report': report.to_dict(), 'is_new': is_new}), 201 if is_new else 200
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_save_custom_report error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/custom-reports/<int:report_id>', methods=['DELETE'])
+@jwt_required
+@cross_origin()
+def dm_delete_custom_report(report_id):
+    """Delete a custom report"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        report = CustomReport.query.get(report_id)
+        if not report:
+            return jsonify({'success': False, 'error': 'Report not found'}), 404
+
+        is_super_admin = check_super_admin()
+        if not is_super_admin and report.company_id and user.company_id and report.company_id != user.company_id:
+            return jsonify({'success': False, 'error': 'Access denied'}), 403
+
+        db.session.delete(report)
+        db.session.commit()
+        return jsonify({'success': True, 'message': 'Report deleted'})
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_delete_custom_report error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/custom-reports/export', methods=['POST'])
+@jwt_required
+@cross_origin()
+def dm_export_custom_report():
+    """Export a custom report (CSV placeholder)"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        data = request.get_json() or {}
+        # TODO: build real CSV from config. Placeholder.
+        content = "id,title\n".encode('utf-8')
+        return Response(content, mimetype='text/csv',
+                        headers={'Content-Disposition': 'attachment; filename="custom-report.csv"'})
+    except Exception as e:
+        current_app.logger.error(f"dm_export_custom_report error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+# ============================================================
+# BUSINESS INTELLIGENCE ENDPOINTS
+# ============================================================
+
+def _bi_base_query(user, is_super_admin):
+    q = Document.query
+    if not is_super_admin and user.company_id:
+        q = q.filter_by(company_id=user.company_id)
+    return q
+
+
+@app.route('/api/dm-documents/bi/kpis', methods=['GET'])
+@jwt_required
+@cross_origin()
+def dm_get_bi_kpis():
+    """BI KPIs"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        q = _bi_base_query(user, is_super_admin)
+        docs = q.all()
+        total = len(docs)
+        published = sum(1 for d in docs if getattr(d, 'status', None) == 'published')
+        approved = sum(1 for d in docs if getattr(d, 'status', None) == 'approved')
+        draft = sum(1 for d in docs if getattr(d, 'status', None) == 'draft')
+
+        return jsonify({'success': True, 'kpis': {
+            'total_documents': total,
+            'published': published,
+            'approved': approved,
+            'draft': draft
+        }})
+    except Exception as e:
+        current_app.logger.error(f"dm_get_bi_kpis error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/bi/trends', methods=['GET'])
+@jwt_required
+@cross_origin()
+def dm_get_bi_trends():
+    """BI trends over time"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        docs = _bi_base_query(user, is_super_admin).all()
+        by_day = {}
+        for d in docs:
+            k = d.created_at.date().isoformat() if d.created_at else None
+            if k:
+                by_day[k] = by_day.get(k, 0) + 1
+        return jsonify({'success': True, 'data': [{'date': k, 'count': v} for k, v in sorted(by_day.items())]})
+    except Exception as e:
+        current_app.logger.error(f"dm_get_bi_trends error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/bi/distributions', methods=['GET'])
+@jwt_required
+@cross_origin()
+def dm_get_bi_distributions():
+    """BI distributions"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        docs = _bi_base_query(user, is_super_admin).all()
+        by_type, by_module, by_status = {}, {}, {}
+        for d in docs:
+            t = getattr(d, 'document_type', None) or 'unknown'
+            by_type[t] = by_type.get(t, 0) + 1
+            m = getattr(d, 'module', None) or 'unknown'
+            by_module[m] = by_module.get(m, 0) + 1
+            s = getattr(d, 'status', None) or 'unknown'
+            by_status[s] = by_status.get(s, 0) + 1
+
+        return jsonify({'success': True, 'distributions': {
+            'by_type': by_type, 'by_module': by_module, 'by_status': by_status
+        }})
+    except Exception as e:
+        current_app.logger.error(f"dm_get_bi_distributions error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/bi/user-metrics', methods=['GET'])
+@jwt_required
+@cross_origin()
+def dm_get_bi_user_metrics():
+    """BI user metrics"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        docs = _bi_base_query(user, is_super_admin).all()
+        by_user = {}
+        for d in docs:
+            uid = getattr(d, 'user_id', None) or 'unknown'
+            if uid not in by_user:
+                by_user[uid] = {'user_id': uid, 'user_name': getattr(d, 'created_by_name', None), 'count': 0}
+            by_user[uid]['count'] += 1
+        metrics = sorted(by_user.values(), key=lambda x: x['count'], reverse=True)
+        return jsonify({'success': True, 'metrics': metrics})
+    except Exception as e:
+        current_app.logger.error(f"dm_get_bi_user_metrics error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/bi/cost-metrics', methods=['GET'])
+@jwt_required
+@cross_origin()
+def dm_get_bi_cost_metrics():
+    """BI cost metrics (placeholder)"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        docs = _bi_base_query(user, is_super_admin).all()
+        total_size = sum(getattr(d, 'file_size', 0) or 0 for d in docs)
+        storage_gb = round(total_size / (1024 ** 3), 3)
+
+        return jsonify({'success': True, 'metrics': {
+            'total_size_bytes': total_size,
+            'storage_gb': storage_gb,
+            'estimated_monthly_cost_usd': round(storage_gb * 0.023, 2)
+        }})
+    except Exception as e:
+        current_app.logger.error(f"dm_get_bi_cost_metrics error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/bi/bottlenecks', methods=['GET'])
+@jwt_required
+@cross_origin()
+def dm_get_bi_bottlenecks():
+    """BI bottlenecks"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        docs = _bi_base_query(user, is_super_admin).all()
+        stuck = [d for d in docs if getattr(d, 'status', None) in ('draft', 'review')]
+        bottlenecks = []
+        for d in stuck[:20]:
+            bottlenecks.append({
+                'id': d.id,
+                'title': d.title,
+                'status': getattr(d, 'status', None),
+                'days_stuck': (datetime.utcnow() - d.updated_at).days if d.updated_at else 0
+            })
+        return jsonify({'success': True, 'bottlenecks': bottlenecks})
+    except Exception as e:
+        current_app.logger.error(f"dm_get_bi_bottlenecks error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/bi/top-contributors', methods=['GET'])
+@jwt_required
+@cross_origin()
+def dm_get_bi_top_contributors():
+    """BI top contributors"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        docs = _bi_base_query(user, is_super_admin).all()
+        by_user = {}
+        for d in docs:
+            uid = getattr(d, 'user_id', None)
+            if uid is None:
+                continue
+            if uid not in by_user:
+                by_user[uid] = {'user_id': uid, 'count': 0}
+            by_user[uid]['count'] += 1
+        contrib = sorted(by_user.values(), key=lambda x: x['count'], reverse=True)[:10]
+        return jsonify({'success': True, 'contributors': contrib})
+    except Exception as e:
+        current_app.logger.error(f"dm_get_bi_top_contributors error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/bi/drilldown', methods=['GET'])
+@jwt_required
+@cross_origin()
+def dm_get_bi_drilldown():
+    """BI drilldown"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        q = _bi_base_query(user, is_super_admin)
+
+        for f in ['document_type', 'module', 'category', 'status', 'priority']:
+            v = request.args.get(f)
+            if v:
+                if hasattr(Document, f):
+                    q = q.filter(getattr(Document, f) == v)
+
+        docs = q.limit(100).all()
+        return jsonify({'success': True, 'items': [
+            {'id': d.id, 'title': d.title,
+             'status': getattr(d, 'status', None),
+             'updated_at': d.updated_at.isoformat() if d.updated_at else None}
+            for d in docs
+        ]})
+    except Exception as e:
+        current_app.logger.error(f"dm_get_bi_drilldown error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/bi/dashboards', methods=['GET'])
+@jwt_required
+@cross_origin()
+def dm_get_bi_dashboards():
+    """List BI dashboards"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        q = BIDashboard.query
+        if not is_super_admin:
+            q = q.filter(db.or_(BIDashboard.company_id == user.company_id,
+                                 BIDashboard.is_public == True))
+        items = q.order_by(BIDashboard.updated_at.desc()).all()
+        return jsonify({'success': True, 'dashboards': [d.to_dict() for d in items], 'total': len(items)})
+    except Exception as e:
+        current_app.logger.error(f"dm_get_bi_dashboards error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/bi/dashboards', methods=['POST'])
+@jwt_required
+@cross_origin()
+def dm_save_bi_dashboard():
+    """Create/update BI dashboard"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        if not is_super_admin:
+            user_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
+            if user_plan not in ['pro', 'business', 'enterprise', 'custom']:
+                return jsonify({'success': False, 'error': 'Plan does not include dashboards', 'code': 'FEATURE_NOT_AVAILABLE'}), 403
+
+        data = request.get_json() or {}
+        dash_id = data.get('id')
+        if dash_id:
+            dash = BIDashboard.query.get(dash_id)
+            if not dash:
+                return jsonify({'success': False, 'error': 'Dashboard not found'}), 404
+            if not is_super_admin and dash.company_id and user.company_id and dash.company_id != user.company_id:
+                return jsonify({'success': False, 'error': 'Access denied'}), 403
+            is_new = False
+        else:
+            if not data.get('name'):
+                return jsonify({'success': False, 'error': 'name required', 'code': 'VALIDATION_ERROR'}), 400
+            dash = BIDashboard(company_id=user.company_id, created_by=user.id)
+            db.session.add(dash)
+            is_new = True
+
+        for f in ['name', 'description', 'is_public']:
+            if f in data:
+                setattr(dash, f, data[f])
+        if 'widgets' in data:
+            dash.widgets = json.dumps(data['widgets'])
+        dash.updated_at = datetime.utcnow()
+        db.session.commit()
+        return jsonify({'success': True, 'dashboard': dash.to_dict(), 'is_new': is_new}), 201 if is_new else 200
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_save_bi_dashboard error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/bi/dashboards/share', methods=['POST'])
+@jwt_required
+@cross_origin()
+def dm_share_bi_dashboard():
+    """Share a BI dashboard"""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        data = request.get_json() or {}
+        dash_id = data.get('dashboard_id')
+        if not dash_id:
+            return jsonify({'success': False, 'error': 'dashboard_id required', 'code': 'VALIDATION_ERROR'}), 400
+
+        dash = BIDashboard.query.get(dash_id)
+        if not dash:
+            return jsonify({'success': False, 'error': 'Dashboard not found'}), 404
+
+        is_super_admin = check_super_admin()
+        if not is_super_admin and dash.company_id and user.company_id and dash.company_id != user.company_id:
+            return jsonify({'success': False, 'error': 'Access denied'}), 403
+
+        share = BIDashboardShare(
+            dashboard_id=dash_id,
+            recipients=json.dumps(data.get('recipients', [])),
+            shared_by=user.id,
+            company_id=user.company_id
+        )
+        db.session.add(share)
+        db.session.commit()
+        return jsonify({'success': True, 'share': share.to_dict(), 'message': 'Dashboard shared'}), 201
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_share_bi_dashboard error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
 # -- ERROR HANDLERS --
 
 @app.errorhandler(404)

@@ -140,7 +140,7 @@ class User(db.Model):
     improvement_initiatives = db.relationship('ImprovementInitiative', back_populates='proposer', foreign_keys='ImprovementInitiative.proposed_by')
     corrective_actions = db.relationship('CorrectiveAction', back_populates='assignee', foreign_keys='CorrectiveAction.assigned_to')
     
-    approved_admins = db.relationship('User', foreign_keys=[approved_by], backref=db.backref('approver', remote_side=[id]))
+    approved_admins = db.relationship('User', backref=db.backref('approver', remote_side=[id]))
     subscription_history = db.relationship('SubscriptionHistory', backref='user', lazy=True, cascade='all, delete-orphan')
     payment_history = db.relationship('PaymentHistory', backref='user', lazy=True, cascade='all, delete-orphan')
     def to_dict(self):
@@ -2858,7 +2858,7 @@ class DocumentComment(db.Model):
     # ============================================================
     document = db.relationship('Document', foreign_keys=[document_id], back_populates='comment_items')
     user = db.relationship('User', foreign_keys=[user_id])
-    replies = db.relationship('DocumentComment', foreign_keys=[parent_id], backref=db.backref('parent', remote_side=[id]), lazy='dynamic')
+    replies = db.relationship('DocumentComment', backref=db.backref('parent', remote_side=[id]), lazy='dynamic')
     
     __table_args__ = (
         db.Index('idx_doc_comments_document', 'document_id'),
@@ -3883,5 +3883,2352 @@ class ComplianceAuditLog(db.Model):
             'user_id': self.user_id,
             'user_name': self.user.name if self.user else None,
             'ip_address': self.ip_address,
+            'created_at': self.created_at.isoformat() if self.created_at else None
+        }
+
+class DocumentPermission(db.Model):
+    """Per-document access control entries"""
+    __tablename__ = 'document_permissions'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    document_id = db.Column(db.Integer, db.ForeignKey('documents.id'), nullable=False, index=True)
+    
+    principal_type = db.Column(db.String(20), nullable=False)  # user/group/role/department/organization/public
+    principal_id = db.Column(db.String(100), nullable=False, index=True)
+    principal_name = db.Column(db.String(255))
+    
+    access_level = db.Column(db.String(20), default='view')  # none/view/comment/edit/full
+    permissions = db.Column(db.Text, default='[]')  # JSON array
+    
+    expires_at = db.Column(db.DateTime)
+    ip_whitelist = db.Column(db.Text, default='[]')  # JSON array
+    notes = db.Column(db.Text)
+    
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), index=True)
+    granted_by = db.Column(db.Integer, db.ForeignKey('users.id'))
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    document = db.relationship('Document', foreign_keys=[document_id], backref=db.backref('permissions', lazy='dynamic', cascade='all, delete-orphan'))
+    grantor = db.relationship('User', foreign_keys=[granted_by])
+    
+    __table_args__ = (
+        db.Index('idx_doc_perm_doc', 'document_id'),
+        db.Index('idx_doc_perm_principal', 'principal_type', 'principal_id'),
+        db.Index('idx_doc_perm_company', 'company_id'),
+    )
+    
+    def to_dict(self):
+        try:
+            perms = json.loads(self.permissions) if isinstance(self.permissions, str) else (self.permissions or [])
+        except:
+            perms = []
+        try:
+            ips = json.loads(self.ip_whitelist) if isinstance(self.ip_whitelist, str) else (self.ip_whitelist or [])
+        except:
+            ips = []
+        
+        return {
+            'id': self.id,
+            'document_id': self.document_id,
+            'principal_type': self.principal_type,
+            'principal_id': self.principal_id,
+            'principal_name': self.principal_name,
+            'access_level': self.access_level,
+            'permissions': perms,
+            'expires_at': self.expires_at.isoformat() if self.expires_at else None,
+            'ip_whitelist': ips,
+            'notes': self.notes,
+            'company_id': self.company_id,
+            'granted_by': self.granted_by,
+            'created_by_name': self.grantor.name if self.grantor else None,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None
+        }
+
+
+class DocumentSecurity(db.Model):
+    """Per-document security settings"""
+    __tablename__ = 'document_security'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    document_id = db.Column(db.Integer, db.ForeignKey('documents.id'), nullable=False, unique=True, index=True)
+    
+    sensitivity = db.Column(db.String(20), default='internal')  # public/internal/confidential/restricted/top_secret
+    masking_rule = db.Column(db.String(20), default='none')  # none/partial/full/custom
+    masking_config = db.Column(db.Text, default='{}')
+    
+    inherit_from_parent = db.Column(db.Boolean, default=True)
+    
+    download_restricted = db.Column(db.Boolean, default=False)
+    print_restricted = db.Column(db.Boolean, default=False)
+    watermark_enabled = db.Column(db.Boolean, default=False)
+    
+    expiry_enabled = db.Column(db.Boolean, default=False)
+    expiry_date = db.Column(db.DateTime)
+    
+    ip_restrictions = db.Column(db.Text, default='[]')
+    time_restrictions = db.Column(db.Text, default='{}')
+    
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), index=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    document = db.relationship('Document', foreign_keys=[document_id], backref=db.backref('security_settings', uselist=False, cascade='all, delete-orphan'))
+    
+    def to_dict(self):
+        def parse_json(val, default):
+            try:
+                return json.loads(val) if isinstance(val, str) else (val or default)
+            except:
+                return default
+        
+        return {
+            'id': self.id,
+            'document_id': self.document_id,
+            'sensitivity': self.sensitivity,
+            'masking_rule': self.masking_rule,
+            'masking_config': parse_json(self.masking_config, {}),
+            'inherit_from_parent': self.inherit_from_parent,
+            'download_restricted': self.download_restricted,
+            'print_restricted': self.print_restricted,
+            'watermark_enabled': self.watermark_enabled,
+            'expiry_enabled': self.expiry_enabled,
+            'expiry_date': self.expiry_date.isoformat() if self.expiry_date else None,
+            'ip_restrictions': parse_json(self.ip_restrictions, []),
+            'time_restrictions': parse_json(self.time_restrictions, {}),
+            'company_id': self.company_id,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None
+        }
+
+
+class AccessAuditLog(db.Model):
+    """Access-specific audit trail"""
+    __tablename__ = 'access_audit_logs'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    document_id = db.Column(db.Integer, db.ForeignKey('documents.id'), index=True)
+    
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), index=True)
+    user_name = db.Column(db.String(255))
+    user_email = db.Column(db.String(255))
+    
+    action = db.Column(db.String(50), nullable=False, index=True)
+    actor_id = db.Column(db.Integer, db.ForeignKey('users.id'))
+    actor_name = db.Column(db.String(255))
+    description = db.Column(db.Text)
+    
+    ip_address = db.Column(db.String(45))
+    user_agent = db.Column(db.String(500))
+    
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), index=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    
+    document = db.relationship('Document', foreign_keys=[document_id])
+    user = db.relationship('User', foreign_keys=[user_id])
+    actor = db.relationship('User', foreign_keys=[actor_id])
+    
+    __table_args__ = (
+        db.Index('idx_access_audit_doc', 'document_id'),
+        db.Index('idx_access_audit_user', 'user_id'),
+        db.Index('idx_access_audit_action', 'action'),
+    )
+    
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'document_id': self.document_id,
+            'document_title': self.document.title if self.document else None,
+            'user_id': self.user_id,
+            'user_name': self.user_name or (self.user.name if self.user else None),
+            'user_email': self.user_email,
+            'action': self.action,
+            'actor_id': self.actor_id,
+            'actor_name': self.actor_name or (self.actor.name if self.actor else None),
+            'description': self.description,
+            'ip_address': self.ip_address,
+            'user_agent': self.user_agent,
+            'company_id': self.company_id,
+            'created_at': self.created_at.isoformat() if self.created_at else None
+        }
+
+
+# ============================================================
+# GROUP 2: RETENTION (3 models)
+# ============================================================
+
+class RetentionPolicy(db.Model):
+    """Retention policy definitions"""
+    __tablename__ = 'retention_policies'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(255))
+    document_id = db.Column(db.Integer, db.ForeignKey('documents.id'), nullable=True, index=True)
+    
+    schedule = db.Column(db.String(20), default='years_7')
+    custom_days = db.Column(db.Integer)
+    regulatory_framework = db.Column(db.String(30))
+    retention_start_event = db.Column(db.String(30), default='created_at')
+    
+    auto_archive = db.Column(db.Boolean, default=True)
+    auto_dispose = db.Column(db.Boolean, default=False)
+    disposal_method = db.Column(db.String(30), default='secure_delete')
+    
+    notify_before_days = db.Column(db.Integer, default=30)
+    notification_emails = db.Column(db.Text, default='[]')
+    require_approval = db.Column(db.Boolean, default=True)
+    enable_legal_hold = db.Column(db.Boolean, default=True)
+    
+    lifecycle_stage = db.Column(db.String(30), default='active')
+    notes = db.Column(db.Text)
+    
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), index=True)
+    created_by = db.Column(db.Integer, db.ForeignKey('users.id'))
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    document = db.relationship('Document', foreign_keys=[document_id], backref=db.backref('retention_policy', uselist=False))
+    creator = db.relationship('User', foreign_keys=[created_by])
+    
+    def to_dict(self):
+        try:
+            emails = json.loads(self.notification_emails) if isinstance(self.notification_emails, str) else (self.notification_emails or [])
+        except:
+            emails = []
+        
+        return {
+            'id': self.id,
+            'name': self.name,
+            'document_id': self.document_id,
+            'schedule': self.schedule,
+            'custom_days': self.custom_days,
+            'regulatory_framework': self.regulatory_framework,
+            'retention_start_event': self.retention_start_event,
+            'auto_archive': self.auto_archive,
+            'auto_dispose': self.auto_dispose,
+            'disposal_method': self.disposal_method,
+            'notify_before_days': self.notify_before_days,
+            'notification_emails': emails,
+            'require_approval': self.require_approval,
+            'enable_legal_hold': self.enable_legal_hold,
+            'lifecycle_stage': self.lifecycle_stage,
+            'notes': self.notes,
+            'company_id': self.company_id,
+            'created_by': self.created_by,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None
+        }
+
+
+class LegalHold(db.Model):
+    """Legal holds preventing disposal"""
+    __tablename__ = 'legal_holds'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    
+    # ⚠️ KEEP JSON for backward compat AND fast "list all doc IDs"
+    document_ids = db.Column(db.Text, default='[]')
+    document_count = db.Column(db.Integer, default=0)
+    
+    case_number = db.Column(db.String(100), index=True)
+    reason = db.Column(db.Text)
+    custodian = db.Column(db.String(255))
+    expected_duration = db.Column(db.String(50))
+    
+    status = db.Column(db.String(20), default='active', index=True)
+    
+    applied_by = db.Column(db.Integer, db.ForeignKey('users.id'))
+    applied_by_name = db.Column(db.String(255))
+    applied_at = db.Column(db.DateTime, default=datetime.utcnow)
+    
+    released_by = db.Column(db.Integer, db.ForeignKey('users.id'))
+    released_at = db.Column(db.DateTime)
+    release_reason = db.Column(db.Text)
+    
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), index=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    
+    applier = db.relationship('User', foreign_keys=[applied_by])
+    releaser = db.relationship('User', foreign_keys=[released_by])
+    
+    # ✅ NEW: Junction relationship
+    hold_documents = db.relationship(
+        'LegalHoldDocument',
+        foreign_keys='LegalHoldDocument.hold_id',
+        backref='hold',
+        lazy='dynamic',
+        cascade='all, delete-orphan'
+    )
+    
+    def to_dict(self):
+        try:
+            doc_ids = json.loads(self.document_ids) if isinstance(self.document_ids, str) else (self.document_ids or [])
+        except:
+            doc_ids = []
+        
+        return {
+            'id': self.id,
+            'document_ids': doc_ids,
+            'case_number': self.case_number,
+            'reason': self.reason,
+            'custodian': self.custodian,
+            'expected_duration': self.expected_duration,
+            'status': self.status,
+            'document_count': self.document_count,
+            'applied_by': self.applied_by,
+            'applied_by_name': self.applied_by_name or (self.applier.name if self.applier else None),
+            'applied_at': self.applied_at.isoformat() if self.applied_at else None,
+            'released_by': self.released_by,
+            'released_at': self.released_at.isoformat() if self.released_at else None,
+            'release_reason': self.release_reason,
+            'company_id': self.company_id,
+            'created_at': self.created_at.isoformat() if self.created_at else None
+        }
+
+
+class LegalHoldDocument(db.Model):
+    """✅ NEW: Junction table for LegalHold ↔ Document"""
+    __tablename__ = 'legal_hold_documents'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    hold_id = db.Column(
+        db.Integer,
+        db.ForeignKey('legal_holds.id', ondelete='CASCADE'),
+        nullable=False,
+        index=True
+    )
+    document_id = db.Column(
+        db.Integer,
+        db.ForeignKey('documents.id', ondelete='CASCADE'),
+        nullable=False,
+        index=True
+    )
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), index=True)
+    
+    added_at = db.Column(db.DateTime, default=datetime.utcnow)
+    added_by = db.Column(db.Integer, db.ForeignKey('users.id'))
+    
+    document = db.relationship('Document', foreign_keys=[document_id])
+    adder = db.relationship('User', foreign_keys=[added_by])
+    
+    __table_args__ = (
+        db.UniqueConstraint('hold_id', 'document_id', name='uq_hold_document'),
+        db.Index('idx_hold_doc_company', 'company_id'),
+    )
+    
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'hold_id': self.hold_id,
+            'document_id': self.document_id,
+            'document_title': self.document.title if self.document else None,
+            'company_id': self.company_id,
+            'added_at': self.added_at.isoformat() if self.added_at else None
+        }
+
+
+class DispositionCertificate(db.Model):
+    """Proof of document disposal"""
+    __tablename__ = 'disposition_certificates'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    certificate_number = db.Column(db.String(100), unique=True, index=True)
+    document_id = db.Column(db.Integer, db.ForeignKey('documents.id'), index=True)
+    document_title = db.Column(db.String(255))
+    
+    disposal_method = db.Column(db.String(30))
+    disposal_reason = db.Column(db.Text)
+    disposed_at = db.Column(db.DateTime, default=datetime.utcnow)
+    
+    disposed_by = db.Column(db.Integer, db.ForeignKey('users.id'))
+    disposed_by_name = db.Column(db.String(255))
+    witnessed_by = db.Column(db.String(255))
+    
+    metadata_json = db.Column(db.Text, default='{}')
+    
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), index=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    
+    document = db.relationship('Document', foreign_keys=[document_id])
+    disposer = db.relationship('User', foreign_keys=[disposed_by])
+    
+    def to_dict(self):
+        try:
+            meta = json.loads(self.metadata_json) if isinstance(self.metadata_json, str) else (self.metadata_json or {})
+        except:
+            meta = {}
+        
+        return {
+            'id': self.id,
+            'certificate_number': self.certificate_number,
+            'document_id': self.document_id,
+            'document_title': self.document_title,
+            'disposal_method': self.disposal_method,
+            'disposal_reason': self.disposal_reason,
+            'disposed_at': self.disposed_at.isoformat() if self.disposed_at else None,
+            'disposed_by': self.disposed_by,
+            'disposed_by_name': self.disposed_by_name or (self.disposer.name if self.disposer else None),
+            'witnessed_by': self.witnessed_by,
+            'metadata': meta,
+            'company_id': self.company_id,
+            'created_at': self.created_at.isoformat() if self.created_at else None
+        }
+
+
+# ============================================================
+# GROUP 3: WATERMARKING (2 models)
+# ============================================================
+
+class WatermarkSettings(db.Model):
+    """Watermark configuration per document"""
+    __tablename__ = 'watermark_settings'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    document_id = db.Column(db.Integer, db.ForeignKey('documents.id'), nullable=False, unique=True, index=True)
+    
+    enabled = db.Column(db.Boolean, default=False)
+    watermark_type = db.Column(db.String(30), default='diagonal')
+    template = db.Column(db.String(30), default='confidential')
+    
+    text = db.Column(db.Text)
+    color = db.Column(db.String(20), default='#f5222d')
+    opacity = db.Column(db.Float, default=0.15)
+    font_size = db.Column(db.Integer, default=60)
+    rotation = db.Column(db.Integer, default=-45)
+    position = db.Column(db.String(30), default='center')
+    font_family = db.Column(db.String(50), default='Arial')
+    font_weight = db.Column(db.String(20), default='bold')
+    tile_spacing = db.Column(db.Integer, default=100)
+    
+    image_url = db.Column(db.String(500))
+    
+    apply_to_pages = db.Column(db.String(20), default='all')
+    page_range = db.Column(db.Text, default='{}')
+    
+    apply_on_view = db.Column(db.Boolean, default=True)
+    apply_on_download = db.Column(db.Boolean, default=True)
+    apply_on_print = db.Column(db.Boolean, default=True)
+    apply_on_share = db.Column(db.Boolean, default=True)
+    dynamic_user_tracking = db.Column(db.Boolean, default=True)
+    include_qr_code = db.Column(db.Boolean, default=False)
+    include_barcode = db.Column(db.Boolean, default=False)
+    
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), index=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    document = db.relationship('Document', foreign_keys=[document_id], backref=db.backref('watermark_settings', uselist=False, cascade='all, delete-orphan'))
+    
+    def to_dict(self):
+        try:
+            pr = json.loads(self.page_range) if isinstance(self.page_range, str) else (self.page_range or {})
+        except:
+            pr = {}
+        
+        return {
+            'id': self.id,
+            'document_id': self.document_id,
+            'enabled': self.enabled,
+            'watermark_type': self.watermark_type,
+            'template': self.template,
+            'text': self.text,
+            'color': self.color,
+            'opacity': self.opacity,
+            'font_size': self.font_size,
+            'rotation': self.rotation,
+            'position': self.position,
+            'font_family': self.font_family,
+            'font_weight': self.font_weight,
+            'tile_spacing': self.tile_spacing,
+            'image_url': self.image_url,
+            'apply_to_pages': self.apply_to_pages,
+            'page_range': pr,
+            'apply_on_view': self.apply_on_view,
+            'apply_on_download': self.apply_on_download,
+            'apply_on_print': self.apply_on_print,
+            'apply_on_share': self.apply_on_share,
+            'dynamic_user_tracking': self.dynamic_user_tracking,
+            'include_qr_code': self.include_qr_code,
+            'include_barcode': self.include_barcode,
+            'company_id': self.company_id,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None
+        }
+
+
+class WatermarkLog(db.Model):
+    """Watermark application history"""
+    __tablename__ = 'watermark_logs'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    document_id = db.Column(db.Integer, db.ForeignKey('documents.id'), index=True)
+    watermark_template = db.Column(db.String(50))
+    
+    action = db.Column(db.String(30))
+    target = db.Column(db.String(30))
+    
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'))
+    user_name = db.Column(db.String(255))
+    ip_address = db.Column(db.String(45))
+    
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), index=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    
+    document = db.relationship('Document', foreign_keys=[document_id])
+    user = db.relationship('User', foreign_keys=[user_id])
+    
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'document_id': self.document_id,
+            'document_title': self.document.title if self.document else None,
+            'watermark_template': self.watermark_template,
+            'action': self.action,
+            'target': self.target,
+            'user_id': self.user_id,
+            'user_name': self.user_name or (self.user.name if self.user else None),
+            'ip_address': self.ip_address,
+            'company_id': self.company_id,
+            'created_at': self.created_at.isoformat() if self.created_at else None
+        }
+
+
+# ============================================================
+# GROUP 4: WORKFLOW BUILDER
+# NOTE: Workflow already exists in your models. Skipping.
+# You need to add ONE new model:
+# ============================================================
+
+class WorkflowExecution(db.Model):
+    """Workflow run instances"""
+    __tablename__ = 'workflow_executions'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    workflow_id = db.Column(db.Integer, db.ForeignKey('workflows.id'), nullable=False, index=True)
+    document_id = db.Column(db.Integer, db.ForeignKey('documents.id'), index=True)
+    
+    status = db.Column(db.String(20), default='running', index=True)
+    current_node_id = db.Column(db.String(100))
+    
+    context = db.Column(db.Text, default='{}')
+    execution_log = db.Column(db.Text, default='[]')
+    
+    started_at = db.Column(db.DateTime, default=datetime.utcnow)
+    completed_at = db.Column(db.DateTime)
+    
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), index=True)
+    
+    workflow = db.relationship('Workflow', foreign_keys=[workflow_id], backref=db.backref('executions', lazy='dynamic'))
+    document = db.relationship('Document', foreign_keys=[document_id])
+    
+    def to_dict(self):
+        def pj(val, default):
+            try:
+                return json.loads(val) if isinstance(val, str) else (val or default)
+            except:
+                return default
+        
+        return {
+            'id': self.id,
+            'workflow_id': self.workflow_id,
+            'workflow_name': self.workflow.name if self.workflow else None,
+            'document_id': self.document_id,
+            'status': self.status,
+            'current_node_id': self.current_node_id,
+            'context': pj(self.context, {}),
+            'execution_log': pj(self.execution_log, []),
+            'started_at': self.started_at.isoformat() if self.started_at else None,
+            'completed_at': self.completed_at.isoformat() if self.completed_at else None,
+            'company_id': self.company_id
+        }
+
+
+# ============================================================
+# GROUP 5: COMPLIANCE REPORTS (3 models)
+# ============================================================
+
+class DocumentComplianceAssessment(db.Model):
+    """Document compliance assessments (new feature)"""
+    __tablename__ = 'document_compliance_assessments'   # ← renamed
+    
+    id = db.Column(db.Integer, primary_key=True)
+    document_id = db.Column(db.Integer, db.ForeignKey('documents.id'), index=True)
+    framework_id = db.Column(db.String(50), nullable=False, index=True)
+    requirement_id = db.Column(db.String(100))
+    requirement = db.Column(db.Text)
+    
+    status = db.Column(db.String(30), default='not_assessed')
+    score = db.Column(db.Integer, default=0)
+    
+    gap_description = db.Column(db.Text)
+    recommendation = db.Column(db.Text)
+    evidence_count = db.Column(db.Integer, default=0)
+    
+    last_assessed = db.Column(db.DateTime)
+    assessed_by = db.Column(db.Integer, db.ForeignKey('users.id'))
+    
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), index=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    document = db.relationship('Document', foreign_keys=[document_id])
+    assessor = db.relationship('User', foreign_keys=[assessed_by])
+    
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'document_id': self.document_id,
+            'framework_id': self.framework_id,
+            'requirement_id': self.requirement_id,
+            'requirement': self.requirement,
+            'status': self.status,
+            'score': self.score,
+            'gap_description': self.gap_description,
+            'recommendation': self.recommendation,
+            'evidence_count': self.evidence_count,
+            'last_assessed': self.last_assessed.isoformat() if self.last_assessed else None,
+            'assessed_by': self.assessed_by,
+            'company_id': self.company_id,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None
+        }
+
+
+class DocumentComplianceReport(db.Model):
+    """Generated document compliance reports (new feature)"""
+    __tablename__ = 'document_compliance_reports'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    title = db.Column(db.String(255), nullable=False)
+    report_type = db.Column(db.String(50), default='compliance_status')
+    
+    frameworks = db.Column(db.Text, default='[]')
+    format = db.Column(db.String(20), default='pdf')
+    
+    date_from = db.Column(db.Date)
+    date_to = db.Column(db.Date)
+    
+    include_charts = db.Column(db.Boolean, default=True)
+    include_evidence = db.Column(db.Boolean, default=True)
+    include_recommendations = db.Column(db.Boolean, default=True)
+    
+    notes = db.Column(db.Text)
+    download_url = db.Column(db.String(500))
+    file_size = db.Column(db.Integer)
+    
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), index=True)
+    generated_by = db.Column(db.Integer, db.ForeignKey('users.id'))
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    
+    generator = db.relationship('User', foreign_keys=[generated_by])
+    
+    def to_dict(self):
+        try:
+            fw = json.loads(self.frameworks) if isinstance(self.frameworks, str) else (self.frameworks or [])
+        except:
+            fw = []
+        
+        return {
+            'id': self.id,
+            'title': self.title,
+            'report_type': self.report_type,
+            'frameworks': fw,
+            'format': self.format,
+            'date_from': self.date_from.isoformat() if self.date_from else None,
+            'date_to': self.date_to.isoformat() if self.date_to else None,
+            'include_charts': self.include_charts,
+            'include_evidence': self.include_evidence,
+            'include_recommendations': self.include_recommendations,
+            'notes': self.notes,
+            'download_url': self.download_url,
+            'file_size': self.file_size,
+            'company_id': self.company_id,
+            'generated_by': self.generated_by,
+            'generated_by_name': self.generator.name if self.generator else None,
+            'created_at': self.created_at.isoformat() if self.created_at else None
+        }
+
+
+class DocumentComplianceSchedule(db.Model):
+    """Scheduled document compliance reports"""
+    __tablename__ = 'document_compliance_schedules'   # ← renamed
+    
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(255))
+    report_config = db.Column(db.Text, default='{}')
+    
+    frequency = db.Column(db.String(20), default='monthly')
+    recipients = db.Column(db.Text, default='[]')
+    
+    enabled = db.Column(db.Boolean, default=True)
+    last_sent_at = db.Column(db.DateTime)
+    next_send_at = db.Column(db.DateTime)
+    
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), index=True)
+    created_by = db.Column(db.Integer, db.ForeignKey('users.id'))
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    
+    creator = db.relationship('User', foreign_keys=[created_by])
+    
+    def to_dict(self):
+        def pj(val, default):
+            try:
+                return json.loads(val) if isinstance(val, str) else (val or default)
+            except:
+                return default
+        
+        return {
+            'id': self.id,
+            'name': self.name,
+            'report_config': pj(self.report_config, {}),
+            'frequency': self.frequency,
+            'recipients': pj(self.recipients, []),
+            'enabled': self.enabled,
+            'last_sent_at': self.last_sent_at.isoformat() if self.last_sent_at else None,
+            'next_send_at': self.next_send_at.isoformat() if self.next_send_at else None,
+            'company_id': self.company_id,
+            'created_by': self.created_by,
+            'created_at': self.created_at.isoformat() if self.created_at else None
+        }
+
+
+# ============================================================
+# GROUP 6: DOCUMENT BUNDLES (2 models)
+# ============================================================
+
+class DocumentBundle(db.Model):
+    """Case files / bundles"""
+    __tablename__ = 'document_bundles'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(255), nullable=False)
+    type = db.Column(db.String(50), default='custom')
+    description = db.Column(db.Text)
+    tags = db.Column(db.Text, default='[]')
+    
+    is_confidential = db.Column(db.Boolean, default=False)
+    is_locked = db.Column(db.Boolean, default=False)
+    expires_at = db.Column(db.DateTime)
+    
+    status = db.Column(db.String(20), default='draft', index=True)
+    
+    document_count = db.Column(db.Integer, default=0)
+    total_size = db.Column(db.Integer, default=0)
+    
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), index=True)
+    created_by = db.Column(db.Integer, db.ForeignKey('users.id'))
+    created_by_name = db.Column(db.String(255))
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    creator = db.relationship('User', foreign_keys=[created_by])
+    bundle_documents = db.relationship('BundleDocument', foreign_keys='BundleDocument.bundle_id', backref='bundle', lazy='dynamic', cascade='all, delete-orphan')
+    
+    def to_dict(self):
+        try:
+            tg = json.loads(self.tags) if isinstance(self.tags, str) else (self.tags or [])
+        except:
+            tg = []
+        
+        return {
+            'id': self.id,
+            'name': self.name,
+            'type': self.type,
+            'description': self.description,
+            'tags': tg,
+            'is_confidential': self.is_confidential,
+            'is_locked': self.is_locked,
+            'expires_at': self.expires_at.isoformat() if self.expires_at else None,
+            'status': self.status,
+            'document_count': self.document_count,
+            'total_size': self.total_size,
+            'company_id': self.company_id,
+            'created_by': self.created_by,
+            'created_by_name': self.created_by_name or (self.creator.name if self.creator else None),
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None
+        }
+
+
+class BundleDocument(db.Model):
+    """Many-to-many link between bundles and documents"""
+    __tablename__ = 'bundle_documents'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    bundle_id = db.Column(db.Integer, db.ForeignKey('document_bundles.id'), nullable=False, index=True)
+    document_id = db.Column(db.Integer, db.ForeignKey('documents.id'), nullable=False, index=True)
+    
+    position = db.Column(db.Integer, default=0)
+    
+    added_by = db.Column(db.Integer, db.ForeignKey('users.id'))
+    added_at = db.Column(db.DateTime, default=datetime.utcnow)
+    
+    document = db.relationship('Document', foreign_keys=[document_id])
+    adder = db.relationship('User', foreign_keys=[added_by])
+    
+    __table_args__ = (
+        db.UniqueConstraint('bundle_id', 'document_id', name='uq_bundle_document'),
+    )
+    
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'bundle_id': self.bundle_id,
+            'document_id': self.document_id,
+            'document_title': self.document.title if self.document else None,
+            'position': self.position,
+            'added_by': self.added_by,
+            'added_at': self.added_at.isoformat() if self.added_at else None
+        }
+
+
+# ============================================================
+# GROUP 7: SHARE PORTAL (2 models)
+# ============================================================
+
+class Share(db.Model):
+    """External share links"""
+    __tablename__ = 'shares'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    document_id = db.Column(db.Integer, db.ForeignKey('documents.id'), index=True)
+    bundle_id = db.Column(db.Integer, db.ForeignKey('document_bundles.id'), index=True)
+    
+    share_type = db.Column(db.String(20), default='link')  # link/email/portal/nda
+    access_level = db.Column(db.String(20), default='view')  # view/comment/download/sign/edit
+    
+    recipient = db.Column(db.String(255))
+    recipient_email = db.Column(db.String(255))
+    recipients = db.Column(db.Text, default='[]')  # JSON array
+    
+    share_url = db.Column(db.String(500))
+    share_token = db.Column(db.String(100), unique=True, index=True)
+    
+    expires_at = db.Column(db.DateTime, index=True)
+    expiry_days = db.Column(db.Integer)
+    max_downloads = db.Column(db.Integer)
+    
+    has_password = db.Column(db.Boolean, default=False)
+    password_hash = db.Column(db.String(255))
+    
+    require_nda = db.Column(db.Boolean, default=False)
+    require_email = db.Column(db.Boolean, default=True)
+    send_notification = db.Column(db.Boolean, default=True)
+    custom_message = db.Column(db.Text)
+    
+    watermark = db.Column(db.Boolean, default=True)
+    allow_print = db.Column(db.Boolean, default=False)
+    
+    status = db.Column(db.String(20), default='active', index=True)  # active/expired/revoked/pending
+    
+    view_count = db.Column(db.Integer, default=0)
+    download_count = db.Column(db.Integer, default=0)
+    unique_users = db.Column(db.Integer, default=0)
+    
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), index=True)
+    created_by = db.Column(db.Integer, db.ForeignKey('users.id'))
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    
+    # Relationships
+    document = db.relationship('Document', foreign_keys=[document_id])
+    bundle = db.relationship('DocumentBundle', foreign_keys=[bundle_id])
+    creator = db.relationship('User', foreign_keys=[created_by])
+    activities = db.relationship(
+        'ShareActivity',
+        foreign_keys='ShareActivity.share_id',
+        backref='share',
+        lazy='dynamic',
+        cascade='all, delete-orphan'
+    )
+    
+    # ✅ NEW: CHECK constraint — exactly one of document_id or bundle_id must be set
+    __table_args__ = (
+        db.CheckConstraint(
+            '(document_id IS NOT NULL AND bundle_id IS NULL) OR '
+            '(document_id IS NULL AND bundle_id IS NOT NULL)',
+            name='ck_share_exactly_one_target'
+        ),
+        db.Index('idx_share_document', 'document_id'),
+        db.Index('idx_share_bundle', 'bundle_id'),
+        db.Index('idx_share_token', 'share_token'),
+        db.Index('idx_share_status', 'status'),
+        db.Index('idx_share_company', 'company_id'),
+        db.Index('idx_share_expires', 'expires_at'),
+    )
+    
+    def to_dict(self):
+        try:
+            rec = json.loads(self.recipients) if isinstance(self.recipients, str) else (self.recipients or [])
+        except:
+            rec = []
+        
+        return {
+            'id': self.id,
+            'document_id': self.document_id,
+            'document_title': self.document.title if self.document else None,
+            'bundle_id': self.bundle_id,
+            'bundle_name': self.bundle.name if self.bundle else None,
+            'share_type': self.share_type,
+            'access_level': self.access_level,
+            'recipient': self.recipient,
+            'recipient_email': self.recipient_email,
+            'recipients': rec,
+            'share_url': self.share_url,
+            'share_token': self.share_token,
+            'expires_at': self.expires_at.isoformat() if self.expires_at else None,
+            'expiry_days': self.expiry_days,
+            'max_downloads': self.max_downloads,
+            'has_password': self.has_password,
+            'require_nda': self.require_nda,
+            'require_email': self.require_email,
+            'send_notification': self.send_notification,
+            'custom_message': self.custom_message,
+            'watermark': self.watermark,
+            'allow_print': self.allow_print,
+            'status': self.status,
+            'view_count': self.view_count,
+            'download_count': self.download_count,
+            'unique_users': self.unique_users,
+            'company_id': self.company_id,
+            'created_by': self.created_by,
+            'created_by_name': self.creator.name if self.creator else None,
+            'created_at': self.created_at.isoformat() if self.created_at else None
+        }
+
+
+class ShareActivity(db.Model):
+    """Track share access"""
+    __tablename__ = 'share_activities'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    share_id = db.Column(db.Integer, db.ForeignKey('shares.id'), nullable=False, index=True)
+    
+    user_email = db.Column(db.String(255))
+    action = db.Column(db.String(30), index=True)
+    allowed = db.Column(db.Boolean, default=True)
+    
+    ip_address = db.Column(db.String(45))
+    device = db.Column(db.String(20))
+    user_agent = db.Column(db.String(500))
+    
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), index=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'share_id': self.share_id,
+            'user_email': self.user_email,
+            'action': self.action,
+            'allowed': self.allowed,
+            'ip_address': self.ip_address,
+            'device': self.device,
+            'user_agent': self.user_agent,
+            'company_id': self.company_id,
+            'created_at': self.created_at.isoformat() if self.created_at else None
+        }
+
+
+# ============================================================
+# GROUP 8: SMART INTAKE (2 models)
+# ============================================================
+
+class IntakeQueueItem(db.Model):
+    """AI-powered document processing queue"""
+    __tablename__ = 'intake_queue_items'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    file_name = db.Column(db.String(255), nullable=False)
+    file_size = db.Column(db.Integer)
+    file_url = db.Column(db.String(500))
+    
+    status = db.Column(db.String(30), default='uploading', index=True)
+    stage = db.Column(db.String(30), default='uploading')
+    progress = db.Column(db.Integer, default=0)
+    
+    predicted_type = db.Column(db.String(50))
+    confidence = db.Column(db.Float, default=0.0)
+    
+    extracted_data = db.Column(db.Text, default='{}')
+    suggested_tags = db.Column(db.Text, default='[]')
+    ocr_text = db.Column(db.Text)
+    
+    duplicate_found = db.Column(db.Boolean, default=False)
+    duplicate_title = db.Column(db.String(255))
+    
+    review_reason = db.Column(db.String(255))
+    needs_review = db.Column(db.Boolean, default=False)
+    
+    error = db.Column(db.Text)
+    message = db.Column(db.String(500))
+    
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), index=True)
+    uploaded_by = db.Column(db.Integer, db.ForeignKey('users.id'))
+    uploaded_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    processed_at = db.Column(db.DateTime)
+    
+    uploader = db.relationship('User', foreign_keys=[uploaded_by])
+    
+    def to_dict(self):
+        def pj(val, default):
+            try:
+                return json.loads(val) if isinstance(val, str) else (val or default)
+            except:
+                return default
+        
+        return {
+            'id': self.id,
+            'file_name': self.file_name,
+            'file_size': self.file_size,
+            'file_url': self.file_url,
+            'status': self.status,
+            'stage': self.stage,
+            'progress': self.progress,
+            'predicted_type': self.predicted_type,
+            'confidence': self.confidence,
+            'extracted_data': pj(self.extracted_data, {}),
+            'suggested_tags': pj(self.suggested_tags, []),
+            'ocr_text': self.ocr_text,
+            'duplicate_found': self.duplicate_found,
+            'duplicate_title': self.duplicate_title,
+            'review_reason': self.review_reason,
+            'needs_review': self.needs_review,
+            'error': self.error,
+            'message': self.message,
+            'company_id': self.company_id,
+            'uploaded_by': self.uploaded_by,
+            'uploaded_at': self.uploaded_at.isoformat() if self.uploaded_at else None,
+            'processed_at': self.processed_at.isoformat() if self.processed_at else None
+        }
+
+
+class IntakeStats(db.Model):
+    """Aggregate intake statistics"""
+    __tablename__ = 'intake_stats'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), index=True, unique=True)
+    
+    total_processed = db.Column(db.Integer, default=0)
+    auto_approved = db.Column(db.Integer, default=0)
+    needs_review = db.Column(db.Integer, default=0)
+    duplicates_found = db.Column(db.Integer, default=0)
+    avg_confidence = db.Column(db.Float, default=0.0)
+    
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'company_id': self.company_id,
+            'total_processed': self.total_processed,
+            'auto_approved': self.auto_approved,
+            'needs_review': self.needs_review,
+            'duplicates_found': self.duplicates_found,
+            'avg_confidence': self.avg_confidence,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None
+        }
+
+
+# ============================================================
+# GROUP 9: ADVANCED SEARCH
+# NOTE: SavedSearch & SearchHistory already exist in your models.
+# Skipping both.
+# ============================================================
+
+class SearchAlert(db.Model):
+    """Scheduled search notifications"""
+    __tablename__ = 'search_alerts'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(255))
+    query = db.Column(db.Text)
+    mode = db.Column(db.String(20), default='fulltext')
+    filters = db.Column(db.Text, default='{}')
+    
+    frequency = db.Column(db.String(20), default='daily')
+    recipients = db.Column(db.Text, default='[]')
+    
+    enabled = db.Column(db.Boolean, default=True)
+    last_sent_at = db.Column(db.DateTime)
+    next_send_at = db.Column(db.DateTime)
+    
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), index=True)
+    created_by = db.Column(db.Integer, db.ForeignKey('users.id'))
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    
+    creator = db.relationship('User', foreign_keys=[created_by])
+    
+    def to_dict(self):
+        def pj(val, default):
+            try:
+                return json.loads(val) if isinstance(val, str) else (val or default)
+            except:
+                return default
+        
+        return {
+            'id': self.id,
+            'name': self.name,
+            'query': self.query,
+            'mode': self.mode,
+            'filters': pj(self.filters, {}),
+            'frequency': self.frequency,
+            'recipients': pj(self.recipients, []),
+            'enabled': self.enabled,
+            'last_sent_at': self.last_sent_at.isoformat() if self.last_sent_at else None,
+            'next_send_at': self.next_send_at.isoformat() if self.next_send_at else None,
+            'company_id': self.company_id,
+            'created_by': self.created_by,
+            'created_at': self.created_at.isoformat() if self.created_at else None
+        }
+
+
+# ============================================================
+# GROUP 10: AI ASSISTANT (2 models)
+# ============================================================
+
+class AssistantConversation(db.Model):
+    """AI chat sessions"""
+    __tablename__ = 'assistant_conversations'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False, index=True)
+    title = db.Column(db.String(255), default='Untitled')
+    message_count = db.Column(db.Integer, default=0)
+    
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), index=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    user = db.relationship('User', foreign_keys=[user_id])
+    messages = db.relationship('AssistantMessage', foreign_keys='AssistantMessage.conversation_id', backref='conversation', lazy='dynamic', cascade='all, delete-orphan')
+    
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'user_id': self.user_id,
+            'title': self.title,
+            'message_count': self.message_count,
+            'company_id': self.company_id,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None
+        }
+
+
+class AssistantMessage(db.Model):
+    """Individual chat messages"""
+    __tablename__ = 'assistant_messages'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    conversation_id = db.Column(
+        db.Integer,
+        db.ForeignKey('assistant_conversations.id', ondelete='CASCADE'),
+        nullable=False,
+        index=True
+    )
+    
+    # ✅ NEW: Direct scope for query speed
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), index=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), index=True)
+    
+    role = db.Column(db.String(20), nullable=False)
+    content = db.Column(db.Text)
+    sources = db.Column(db.Text, default='[]')
+    suggestions = db.Column(db.Text, default='[]')
+    tokens_used = db.Column(db.Integer, default=0)
+    
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    
+    __table_args__ = (
+        db.Index('idx_assistant_msg_user', 'user_id'),
+        db.Index('idx_assistant_msg_company', 'company_id'),
+    )
+    
+    def to_dict(self):
+        def pj(val, default):
+            try:
+                return json.loads(val) if isinstance(val, str) else (val or default)
+            except:
+                return default
+        
+        return {
+            'id': self.id,
+            'conversation_id': self.conversation_id,
+            'user_id': self.user_id,
+            'company_id': self.company_id,
+            'role': self.role,
+            'content': self.content,
+            'sources': pj(self.sources, []),
+            'suggestions': pj(self.suggestions, []),
+            'tokens_used': self.tokens_used,
+            'created_at': self.created_at.isoformat() if self.created_at else None
+        }
+
+
+# ============================================================
+# GROUP 11: BUSINESS INTELLIGENCE (2 models)
+# ============================================================
+
+class BIDashboard(db.Model):
+    """Custom BI dashboards"""
+    __tablename__ = 'bi_dashboards'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(255), nullable=False)
+    description = db.Column(db.Text)
+    widgets = db.Column(db.Text, default='[]')
+    is_public = db.Column(db.Boolean, default=False)
+    
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), index=True)
+    created_by = db.Column(db.Integer, db.ForeignKey('users.id'))
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    creator = db.relationship('User', foreign_keys=[created_by])
+    
+    def to_dict(self):
+        try:
+            wg = json.loads(self.widgets) if isinstance(self.widgets, str) else (self.widgets or [])
+        except:
+            wg = []
+        
+        return {
+            'id': self.id,
+            'name': self.name,
+            'description': self.description,
+            'widgets': wg,
+            'is_public': self.is_public,
+            'company_id': self.company_id,
+            'created_by': self.created_by,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None
+        }
+
+
+class BIDashboardShare(db.Model):
+    """BI dashboard sharing"""
+    __tablename__ = 'bi_dashboard_shares'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    dashboard_id = db.Column(db.Integer, db.ForeignKey('bi_dashboards.id'), nullable=False, index=True)
+    recipients = db.Column(db.Text, default='[]')
+    
+    shared_by = db.Column(db.Integer, db.ForeignKey('users.id'))
+    shared_at = db.Column(db.DateTime, default=datetime.utcnow)
+    
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), index=True)
+    
+    dashboard = db.relationship('BIDashboard', foreign_keys=[dashboard_id])
+    sharer = db.relationship('User', foreign_keys=[shared_by])
+    
+    def to_dict(self):
+        try:
+            rec = json.loads(self.recipients) if isinstance(self.recipients, str) else (self.recipients or [])
+        except:
+            rec = []
+        
+        return {
+            'id': self.id,
+            'dashboard_id': self.dashboard_id,
+            'recipients': rec,
+            'shared_by': self.shared_by,
+            'shared_at': self.shared_at.isoformat() if self.shared_at else None,
+            'company_id': self.company_id
+        }
+
+
+# ============================================================
+# GROUP 12: ANOMALY DETECTION (3 models)
+# ============================================================
+
+class Anomaly(db.Model):
+    """Detected anomalies"""
+    __tablename__ = 'anomalies'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    type = db.Column(db.String(50), nullable=False, index=True)
+    severity = db.Column(db.String(20), nullable=False, index=True)
+    
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), index=True)
+    user_name = db.Column(db.String(255))
+    user_email = db.Column(db.String(255))
+    
+    description = db.Column(db.Text)
+    risk_score = db.Column(db.Integer, default=0)
+    
+    status = db.Column(db.String(30), default='new', index=True)
+    
+    ip_address = db.Column(db.String(45))
+    location = db.Column(db.String(255))
+    device_info = db.Column(db.String(255))
+    detection_method = db.Column(db.String(50))
+    related_events = db.Column(db.Text, default='[]')
+    
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), index=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    resolved_at = db.Column(db.DateTime)
+    resolved_by = db.Column(db.Integer, db.ForeignKey('users.id'))
+    
+    user = db.relationship('User', foreign_keys=[user_id])
+    resolver = db.relationship('User', foreign_keys=[resolved_by])
+    
+    def to_dict(self):
+        try:
+            re = json.loads(self.related_events) if isinstance(self.related_events, str) else (self.related_events or [])
+        except:
+            re = []
+        
+        return {
+            'id': self.id,
+            'type': self.type,
+            'severity': self.severity,
+            'user_id': self.user_id,
+            'user_name': self.user_name or (self.user.name if self.user else None),
+            'user_email': self.user_email,
+            'description': self.description,
+            'risk_score': self.risk_score,
+            'status': self.status,
+            'ip_address': self.ip_address,
+            'location': self.location,
+            'device_info': self.device_info,
+            'detection_method': self.detection_method,
+            'related_events': re,
+            'company_id': self.company_id,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'resolved_at': self.resolved_at.isoformat() if self.resolved_at else None,
+            'resolved_by': self.resolved_by
+        }
+
+
+class DetectionRule(db.Model):
+    """Custom anomaly detection rules"""
+    __tablename__ = 'detection_rules'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(255), nullable=False)
+    description = db.Column(db.Text)
+    type = db.Column(db.String(50))
+    severity = db.Column(db.String(20), default='medium')
+    
+    condition = db.Column(db.Text)
+    actions = db.Column(db.Text, default='[]')
+    
+    enabled = db.Column(db.Boolean, default=True)
+    triggered_count = db.Column(db.Integer, default=0)
+    
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), index=True)
+    created_by = db.Column(db.Integer, db.ForeignKey('users.id'))
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    creator = db.relationship('User', foreign_keys=[created_by])
+    
+    def to_dict(self):
+        try:
+            ac = json.loads(self.actions) if isinstance(self.actions, str) else (self.actions or [])
+        except:
+            ac = []
+        
+        return {
+            'id': self.id,
+            'name': self.name,
+            'description': self.description,
+            'type': self.type,
+            'severity': self.severity,
+            'condition': self.condition,
+            'actions': ac,
+            'enabled': self.enabled,
+            'triggered_count': self.triggered_count,
+            'company_id': self.company_id,
+            'created_by': self.created_by,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None
+        }
+
+
+class UserBaseline(db.Model):
+    """User behavior baselines"""
+    __tablename__ = 'user_baselines'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False, unique=True, index=True)
+    user_name = db.Column(db.String(255))
+    user_email = db.Column(db.String(255))
+    
+    typical_hours = db.Column(db.String(100))
+    common_locations = db.Column(db.Text, default='[]')
+    avg_daily_downloads = db.Column(db.Float, default=0.0)
+    
+    baseline_score = db.Column(db.Integer, default=100)
+    risk_level = db.Column(db.String(20), default='low')
+    
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), index=True)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    user = db.relationship('User', foreign_keys=[user_id])
+    
+    def to_dict(self):
+        try:
+            cl = json.loads(self.common_locations) if isinstance(self.common_locations, str) else (self.common_locations or [])
+        except:
+            cl = []
+        
+        return {
+            'id': self.id,
+            'user_id': self.user_id,
+            'user_name': self.user_name or (self.user.name if self.user else None),
+            'user_email': self.user_email,
+            'typical_hours': self.typical_hours,
+            'common_locations': cl,
+            'avg_daily_downloads': self.avg_daily_downloads,
+            'baseline_score': self.baseline_score,
+            'risk_level': self.risk_level,
+            'company_id': self.company_id,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None
+        }
+
+
+# ============================================================
+# GROUP 13: CUSTOM REPORTS (1 model)
+# ============================================================
+
+class CustomReport(db.Model):
+    """User-built reports"""
+    __tablename__ = 'custom_reports'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(255), nullable=False)
+    description = db.Column(db.Text)
+    
+    data_source = db.Column(db.String(50), default='documents')
+    
+    fields = db.Column(db.Text, default='[]')
+    group_by = db.Column(db.Text, default='[]')
+    aggregations = db.Column(db.Text, default='[]')
+    filters = db.Column(db.Text, default='[]')
+    sort_by = db.Column(db.Text, default='[]')
+    limit = db.Column(db.Integer, default=100)
+    
+    visualization_type = db.Column(db.String(30), default='table')
+    chart_config = db.Column(db.Text, default='{}')
+    
+    is_public = db.Column(db.Boolean, default=False)
+    schedule = db.Column(db.Text, default='{}')
+    
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), index=True)
+    created_by = db.Column(db.Integer, db.ForeignKey('users.id'))
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    creator = db.relationship('User', foreign_keys=[created_by])
+    
+    def to_dict(self):
+        def pj(val, default):
+            try:
+                return json.loads(val) if isinstance(val, str) else (val or default)
+            except:
+                return default
+        
+        return {
+            'id': self.id,
+            'name': self.name,
+            'description': self.description,
+            'data_source': self.data_source,
+            'fields': pj(self.fields, []),
+            'group_by': pj(self.group_by, []),
+            'aggregations': pj(self.aggregations, []),
+            'filters': pj(self.filters, []),
+            'sort_by': pj(self.sort_by, []),
+            'limit': self.limit,
+            'visualization_type': self.visualization_type,
+            'chart_config': pj(self.chart_config, {}),
+            'is_public': self.is_public,
+            'schedule': pj(self.schedule, {}),
+            'company_id': self.company_id,
+            'created_by': self.created_by,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None
+        }
+
+
+# ============================================================
+# GROUP 14: PREDICTIVE ANALYTICS (2 models)
+# NOTE: PredictiveModel already exists in your models.
+# ============================================================
+
+
+
+class PredictiveAlert(db.Model):
+    """Predictive analytics alerts"""
+    __tablename__ = 'predictive_alerts'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(255))
+    prediction_type = db.Column(db.String(50))
+    threshold = db.Column(db.Float, default=0.0)
+    recipients = db.Column(db.Text, default='[]')
+    enabled = db.Column(db.Boolean, default=True)
+    
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), index=True)
+    created_by = db.Column(db.Integer, db.ForeignKey('users.id'))
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    
+    creator = db.relationship('User', foreign_keys=[created_by])
+    
+    def to_dict(self):
+        try:
+            rec = json.loads(self.recipients) if isinstance(self.recipients, str) else (self.recipients or [])
+        except:
+            rec = []
+        
+        return {
+            'id': self.id,
+            'name': self.name,
+            'prediction_type': self.prediction_type,
+            'threshold': self.threshold,
+            'recipients': rec,
+            'enabled': self.enabled,
+            'company_id': self.company_id,
+            'created_by': self.created_by,
+            'created_at': self.created_at.isoformat() if self.created_at else None
+        }
+
+
+# ============================================================
+# GROUP 15: QUALITY MANAGEMENT (4 models)
+# ============================================================
+
+class QualityRecord(db.Model):
+    """CAPA/NCR/Deviation/Change Request records"""
+    __tablename__ = 'quality_records'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    record_number = db.Column(db.String(50), unique=True, index=True)
+    type = db.Column(db.String(30), nullable=False, index=True)
+    
+    title = db.Column(db.String(255), nullable=False)
+    description = db.Column(db.Text)
+    severity = db.Column(db.String(20), default='minor', index=True)
+    
+    department = db.Column(db.String(100))
+    assigned_to = db.Column(db.Integer, db.ForeignKey('users.id'))
+    assigned_to_name = db.Column(db.String(255))
+    due_date = db.Column(db.DateTime, index=True)
+    source = db.Column(db.String(100))
+    
+    attachments = db.Column(db.Text, default='[]')
+    rca = db.Column(db.Text, default='{}')
+    
+    status = db.Column(db.String(30), default='draft', index=True)
+    
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), index=True)
+    created_by = db.Column(db.Integer, db.ForeignKey('users.id'))
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    assignee = db.relationship('User', foreign_keys=[assigned_to])
+    creator = db.relationship('User', foreign_keys=[created_by])
+    actions = db.relationship('QualityAction', foreign_keys='QualityAction.record_id', backref='record', lazy='dynamic', cascade='all, delete-orphan')
+    timeline = db.relationship('QualityTimeline', foreign_keys='QualityTimeline.record_id', backref='quality_record', lazy='dynamic', cascade='all, delete-orphan')
+    
+    def to_dict(self):
+        def pj(val, default):
+            try:
+                return json.loads(val) if isinstance(val, str) else (val or default)
+            except:
+                return default
+        
+        return {
+            'id': self.id,
+            'record_number': self.record_number,
+            'type': self.type,
+            'title': self.title,
+            'description': self.description,
+            'severity': self.severity,
+            'department': self.department,
+            'assigned_to': self.assigned_to,
+            'assigned_to_name': self.assigned_to_name or (self.assignee.name if self.assignee else None),
+            'due_date': self.due_date.isoformat() if self.due_date else None,
+            'source': self.source,
+            'attachments': pj(self.attachments, []),
+            'rca': pj(self.rca, {}),
+            'status': self.status,
+            'company_id': self.company_id,
+            'created_by': self.created_by,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None
+        }
+
+
+
+class QualityAction(db.Model):
+    """Action items per quality record"""
+    __tablename__ = 'quality_actions'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    record_id = db.Column(
+        db.Integer,
+        db.ForeignKey('quality_records.id', ondelete='CASCADE'),
+        nullable=False,
+        index=True
+    )
+    
+    # ✅ NEW: Direct scope for query speed
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), index=True)
+    
+    action_type = db.Column(db.String(30), default='corrective')
+    description = db.Column(db.Text)
+    
+    assigned_to = db.Column(db.Integer, db.ForeignKey('users.id'))
+    assigned_to_name = db.Column(db.String(255))
+    due_date = db.Column(db.DateTime, index=True)
+    priority = db.Column(db.String(20), default='medium')
+    
+    status = db.Column(db.String(30), default='pending', index=True)
+    
+    completed_at = db.Column(db.DateTime)
+    verified_at = db.Column(db.DateTime)
+    verification_notes = db.Column(db.Text)
+    effectiveness_score = db.Column(db.Integer)
+    
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    assignee = db.relationship('User', foreign_keys=[assigned_to])
+    
+    __table_args__ = (
+        db.Index('idx_quality_action_company', 'company_id'),
+    )
+    
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'record_id': self.record_id,
+            'company_id': self.company_id,
+            'action_type': self.action_type,
+            'description': self.description,
+            'assigned_to': self.assigned_to,
+            'assigned_to_name': self.assigned_to_name or (self.assignee.name if self.assignee else None),
+            'due_date': self.due_date.isoformat() if self.due_date else None,
+            'priority': self.priority,
+            'status': self.status,
+            'completed_at': self.completed_at.isoformat() if self.completed_at else None,
+            'verified_at': self.verified_at.isoformat() if self.verified_at else None,
+            'verification_notes': self.verification_notes,
+            'effectiveness_score': self.effectiveness_score,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None
+        }
+
+
+class QualityTimeline(db.Model):
+    """Activity log for quality records"""
+    __tablename__ = 'quality_timeline'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    record_id = db.Column(
+        db.Integer,
+        db.ForeignKey('quality_records.id', ondelete='CASCADE'),
+        nullable=False,
+        index=True
+    )
+    
+    # ✅ NEW: Direct scope
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), index=True)
+    
+    action = db.Column(db.String(100))
+    description = db.Column(db.Text)
+    type = db.Column(db.String(30))
+    
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'))
+    user_name = db.Column(db.String(255))
+    
+    action_metadata = db.Column(db.Text, default='{}')
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    
+    user = db.relationship('User', foreign_keys=[user_id])
+    
+    __table_args__ = (
+        db.Index('idx_quality_timeline_company', 'company_id'),
+    )
+    
+    def to_dict(self):
+        try:
+            md = json.loads(self.action_metadata) if isinstance(self.action_metadata, str) else (self.action_metadata or {})
+        except:
+            md = {}
+        
+        return {
+            'id': self.id,
+            'record_id': self.record_id,
+            'company_id': self.company_id,
+            'action': self.action,
+            'description': self.description,
+            'type': self.type,
+            'user_id': self.user_id,
+            'user_name': self.user_name or (self.user.name if self.user else None),
+            'metadata': md,
+            'created_at': self.created_at.isoformat() if self.created_at else None
+        }
+
+
+class QualityMetrics(db.Model):
+    """Aggregate QMS metrics"""
+    __tablename__ = 'quality_metrics'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), index=True)
+    period = db.Column(db.String(30))
+    
+    avg_resolution_days = db.Column(db.Float, default=0.0)
+    closure_rate = db.Column(db.Float, default=0.0)
+    on_time_rate = db.Column(db.Float, default=0.0)
+    recurrence_rate = db.Column(db.Float, default=0.0)
+    capa_effectiveness = db.Column(db.Float, default=0.0)
+    first_time_right = db.Column(db.Float, default=0.0)
+    response_sla = db.Column(db.Float, default=0.0)
+    doc_accuracy = db.Column(db.Float, default=0.0)
+    
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'company_id': self.company_id,
+            'period': self.period,
+            'avg_resolution_days': self.avg_resolution_days,
+            'closure_rate': self.closure_rate,
+            'on_time_rate': self.on_time_rate,
+            'recurrence_rate': self.recurrence_rate,
+            'capa_effectiveness': self.capa_effectiveness,
+            'first_time_right': self.first_time_right,
+            'response_sla': self.response_sla,
+            'doc_accuracy': self.doc_accuracy,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None
+        }
+
+
+# ============================================================
+# GROUP 16: OFFLINE MANAGER (4 models)
+# ============================================================
+
+class OfflineDocument(db.Model):
+    """Cached documents for offline access"""
+    __tablename__ = 'offline_documents'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False, index=True)
+    document_id = db.Column(db.Integer, db.ForeignKey('documents.id'), nullable=False, index=True)
+    
+    cached_at = db.Column(db.DateTime, default=datetime.utcnow)
+    last_accessed = db.Column(db.DateTime)
+    
+    file_size = db.Column(db.Integer)
+    hash_value = db.Column(db.String(255))
+    
+    sync_status = db.Column(db.String(20), default='synced', index=True)
+    
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), index=True)
+    
+    user = db.relationship('User', foreign_keys=[user_id])
+    document = db.relationship('Document', foreign_keys=[document_id])
+    
+    __table_args__ = (
+        db.UniqueConstraint('user_id', 'document_id', name='uq_user_offline_doc'),
+    )
+    
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'user_id': self.user_id,
+            'document_id': self.document_id,
+            'document_title': self.document.title if self.document else None,
+            'cached_at': self.cached_at.isoformat() if self.cached_at else None,
+            'last_accessed': self.last_accessed.isoformat() if self.last_accessed else None,
+            'file_size': self.file_size,
+            'hash': self.hash_value,
+            'sync_status': self.sync_status,
+            'company_id': self.company_id
+        }
+
+
+class SyncQueueItem(db.Model):
+    """Pending offline changes"""
+    __tablename__ = 'sync_queue_items'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False, index=True)
+    document_id = db.Column(db.Integer, db.ForeignKey('documents.id'), index=True)
+    
+    action = db.Column(db.String(30), index=True)
+    description = db.Column(db.Text)
+    payload = db.Column(db.Text, default='{}')
+    
+    status = db.Column(db.String(20), default='pending', index=True)
+    retry_count = db.Column(db.Integer, default=0)
+    error = db.Column(db.Text)
+    
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), index=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    user = db.relationship('User', foreign_keys=[user_id])
+    document = db.relationship('Document', foreign_keys=[document_id])
+    
+    def to_dict(self):
+        try:
+            pl = json.loads(self.payload) if isinstance(self.payload, str) else (self.payload or {})
+        except:
+            pl = {}
+        
+        return {
+            'id': self.id,
+            'user_id': self.user_id,
+            'document_id': self.document_id,
+            'document_title': self.document.title if self.document else None,
+            'action': self.action,
+            'description': self.description,
+            'payload': pl,
+            'status': self.status,
+            'retry_count': self.retry_count,
+            'error': self.error,
+            'company_id': self.company_id,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None
+        }
+
+
+class SyncConflict(db.Model):
+    """Sync conflicts between local and remote"""
+    __tablename__ = 'sync_conflicts'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False, index=True)
+    document_id = db.Column(db.Integer, db.ForeignKey('documents.id'), index=True)
+    document_title = db.Column(db.String(255))
+    
+    conflict_type = db.Column(db.String(50))
+    local_content = db.Column(db.Text)
+    remote_content = db.Column(db.Text)
+    local_modified = db.Column(db.DateTime)
+    remote_modified = db.Column(db.DateTime)
+    
+    resolved = db.Column(db.Boolean, default=False, index=True)
+    resolution = db.Column(db.String(20))
+    resolved_at = db.Column(db.DateTime)
+    resolved_by = db.Column(db.Integer, db.ForeignKey('users.id'))
+    
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), index=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    
+    user = db.relationship('User', foreign_keys=[user_id])
+    resolver = db.relationship('User', foreign_keys=[resolved_by])
+    
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'user_id': self.user_id,
+            'document_id': self.document_id,
+            'document_title': self.document_title,
+            'conflict_type': self.conflict_type,
+            'local_content': self.local_content,
+            'remote_content': self.remote_content,
+            'local_modified': self.local_modified.isoformat() if self.local_modified else None,
+            'remote_modified': self.remote_modified.isoformat() if self.remote_modified else None,
+            'resolved': self.resolved,
+            'resolution': self.resolution,
+            'resolved_at': self.resolved_at.isoformat() if self.resolved_at else None,
+            'resolved_by': self.resolved_by,
+            'company_id': self.company_id,
+            'created_at': self.created_at.isoformat() if self.created_at else None
+        }
+
+
+class OfflineSettings(db.Model):
+    """Per-user offline preferences"""
+    __tablename__ = 'offline_settings'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False, unique=True, index=True)
+    
+    cache_strategy = db.Column(db.String(30), default='recent')
+    auto_sync = db.Column(db.Boolean, default=True)
+    sync_interval = db.Column(db.Integer, default=15)
+    wifi_only = db.Column(db.Boolean, default=True)
+    max_cache_size = db.Column(db.Integer, default=500)
+    encrypt_cache = db.Column(db.Boolean, default=True)
+    auto_download = db.Column(db.Boolean, default=True)
+    
+    last_sync_at = db.Column(db.DateTime)
+    
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), index=True)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    user = db.relationship('User', foreign_keys=[user_id])
+    
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'user_id': self.user_id,
+            'cache_strategy': self.cache_strategy,
+            'auto_sync': self.auto_sync,
+            'sync_interval': self.sync_interval,
+            'wifi_only': self.wifi_only,
+            'max_cache_size': self.max_cache_size,
+            'encrypt_cache': self.encrypt_cache,
+            'auto_download': self.auto_download,
+            'last_sync_at': self.last_sync_at.isoformat() if self.last_sync_at else None,
+            'company_id': self.company_id,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None
+        }
+
+
+# ============================================================
+# GROUP 17: INTEGRATION HUB (4 models)
+# ============================================================
+
+class Integration(db.Model):
+    """Connected external integrations"""
+    __tablename__ = 'integrations'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    integration_id = db.Column(db.String(50), nullable=False, index=True)
+    name = db.Column(db.String(255))
+    category = db.Column(db.String(30))
+    
+    config = db.Column(db.Text, default='{}')
+    
+    status = db.Column(db.String(20), default='disconnected', index=True)
+    
+    connected_at = db.Column(db.DateTime)
+    last_sync_at = db.Column(db.DateTime)
+    documents_synced = db.Column(db.Integer, default=0)
+    
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), index=True)
+    connected_by = db.Column(db.Integer, db.ForeignKey('users.id'))
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    connector = db.relationship('User', foreign_keys=[connected_by])
+    
+    def to_dict(self):
+        try:
+            cf = json.loads(self.config) if isinstance(self.config, str) else (self.config or {})
+        except:
+            cf = {}
+        
+        return {
+            'id': self.id,
+            'integration_id': self.integration_id,
+            'name': self.name,
+            'category': self.category,
+            'config': cf,
+            'status': self.status,
+            'connected_at': self.connected_at.isoformat() if self.connected_at else None,
+            'last_sync_at': self.last_sync_at.isoformat() if self.last_sync_at else None,
+            'documents_synced': self.documents_synced,
+            'company_id': self.company_id,
+            'connected_by': self.connected_by,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None
+        }
+
+
+class Webhook(db.Model):
+    """User-defined webhooks"""
+    __tablename__ = 'webhooks'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(255), nullable=False)
+    url = db.Column(db.String(500), nullable=False)
+    
+    events = db.Column(db.Text, default='[]')
+    secret = db.Column(db.String(255))
+    
+    enabled = db.Column(db.Boolean, default=True, index=True)
+    last_triggered_at = db.Column(db.DateTime)
+    trigger_count = db.Column(db.Integer, default=0)
+    
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), index=True)
+    created_by = db.Column(db.Integer, db.ForeignKey('users.id'))
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    creator = db.relationship('User', foreign_keys=[created_by])
+    
+    def to_dict(self):
+        try:
+            ev = json.loads(self.events) if isinstance(self.events, str) else (self.events or [])
+        except:
+            ev = []
+        
+        return {
+            'id': self.id,
+            'name': self.name,
+            'url': self.url,
+            'events': ev,
+            'enabled': self.enabled,
+            'last_triggered_at': self.last_triggered_at.isoformat() if self.last_triggered_at else None,
+            'trigger_count': self.trigger_count,
+            'company_id': self.company_id,
+            'created_by': self.created_by,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None
+        }
+
+
+class APIKey(db.Model):
+    """API access keys"""
+    __tablename__ = 'api_keys'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(255), nullable=False)
+    key_hash = db.Column(db.String(255), nullable=False)
+    prefix = db.Column(db.String(20))
+    
+    scopes = db.Column(db.Text, default='[]')
+    
+    expires_at = db.Column(db.DateTime)
+    last_used_at = db.Column(db.DateTime)
+    
+    revoked = db.Column(db.Boolean, default=False, index=True)
+    
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), index=True)
+    created_by = db.Column(db.Integer, db.ForeignKey('users.id'))
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    
+    creator = db.relationship('User', foreign_keys=[created_by])
+    
+    def to_dict(self):
+        try:
+            sc = json.loads(self.scopes) if isinstance(self.scopes, str) else (self.scopes or [])
+        except:
+            sc = []
+        
+        return {
+            'id': self.id,
+            'name': self.name,
+            'prefix': self.prefix,
+            'scopes': sc,
+            'expires_at': self.expires_at.isoformat() if self.expires_at else None,
+            'last_used_at': self.last_used_at.isoformat() if self.last_used_at else None,
+            'revoked': self.revoked,
+            'company_id': self.company_id,
+            'created_by': self.created_by,
+            'created_at': self.created_at.isoformat() if self.created_at else None
+        }
+
+
+class IntegrationActivity(db.Model):
+    """Integration activity log"""
+    __tablename__ = 'integration_activities'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    integration_id = db.Column(db.String(50), index=True)
+    integration_name = db.Column(db.String(255))
+    
+    action = db.Column(db.String(100))
+    description = db.Column(db.Text)
+    status = db.Column(db.String(20), default='success', index=True)
+    duration = db.Column(db.Integer)
+    error_message = db.Column(db.Text)
+    
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), index=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'integration_id': self.integration_id,
+            'integration_name': self.integration_name,
+            'action': self.action,
+            'description': self.description,
+            'status': self.status,
+            'duration': self.duration,
+            'error_message': self.error_message,
+            'company_id': self.company_id,
+            'created_at': self.created_at.isoformat() if self.created_at else None
+        }
+
+
+# ============================================================
+# GROUP 18: REALTIME COLLABORATION (2 models)
+# ============================================================
+
+class CollaborationSession(db.Model):
+    """Active real-time editing sessions"""
+    __tablename__ = 'collaboration_sessions'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    document_id = db.Column(db.Integer, db.ForeignKey('documents.id'), nullable=False, index=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False, index=True)
+    user_name = db.Column(db.String(255))
+    user_color = db.Column(db.String(20))
+    
+    socket_id = db.Column(db.String(100), index=True)
+    cursor_position = db.Column(db.Integer, default=0)
+    
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), index=True)
+    joined_at = db.Column(db.DateTime, default=datetime.utcnow)
+    last_seen = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    document = db.relationship('Document', foreign_keys=[document_id])
+    user = db.relationship('User', foreign_keys=[user_id])
+    
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'document_id': self.document_id,
+            'user_id': self.user_id,
+            'user_name': self.user_name or (self.user.name if self.user else None),
+            'user_color': self.user_color,
+            'socket_id': self.socket_id,
+            'cursor_position': self.cursor_position,
+            'company_id': self.company_id,
+            'joined_at': self.joined_at.isoformat() if self.joined_at else None,
+            'last_seen': self.last_seen.isoformat() if self.last_seen else None
+        }
+
+
+class DocumentLock(db.Model):
+    """Document locks during editing"""
+    __tablename__ = 'document_locks'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    document_id = db.Column(db.Integer, db.ForeignKey('documents.id'), nullable=False, unique=True, index=True)
+    
+    locked_by = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    locked_by_name = db.Column(db.String(255))
+    locked_at = db.Column(db.DateTime, default=datetime.utcnow)
+    reason = db.Column(db.String(255))
+    
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), index=True)
+    
+    document = db.relationship('Document', foreign_keys=[document_id])
+    locker = db.relationship('User', foreign_keys=[locked_by])
+    
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'document_id': self.document_id,
+            'document_title': self.document.title if self.document else None,
+            'locked_by': self.locked_by,
+            'locked_by_name': self.locked_by_name or (self.locker.name if self.locker else None),
+            'locked_at': self.locked_at.isoformat() if self.locked_at else None,
+            'reason': self.reason,
+            'company_id': self.company_id
+        }
+
+# ============================================================
+# GROUP 4: WORKFLOW BUILDER (2 models) — RENAMED
+# ============================================================
+
+class DocumentWorkflowDefinition(db.Model):
+    """Custom document workflow definitions (visual builder)"""
+    __tablename__ = 'document_workflow_definitions'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(255), nullable=False)
+    description = db.Column(db.Text)
+    category = db.Column(db.String(50), default='general')
+    
+    is_active = db.Column(db.Boolean, default=True)
+    is_default = db.Column(db.Boolean, default=False)
+    applicable_to = db.Column(db.Text, default='[]')  # JSON array
+    
+    nodes = db.Column(db.Text, default='[]')  # JSON array of node objects
+    connections = db.Column(db.Text, default='[]')  # JSON array of edges
+    
+    version = db.Column(db.Integer, default=1)
+    
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), index=True)
+    created_by = db.Column(db.Integer, db.ForeignKey('users.id'))
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    creator = db.relationship('User', foreign_keys=[created_by])
+    executions = db.relationship(
+        'DocumentWorkflowExecution',
+        foreign_keys='DocumentWorkflowExecution.workflow_id',
+        backref='workflow',
+        lazy='dynamic',
+        cascade='all, delete-orphan'
+    )
+    
+    __table_args__ = (
+        db.Index('idx_doc_workflow_company', 'company_id'),
+        db.Index('idx_doc_workflow_active', 'is_active'),
+    )
+    
+    def to_dict(self):
+        def pj(val, default):
+            try:
+                return json.loads(val) if isinstance(val, str) else (val or default)
+            except:
+                return default
+        
+        return {
+            'id': self.id,
+            'name': self.name,
+            'description': self.description,
+            'category': self.category,
+            'is_active': self.is_active,
+            'is_default': self.is_default,
+            'applicable_to': pj(self.applicable_to, []),
+            'nodes': pj(self.nodes, []),
+            'connections': pj(self.connections, []),
+            'version': self.version,
+            'company_id': self.company_id,
+            'created_by': self.created_by,
+            'created_by_name': self.creator.name if self.creator else None,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None
+        }
+
+
+class DocumentWorkflowExecution(db.Model):
+    """Runs of a document workflow definition"""
+    __tablename__ = 'document_workflow_executions'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    workflow_id = db.Column(
+        db.Integer,
+        db.ForeignKey('document_workflow_definitions.id'),
+        nullable=False,
+        index=True
+    )
+    document_id = db.Column(db.Integer, db.ForeignKey('documents.id'), index=True)
+    
+    status = db.Column(db.String(20), default='running', index=True)  # running/completed/failed/cancelled
+    current_node_id = db.Column(db.String(100))
+    
+    context = db.Column(db.Text, default='{}')  # JSON
+    execution_log = db.Column(db.Text, default='[]')  # JSON array
+    
+    started_at = db.Column(db.DateTime, default=datetime.utcnow)
+    completed_at = db.Column(db.DateTime)
+    
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), index=True)
+    
+    document = db.relationship('Document', foreign_keys=[document_id])
+    
+    def to_dict(self):
+        def pj(val, default):
+            try:
+                return json.loads(val) if isinstance(val, str) else (val or default)
+            except:
+                return default
+        
+        return {
+            'id': self.id,
+            'workflow_id': self.workflow_id,
+            'workflow_name': self.workflow.name if self.workflow else None,
+            'document_id': self.document_id,
+            'document_title': self.document.title if self.document else None,
+            'status': self.status,
+            'current_node_id': self.current_node_id,
+            'context': pj(self.context, {}),
+            'execution_log': pj(self.execution_log, []),
+            'started_at': self.started_at.isoformat() if self.started_at else None,
+            'completed_at': self.completed_at.isoformat() if self.completed_at else None,
+            'company_id': self.company_id
+        }
+
+
+# ============================================================
+# GROUP 14: PREDICTIVE ANALYTICS — RENAMED
+# ============================================================
+
+class MLPredictiveModel(db.Model):
+    """Machine learning model registry for predictive analytics"""
+    __tablename__ = 'ml_predictive_models'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(255), nullable=False)
+    type = db.Column(db.String(50))  # time_series/regression/ml_model/neural_network
+    
+    accuracy = db.Column(db.Float, default=0.0)
+    status = db.Column(db.String(20), default='inactive', index=True)  # active/training/inactive
+    
+    model_metadata = db.Column(db.Text, default='{}')  # JSON
+    
+    trained_at = db.Column(db.DateTime)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), index=True)
+    created_by = db.Column(db.Integer, db.ForeignKey('users.id'))
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    creator = db.relationship('User', foreign_keys=[created_by])
+    
+    def to_dict(self):
+        try:
+            md = json.loads(self.model_metadata) if isinstance(self.model_metadata, str) else (self.model_metadata or {})
+        except:
+            md = {}
+        
+        return {
+            'id': self.id,
+            'name': self.name,
+            'type': self.type,
+            'accuracy': self.accuracy,
+            'status': self.status,
+            'metadata': md,
+            'trained_at': self.trained_at.isoformat() if self.trained_at else None,
+            'company_id': self.company_id,
+            'created_by': self.created_by,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None
+        }
+
+
+class Prediction(db.Model):
+    """Generated predictions"""
+    __tablename__ = 'predictions'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    title = db.Column(db.String(255))
+    type = db.Column(db.String(50), index=True)  # document_volume/compliance_risk/expiry_risk/etc
+    description = db.Column(db.Text)
+    
+    value = db.Column(db.Float, default=0.0)
+    unit = db.Column(db.String(30))
+    timeframe = db.Column(db.String(50))
+    confidence = db.Column(db.Float, default=0.0)
+    risk_score = db.Column(db.Integer, default=0)
+    
+    # ✅ UPDATED FK — points to the new renamed model
+    model_id = db.Column(
+        db.Integer,
+        db.ForeignKey('ml_predictive_models.id'),
+        index=True
+    )
+    supporting_data = db.Column(db.Text, default='[]')  # JSON
+    
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), index=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    
+    model = db.relationship('MLPredictiveModel', foreign_keys=[model_id])
+    
+    def to_dict(self):
+        try:
+            sd = json.loads(self.supporting_data) if isinstance(self.supporting_data, str) else (self.supporting_data or [])
+        except:
+            sd = []
+        
+        return {
+            'id': self.id,
+            'title': self.title,
+            'type': self.type,
+            'description': self.description,
+            'value': self.value,
+            'unit': self.unit,
+            'timeframe': self.timeframe,
+            'confidence': self.confidence,
+            'risk_score': self.risk_score,
+            'model_id': self.model_id,
+            'model': self.model.name if self.model else None,
+            'supporting_data': sd,
+            'company_id': self.company_id,
             'created_at': self.created_at.isoformat() if self.created_at else None
         }
