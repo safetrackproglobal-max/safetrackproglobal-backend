@@ -134809,7 +134809,7 @@ def create_document_control():
     try:
         current_user = request.user
         is_super_admin = check_super_admin()
-        
+
         # ✅ Check if user can create documents
         if not is_super_admin:
             if not has_document_feature_access(current_user, 'create'):
@@ -134820,11 +134820,11 @@ def create_document_control():
                     'required_plan': 'basic',
                     'current_plan': getattr(current_user, 'subscription_plan', 'free')
                 }), 403
-        
+
         from models import Document
-        
+
         # ==================== VALIDATION ====================
-        
+
         # Get form data
         title = request.form.get('title', '').strip()
         if not title or len(title) < 3:
@@ -134833,14 +134833,14 @@ def create_document_control():
                 'error': 'Title must be at least 3 characters',
                 'code': 'INVALID_TITLE'
             }), 400
-        
+
         if len(title) > 255:
             return jsonify({
                 'success': False,
                 'error': 'Title must be less than 255 characters',
                 'code': 'TITLE_TOO_LONG'
             }), 400
-        
+
         document_type = request.form.get('document_type', 'report')
         if not document_type:
             return jsonify({
@@ -134848,7 +134848,7 @@ def create_document_control():
                 'error': 'Document type is required',
                 'code': 'MISSING_TYPE'
             }), 400
-        
+
         description = request.form.get('description', '').strip()
         if len(description) > 2000:
             return jsonify({
@@ -134856,7 +134856,7 @@ def create_document_control():
                 'error': 'Description must be less than 2000 characters',
                 'code': 'DESCRIPTION_TOO_LONG'
             }), 400
-        
+
         module = request.form.get('module', 'general')
         category = request.form.get('category', '')
         priority = request.form.get('priority', 'medium')
@@ -134865,7 +134865,7 @@ def create_document_control():
         site_id = request.form.get('site_id')
         is_confidential = request.form.get('is_confidential', 'false').lower() == 'true'
         requires_approval = request.form.get('requires_approval', 'true').lower() == 'true'
-        
+
         # ✅ Parse and convert tags to JSON string
         try:
             tags = json.loads(tags_json) if tags_json else []
@@ -134873,15 +134873,14 @@ def create_document_control():
                 tags = []
         except json.JSONDecodeError:
             tags = []
-        
-        # ✅ CRITICAL FIX: Convert tags to JSON string for database storage
+
         tags_as_string = json.dumps(tags) if tags else '[]'
-        
+
         # Validate priority
         valid_priorities = ['low', 'medium', 'high', 'critical']
         if priority not in valid_priorities:
             priority = 'medium'
-        
+
         # Validate site_id
         site_id_int = None
         if site_id:
@@ -134893,7 +134892,7 @@ def create_document_control():
                     'error': 'Invalid site_id format',
                     'code': 'INVALID_SITE_ID'
                 }), 400
-        
+
         # Check file
         file = request.files.get('file')
         if not file:
@@ -134902,7 +134901,7 @@ def create_document_control():
                 'error': 'File is required',
                 'code': 'MISSING_FILE'
             }), 400
-        
+
         # Validate file type
         if not is_allowed_file(file.filename):
             return jsonify({
@@ -134910,7 +134909,7 @@ def create_document_control():
                 'error': 'Unsupported file type. Allowed: PDF, Word, Excel, Images, Text',
                 'code': 'INVALID_FILE_TYPE'
             }), 400
-        
+
         # Validate file size (50MB max)
         file.seek(0, os.SEEK_END)
         file_size = file.tell()
@@ -134921,175 +134920,133 @@ def create_document_control():
                 'error': 'File size cannot exceed 50MB',
                 'code': 'FILE_TOO_LARGE'
             }), 400
-        
+
         # ==================== CREATE DOCUMENT ====================
+
+        # ✅ FIX: NO custom ID generation.
+        # Let PostgreSQL auto-assign the id via SERIAL / IDENTITY.
+        # We use a UUID-based filename instead to avoid collisions.
+
+        filename = secure_filename(file.filename)
+        file_ext = get_file_extension(filename)
+
+        import uuid
+        file_uuid = uuid.uuid4().hex[:16]
+        safe_filename = f"{file_uuid}{file_ext}"
+
+        # Create upload directory
+        upload_dir = os.path.join(
+            current_app.config.get('UPLOAD_FOLDER', 'uploads'),
+            'documents'
+        )
+        os.makedirs(upload_dir, exist_ok=True)
+
+        file_path = os.path.join(upload_dir, safe_filename)
+        file.save(file_path)
+
+        # Generate file hash
+        with open(file_path, 'rb') as f:
+            file_hash = hashlib.sha256(f.read()).hexdigest()
+
+        # Get company_id from user
+        user_company_id = getattr(current_user, 'company_id', None)
+
+        # ✅ Create document WITHOUT passing `id` — let PG auto-increment
+        document = Document(
+            user_id=current_user.id,
+            title=title,
+            description=description,
+            document_type=document_type,
+            category=category,
+            module=module,
+            priority=priority,
+            tags=tags_as_string,
+            content=content,
+            content_hash=calculate_content_hash(content) if content else None,
+            file_name=filename,
+            file_size=file_size,
+            mime_type=file.mimetype or 'application/octet-stream',
+            file_url=f"/uploads/documents/{safe_filename}",
+            file_hash=file_hash,
+            status='draft',
+            version=1,
+            company_id=user_company_id,
+            site_id=site_id_int,
+            is_confidential=is_confidential,
+            requires_approval=requires_approval,
+            created_by=current_user.id,
+            updated_by=current_user.id,
+            review_status='never_reviewed'
+        )
+
+        # ✅ Commit document ALONE first — any failure will surface here
+        db.session.add(document)
+        db.session.commit()
+
+        current_app.logger.info(
+            f"✅ Document created: id={document.id} by user {current_user.id}"
+        )
+
+        # ✅ Now create audit log SEPARATELY (non-fatal if it fails)
         try:
-            # ✅ Generate a numeric ID
-            doc_id = int(time.time() * 1000000) + random.randint(1, 999)
-            
-            # Save file
-            filename = secure_filename(file.filename)
-            file_ext = get_file_extension(filename)
-            safe_filename = f"{doc_id}{file_ext}"
-            
-            # Create upload directory
-            upload_dir = os.path.join(current_app.config.get('UPLOAD_FOLDER', 'uploads'), 'documents')
-            os.makedirs(upload_dir, exist_ok=True)
-            
-            file_path = os.path.join(upload_dir, safe_filename)
-            file.save(file_path)
-            
-            # Generate file hash
-            with open(file_path, 'rb') as f:
-                file_hash = hashlib.sha256(f.read()).hexdigest()
-            
-            # Get company_id from user
-            user_company_id = getattr(current_user, 'company_id', None)
-            
-            # ✅ Create document with INTEGER ID
-            document = Document(
-                id=doc_id,  # ✅ INTEGER
-                user_id=current_user.id,
-                title=title,
-                description=description,
-                document_type=document_type,
-                category=category,
-                module=module,
-                priority=priority,
-                tags=tags_as_string,  # ✅ JSON string
-                content=content,
-                content_hash=calculate_content_hash(content) if content else None,
-                file_name=filename,
-                file_size=file_size,
-                mime_type=file.mimetype or 'application/octet-stream',
-                file_url=f"/uploads/documents/{safe_filename}",
-                file_hash=file_hash,
-                status='draft',
-                version=1,
-                company_id=user_company_id,
-                site_id=site_id_int,
-                is_confidential=is_confidential,
-                requires_approval=requires_approval,
-                created_by=current_user.id,
-                updated_by=current_user.id,
-                review_status='never_reviewed'
-            )
-            
-            db.session.add(document)
-            
-            # ✅ Create audit log using the fixed function
-            audit_success = create_audit_log(
-                document_id=doc_id,
+            create_audit_log(
+                document_id=document.id,
                 user_id=current_user.id,
                 action='create',
                 details={'title': title, 'document_type': document_type}
             )
-            
-            # ✅ Commit everything together
             db.session.commit()
-            
-            if not audit_success:
-                current_app.logger.warning(f"Audit log creation failed for document {doc_id}")
-            else:
-                current_app.logger.info(f"✅ Document created: {doc_id} by user {current_user.id}")
-            
-            # ✅ Return document with tags parsed back to list
-            return jsonify({
-                'success': True,
-                'message': 'Document created successfully',
-                'document': {
-                    'id': document.id,
-                    'user_id': document.user_id,
-                    'title': document.title,
-                    'description': document.description,
-                    'document_type': document.document_type,
-                    'category': document.category,
-                    'module': document.module,
-                    'priority': document.priority,
-                    'tags': json.loads(document.tags) if document.tags else [],
-                    'status': document.status,
-                    'version': document.version,
-                    'is_latest': bool(document.is_latest),
-                    'file_name': document.file_name,
-                    'file_size': document.file_size,
-                    'mime_type': document.mime_type,
-                    'file_url': document.file_url,
-                    'is_confidential': bool(document.is_confidential),
-                    'requires_approval': bool(document.requires_approval),
-                    'company_id': document.company_id,
-                    'created_by': document.created_by,
-                    'created_at': document.created_at.isoformat() if document.created_at else None,
-                    'updated_at': document.updated_at.isoformat() if document.updated_at else None,
-                }
-            }), 201
-            
-        except IntegrityError as ie:
+        except Exception as audit_err:
             db.session.rollback()
-            current_app.logger.error(f"Integrity error: {ie}")
-            # If ID already exists, try with a new ID
-            try:
-                # Get max ID and retry
-                max_id = db.session.query(db.func.max(Document.id)).scalar() or 0
-                new_doc_id = max_id + 1
-                
-                # Update file name with new ID
-                new_safe_filename = f"{new_doc_id}{file_ext}"
-                new_file_path = os.path.join(upload_dir, new_safe_filename)
-                os.rename(file_path, new_file_path)
-                
-                # Update document with new ID
-                document.id = new_doc_id
-                document.file_url = f"/uploads/documents/{new_safe_filename}"
-                
-                db.session.commit()
-                
-                # ✅ Also update audit log if created
-                if 'audit_success' in locals() and audit_success:
-                    # Update audit log with new document_id
-                    # This is a simplified retry - in production you'd want to delete and recreate
-                    pass
-                
-                return jsonify({
-                    'success': True,
-                    'message': 'Document created successfully',
-                    'document': {
-                        'id': document.id,
-                        'user_id': document.user_id,
-                        'title': document.title,
-                        'description': document.description,
-                        'document_type': document.document_type,
-                        'category': document.category,
-                        'module': document.module,
-                        'priority': document.priority,
-                        'tags': json.loads(document.tags) if document.tags else [],
-                        'status': document.status,
-                        'version': document.version,
-                        'is_latest': bool(document.is_latest),
-                        'file_name': document.file_name,
-                        'file_size': document.file_size,
-                        'mime_type': document.mime_type,
-                        'file_url': document.file_url,
-                        'is_confidential': bool(document.is_confidential),
-                        'requires_approval': bool(document.requires_approval),
-                        'company_id': document.company_id,
-                        'created_by': document.created_by,
-                        'created_at': document.created_at.isoformat() if document.created_at else None,
-                        'updated_at': document.updated_at.isoformat() if document.updated_at else None,
-                    }
-                }), 201
-                
-            except Exception as retry_error:
-                db.session.rollback()
-                current_app.logger.error(f"Retry failed: {retry_error}")
-                return jsonify({
-                    'success': False,
-                    'error': 'Document could not be created',
-                    'code': 'INTEGRITY_ERROR'
-                }), 500
-            
+            current_app.logger.warning(
+                f"⚠️ Audit log creation failed for document {document.id}: {audit_err}"
+            )
+
+        # ✅ Return the document (id populated by DB)
+        return jsonify({
+            'success': True,
+            'message': 'Document created successfully',
+            'document': {
+                'id': document.id,
+                'user_id': document.user_id,
+                'title': document.title,
+                'description': document.description,
+                'document_type': document.document_type,
+                'category': document.category,
+                'module': document.module,
+                'priority': document.priority,
+                'tags': json.loads(document.tags) if document.tags else [],
+                'status': document.status,
+                'version': document.version,
+                'is_latest': bool(document.is_latest),
+                'file_name': document.file_name,
+                'file_size': document.file_size,
+                'mime_type': document.mime_type,
+                'file_url': document.file_url,
+                'is_confidential': bool(document.is_confidential),
+                'requires_approval': bool(document.requires_approval),
+                'company_id': document.company_id,
+                'created_by': document.created_by,
+                'created_at': document.created_at.isoformat() if document.created_at else None,
+                'updated_at': document.updated_at.isoformat() if document.updated_at else None,
+            }
+        }), 201
+
+    except IntegrityError as ie:
+        db.session.rollback()
+        current_app.logger.error(f"Integrity error creating document: {ie}")
+        return jsonify({
+            'success': False,
+            'error': 'Document could not be created due to a data conflict',
+            'code': 'INTEGRITY_ERROR',
+            'details': str(ie) if current_app.debug else None
+        }), 500
+
     except Exception as e:
         db.session.rollback()
-        current_app.logger.error(f"Error creating document: {str(e)}", exc_info=True)
+        current_app.logger.error(
+            f"Error creating document: {str(e)}", exc_info=True
+        )
         return jsonify({
             'success': False,
             'error': 'Failed to create document',
