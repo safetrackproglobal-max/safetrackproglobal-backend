@@ -134568,7 +134568,7 @@ def get_document_by_id(document_id):
     try:
         current_user = request.user
         is_super_admin = check_super_admin()
-        
+
         # ✅ Check if user has document access
         if not is_super_admin:
             if not has_document_feature_access(current_user, 'view'):
@@ -134579,23 +134579,20 @@ def get_document_by_id(document_id):
                     'required_plan': 'free',
                     'current_plan': getattr(current_user, 'subscription_plan', 'free')
                 }), 403
-        
+
         from models import Document
         import uuid
-        
+
         # ============================================================
         # PARSE ID - SUPPORT BOTH UUID AND INTEGER
         # ============================================================
         doc_uuid = None
         doc_id = None
-        
-        # Try to parse as UUID
+
         try:
             doc_uuid = uuid.UUID(document_id)
-            # Use UUID for query
             id_filter = Document.id == doc_uuid
         except ValueError:
-            # Not a valid UUID, try as integer
             try:
                 doc_id = int(document_id)
                 id_filter = Document.id == doc_id
@@ -134605,7 +134602,7 @@ def get_document_by_id(document_id):
                     'error': 'Invalid document ID format. Must be UUID or integer.',
                     'code': 'INVALID_ID'
                 }), 400
-        
+
         # ============================================================
         # BUILD QUERY WITH SCOPE
         # ============================================================
@@ -134623,27 +134620,26 @@ def get_document_by_id(document_id):
                     id_filter,
                     Document.user_id == current_user.id
                 ).first()
-        
+
         if not document:
             return jsonify({
                 'success': False,
                 'error': 'Document not found',
                 'code': 'DOCUMENT_NOT_FOUND'
             }), 404
-        
+
         # ============================================================
-        # ✅ FIX: Parse tags from JSON string to array
+        # ✅ Parse tags from JSON string to array
         # ============================================================
         tags = document.tags or '[]'
         if isinstance(tags, str):
             try:
                 tags = json.loads(tags) if tags else []
             except json.JSONDecodeError:
-                # If it's a comma-separated string, split it
                 tags = [t.strip() for t in tags.split(',') if t.strip()]
         elif not isinstance(tags, list):
             tags = []
-        
+
         # ============================================================
         # AUDIT LOG
         # ============================================================
@@ -134653,7 +134649,7 @@ def get_document_by_id(document_id):
             action='view',
             details={'viewed_at': datetime.utcnow().isoformat()}
         )
-        
+
         # ============================================================
         # PREPARE RESPONSE
         # ============================================================
@@ -134671,7 +134667,8 @@ def get_document_by_id(document_id):
             'file_name': document.file_name,
             'file_size': document.file_size,
             'mime_type': document.mime_type,
-            'tags': tags,  # ✅ Now properly parsed as an array
+            'tags': tags,
+            'editing_source': getattr(document, 'editing_source', 'regular') or 'regular',  # ✅ NEW
             'is_confidential': document.is_confidential,
             'requires_approval': document.requires_approval,
             'approval_workflow': document.approval_workflow,
@@ -134701,13 +134698,13 @@ def get_document_by_id(document_id):
                 'can_view': True
             }
         }
-        
+
         return jsonify({
             'success': True,
             'document': doc_dict,
             'access_level': 'super_admin' if is_super_admin else 'user'
         }), 200
-        
+
     except Exception as e:
         current_app.logger.error(f"Error fetching document: {str(e)}", exc_info=True)
         return jsonify({
@@ -134716,8 +134713,6 @@ def get_document_by_id(document_id):
             'details': str(e) if current_app.debug else 'Please try again',
             'code': 'INTERNAL_ERROR'
         }), 500
-
-
 # ============================================================
 # 3. GET REVIEW DOCUMENTS
 # ============================================================
@@ -134866,6 +134861,15 @@ def create_document_control():
         is_confidential = request.form.get('is_confidential', 'false').lower() == 'true'
         requires_approval = request.form.get('requires_approval', 'true').lower() == 'true'
 
+        # ============================================================
+        # ✅ NEW: Parse editing_source
+        # 'regular' — normal upload or modal-edited document
+        # 'sidebar' — created/edited from standalone sidebar editor
+        # ============================================================
+        editing_source = (request.form.get('editing_source') or 'regular').strip().lower()
+        if editing_source not in ('regular', 'sidebar'):
+            editing_source = 'regular'
+
         # ✅ Parse and convert tags to JSON string
         try:
             tags = json.loads(tags_json) if tags_json else []
@@ -134923,10 +134927,6 @@ def create_document_control():
 
         # ==================== CREATE DOCUMENT ====================
 
-        # ✅ FIX: NO custom ID generation.
-        # Let PostgreSQL auto-assign the id via SERIAL / IDENTITY.
-        # We use a UUID-based filename instead to avoid collisions.
-
         filename = secure_filename(file.filename)
         file_ext = get_file_extension(filename)
 
@@ -134976,7 +134976,8 @@ def create_document_control():
             requires_approval=requires_approval,
             created_by=current_user.id,
             updated_by=current_user.id,
-            review_status='never_reviewed'
+            review_status='never_reviewed',
+            editing_source=editing_source,           # ✅ NEW
         )
 
         # ✅ Commit document ALONE first — any failure will surface here
@@ -134984,7 +134985,8 @@ def create_document_control():
         db.session.commit()
 
         current_app.logger.info(
-            f"✅ Document created: id={document.id} by user {current_user.id}"
+            f"✅ Document created: id={document.id} by user {current_user.id} "
+            f"(source={editing_source})"
         )
 
         # ✅ Now create audit log SEPARATELY (non-fatal if it fails)
@@ -134993,7 +134995,11 @@ def create_document_control():
                 document_id=document.id,
                 user_id=current_user.id,
                 action='create',
-                details={'title': title, 'document_type': document_type}
+                details={
+                    'title': title,
+                    'document_type': document_type,
+                    'editing_source': editing_source,   # ✅ NEW
+                }
             )
             db.session.commit()
         except Exception as audit_err:
@@ -135002,7 +135008,7 @@ def create_document_control():
                 f"⚠️ Audit log creation failed for document {document.id}: {audit_err}"
             )
 
-        # ✅ Return the document (id populated by DB)
+        # ✅ Return the document
         return jsonify({
             'success': True,
             'message': 'Document created successfully',
@@ -135026,6 +135032,7 @@ def create_document_control():
                 'is_confidential': bool(document.is_confidential),
                 'requires_approval': bool(document.requires_approval),
                 'company_id': document.company_id,
+                'editing_source': document.editing_source or 'regular',  # ✅ NEW
                 'created_by': document.created_by,
                 'created_at': document.created_at.isoformat() if document.created_at else None,
                 'updated_at': document.updated_at.isoformat() if document.updated_at else None,
@@ -135053,7 +135060,6 @@ def create_document_control():
             'details': str(e) if current_app.debug else 'Please try again',
             'code': 'INTERNAL_ERROR'
         }), 500
-
 # ============================================================
 # 5. UPDATE DOCUMENT
 # ============================================================
@@ -145767,7 +145773,285 @@ def dm_share_bi_dashboard():
         db.session.rollback()
         current_app.logger.error(f"dm_share_bi_dashboard error: {str(e)}")
         return jsonify({'success': False, 'error': str(e)}), 500
+
+
+# ============================================================
+# TRACK CHANGES ROUTES
+# ============================================================
+
+@app.route('/api/dm-documents/<int:document_id>/changes', methods=['GET'])
+@cross_origin()
+@jwt_required
+def dm_get_document_changes(document_id):
+    """List pending change sets for a document."""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+        q = DocumentChange.query.filter_by(document_id=document_id)
+
+        status_filter = request.args.get('status')
+        if status_filter and status_filter != 'all':
+            q = q.filter_by(status=status_filter)
+
+        if not is_super_admin and user.company_id:
+            q = q.filter_by(company_id=user.company_id)
+
+        items = q.order_by(DocumentChange.created_at.desc()).all()
+        return jsonify({
+            'success': True,
+            'changes': [c.to_dict() for c in items],
+            'total': len(items)
+        })
+    except Exception as e:
+        current_app.logger.error(f"dm_get_document_changes error: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/<int:document_id>/changes', methods=['POST'])
+@cross_origin()
+@jwt_required
+def dm_create_document_change(document_id):
+    """Create a change set when user exits track-changes mode."""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        document = Document.query.get(document_id)
+        if not document:
+            return jsonify({'success': False, 'error': 'Document not found'}), 404
+
+        data = request.get_json() or {}
+        original = data.get('original_content', '')
+        proposed = data.get('proposed_content', '')
+        hunks = data.get('hunks', [])
+        summary = data.get('summary', '')
+
+        if not proposed:
+            return jsonify({'success': False, 'error': 'proposed_content required'}), 400
+
+        change = DocumentChange(
+            document_id=document_id,
+            original_content=original,
+            proposed_content=proposed,
+            hunks=json.dumps(hunks),
+            summary=summary,
+            status='pending',
+            author_id=user.id,
+            author_name=user.name,
+            company_id=getattr(user, 'company_id', None)
+        )
+        db.session.add(change)
+        db.session.commit()
+
+        return jsonify({
+            'success': True,
+            'change': change.to_dict(),
+            'message': 'Change set saved'
+        }), 201
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_create_document_change error: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-changes/<int:change_id>/accept', methods=['POST'])
+@cross_origin()
+@jwt_required
+def dm_accept_document_change(change_id):
+    """Accept a pending change — updates the document to the proposed content."""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        change = DocumentChange.query.get(change_id)
+        if not change:
+            return jsonify({'success': False, 'error': 'Change not found'}), 404
+
+        is_super_admin = check_super_admin()
+        if not is_super_admin and change.company_id and user.company_id != change.company_id:
+            return jsonify({'success': False, 'error': 'Access denied'}), 403
+
+        doc = Document.query.get(change.document_id)
+        if doc:
+            doc.content = change.proposed_content
+            doc.updated_by = user.id
+            doc.updated_at = datetime.utcnow()
+
+        change.status = 'accepted'
+        change.resolved_at = datetime.utcnow()
+        change.resolved_by = user.id
+        db.session.commit()
+
+        return jsonify({
+            'success': True,
+            'change': change.to_dict(),
+            'message': 'Change accepted'
+        })
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_accept_document_change error: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-changes/<int:change_id>/reject', methods=['POST'])
+@cross_origin()
+@jwt_required
+def dm_reject_document_change(change_id):
+    """Reject a pending change — keeps the document as-is."""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        change = DocumentChange.query.get(change_id)
+        if not change:
+            return jsonify({'success': False, 'error': 'Change not found'}), 404
+
+        is_super_admin = check_super_admin()
+        if not is_super_admin and change.company_id and user.company_id != change.company_id:
+            return jsonify({'success': False, 'error': 'Access denied'}), 403
+
+        change.status = 'rejected'
+        change.resolved_at = datetime.utcnow()
+        change.resolved_by = user.id
+        db.session.commit()
+
+        return jsonify({
+            'success': True,
+            'change': change.to_dict(),
+            'message': 'Change rejected'
+        })
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_reject_document_change error: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-changes/<int:change_id>', methods=['DELETE'])
+@cross_origin()
+@jwt_required
+def dm_delete_document_change(change_id):
+    """Delete a change set (only author or admin)."""
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        change = DocumentChange.query.get(change_id)
+        if not change:
+            return jsonify({'success': False, 'error': 'Change not found'}), 404
+
+        is_super_admin = check_super_admin()
+        is_author = change.author_id == user.id
+        if not (is_super_admin or is_author):
+            return jsonify({'success': False, 'error': 'Access denied'}), 403
+
+        db.session.delete(change)
+        db.session.commit()
+        return jsonify({'success': True, 'message': 'Change deleted'})
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"dm_delete_document_change error: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/documents/upload-image', methods=['POST'])
+@cross_origin()
+@jwt_required
+def upload_document_image():
+    try:
+        user = request.user
+        if 'image' not in request.files:
+            return jsonify({'success': False, 'error': 'No image'}), 400
+        file = request.files['image']
+        if not file.filename:
+            return jsonify({'success': False, 'error': 'Empty file'}), 400
+
+        import uuid
+        ext = os.path.splitext(file.filename)[1].lower() or '.png'
+        filename = f"img_{uuid.uuid4().hex}{ext}"
+        upload_dir = os.path.join(
+            current_app.config.get('UPLOAD_FOLDER', 'uploads'),
+            'documents', 'images'
+        )
+        os.makedirs(upload_dir, exist_ok=True)
+        file.save(os.path.join(upload_dir, filename))
+        url = f"/uploads/documents/images/{filename}"
+        return jsonify({'success': True, 'url': url})
+    except Exception as e:
+        current_app.logger.error(f"Image upload error: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/dm-documents/editor-drafts', methods=['GET'])
+@cross_origin()
+@jwt_required
+def dm_get_editor_drafts():
+    """
+    Get documents created/edited via the standalone sidebar editor.
+    Returns most recently updated sidebar drafts for the current user.
+    """
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        is_super_admin = check_super_admin()
+
+        limit = min(int(request.args.get('limit', 30)), 100)
+        offset = int(request.args.get('offset', 0))
+
+        q = Document.query.filter_by(editing_source='sidebar')
+        if not is_super_admin and getattr(user, 'company_id', None):
+            q = q.filter_by(company_id=user.company_id)
+        # Optionally scope to author for personal drafts:
+        author_scope = request.args.get('scope', 'mine')
+        if author_scope == 'mine':
+            q = q.filter_by(created_by=user.id)
+
+        total = q.count()
+        docs = (
+            q.order_by(Document.updated_at.desc())
+             .limit(limit).offset(offset).all()
+        )
+
+        # Try to use to_dict() if it exists; fall back to a minimal dict
+        result = []
+        for d in docs:
+            if hasattr(d, 'to_dict'):
+                result.append(d.to_dict())
+            else:
+                result.append({
+                    'id': d.id,
+                    'title': d.title,
+                    'description': d.description,
+                    'document_type': d.document_type,
+                    'module': d.module,
+                    'status': d.status,
+                    'version': d.version,
+                    'updated_at': d.updated_at.isoformat() if d.updated_at else None,
+                    'created_at': d.created_at.isoformat() if d.created_at else None,
+                    'company_id': d.company_id,
+                    'editing_source': getattr(d, 'editing_source', 'sidebar'),
+                })
+
+        return jsonify({
+            'success': True,
+            'documents': result,
+            'total': total,
+            'limit': limit,
+            'offset': offset
+        })
+    except Exception as e:
+        current_app.logger.error(f"dm_get_editor_drafts error: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
 # -- ERROR HANDLERS --
+
 
 @app.errorhandler(404)
 def not_found(error):
