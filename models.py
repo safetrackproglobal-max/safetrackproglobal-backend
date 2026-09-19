@@ -5736,6 +5736,70 @@ class EmergencyPreparedness(db.Model):
         }
 
 
+class DocumentChange(db.Model):
+    """Track Changes entries — pending or resolved diff hunks."""
+    __tablename__ = 'document_changes'
+
+    id = db.Column(db.Integer, primary_key=True)
+
+    document_id = db.Column(
+        db.Integer,
+        db.ForeignKey('documents.id', ondelete='CASCADE'),
+        nullable=False,
+        index=True
+    )
+
+    # The proposed content (full HTML snapshot for this change)
+    proposed_content = db.Column(db.Text, nullable=False)
+
+    # Original content at the moment the change was started
+    original_content = db.Column(db.Text, nullable=False)
+
+    # Human-readable summary: "3 insertions, 2 deletions"
+    summary = db.Column(db.String(255))
+
+    # JSON-encoded list of hunks: [{type: 'insert'|'delete'|'equal', value: '...'}, ...]
+    hunks = db.Column(db.Text, default='[]')
+
+    status = db.Column(db.String(20), default='pending', index=True)  # pending/accepted/rejected
+    resolved_at = db.Column(db.DateTime)
+    resolved_by = db.Column(db.Integer, db.ForeignKey('users.id'))
+
+    # Author info
+    author_id = db.Column(db.Integer, db.ForeignKey('users.id'), index=True)
+    author_name = db.Column(db.String(255))
+
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), index=True)
+
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+
+    # Relationships
+    author = db.relationship('User', foreign_keys=[author_id])
+    resolver = db.relationship('User', foreign_keys=[resolved_by])
+
+    def to_dict(self):
+        import json
+        try:
+            h = json.loads(self.hunks) if isinstance(self.hunks, str) else (self.hunks or [])
+        except Exception:
+            h = []
+        return {
+            'id': self.id,
+            'document_id': self.document_id,
+            'original_content': self.original_content,
+            'proposed_content': self.proposed_content,
+            'summary': self.summary,
+            'hunks': h,
+            'status': self.status,
+            'resolved_at': self.resolved_at.isoformat() if self.resolved_at else None,
+            'resolved_by': self.resolved_by,
+            'author_id': self.author_id,
+            'author_name': self.author_name or (self.author.name if self.author else None),
+            'company_id': self.company_id,
+            'created_at': self.created_at.isoformat() if self.created_at else None
+        }
+
+
 __all__ = [
     # Core models
     'Industry',
@@ -6081,6 +6145,7 @@ __all__ = [
     'MLPredictiveModel',
     'Prediction',
     'PredictiveAlert',
+    'DocumentChange',
 
     
 ]
