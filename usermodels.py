@@ -720,6 +720,7 @@ class Document(db.Model):
     # ============================================================
     user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False, index=True)
     analysis_result = db.Column(db.JSON, nullable=True, default=None)
+    
     # ============================================================
     # NEW DOCUMENT MANAGEMENT FIELDS
     # ============================================================
@@ -742,6 +743,13 @@ class Document(db.Model):
     
     # ✅ FIXED: Store tags as JSON string in TEXT column
     tags = db.Column(db.Text, default='[]')
+    
+    # ============================================================
+    # ✅ NEW: Editing Source — distinguishes where a doc came from
+    #   'regular' — normal upload or modal-edited document
+    #   'sidebar' — created/edited in standalone sidebar editor
+    # ============================================================
+    editing_source = db.Column(db.String(20), default='regular', index=True)
     
     is_confidential = db.Column(db.Boolean, default=False)
     requires_approval = db.Column(db.Boolean, default=True)
@@ -777,17 +785,14 @@ class Document(db.Model):
     # ============================================================
     # RELATIONSHIPS
     # ============================================================
-    # User relationships (backward compatibility)
     user = db.relationship('User', foreign_keys=[user_id], backref=db.backref('user_documents', lazy='dynamic'))
     
-    # New relationships
     creator = db.relationship('User', foreign_keys=[created_by], backref=db.backref('created_documents', lazy='dynamic'))
     updater = db.relationship('User', foreign_keys=[updated_by])
     reviewer = db.relationship('User', foreign_keys=[reviewed_by])
     approver = db.relationship('User', foreign_keys=[approved_by])
     company = db.relationship('Company', foreign_keys=[company_id], backref=db.backref('company_documents', lazy='dynamic'))
     
-    # Document Control System Relationships
     versions = db.relationship('DocumentVersion', foreign_keys='DocumentVersion.document_id', backref='doc_version', lazy='dynamic', cascade='all, delete-orphan')
     metadata_items = db.relationship('DocumentMetadata', foreign_keys='DocumentMetadata.document_id', backref='doc_metadata', lazy='dynamic', cascade='all, delete-orphan')
     comment_items = db.relationship('DocumentComment', foreign_keys='DocumentComment.document_id', backref='doc_comment', lazy='dynamic', cascade='all, delete-orphan')
@@ -807,19 +812,20 @@ class Document(db.Model):
         db.Index('idx_documents_created_at', 'created_at'),
         db.Index('idx_documents_status_company', 'status', 'company_id'),
         db.Index('idx_documents_type_company', 'document_type', 'company_id'),
+        # ✅ NEW: compound index for fast draft queries
+        db.Index('idx_documents_editing_source', 'editing_source', 'company_id'),
     )
     
     def to_dict(self):
         """Convert document to dictionary with proper type handling"""
         
-        # ✅ FIXED: Parse tags from JSON string properly
+        # Parse tags from JSON string
         try:
             if self.tags:
                 tags = json.loads(self.tags) if isinstance(self.tags, str) else self.tags
             else:
                 tags = []
         except (json.JSONDecodeError, TypeError):
-            # Fallback: if it's a comma-separated string
             if self.tags and isinstance(self.tags, str):
                 tags = [t.strip() for t in self.tags.split(',') if t.strip()]
             else:
@@ -827,7 +833,7 @@ class Document(db.Model):
         
         return {
             'id': self.id,
-            'user_id': self.user_id,  # Keep for backward compatibility
+            'user_id': self.user_id,
             'title': self.title,
             'description': self.description,
             'content': self.content,
@@ -844,7 +850,8 @@ class Document(db.Model):
             'file_size': self.file_size,
             'file_hash': self.file_hash,
             'mime_type': self.mime_type,
-            'tags': tags,  # ✅ Now properly parsed as a list
+            'tags': tags,
+            'editing_source': self.editing_source or 'regular',   # ✅ NEW
             'is_confidential': self.is_confidential,
             'requires_approval': self.requires_approval,
             'approval_workflow': self.approval_workflow,
@@ -882,11 +889,9 @@ class Document(db.Model):
             self.tags = json.dumps(tags_list)
         elif isinstance(tags_list, str):
             try:
-                # If it's already a JSON string, validate it
                 json.loads(tags_list)
                 self.tags = tags_list
             except json.JSONDecodeError:
-                # If it's a comma-separated string, convert to list
                 self.tags = json.dumps([t.strip() for t in tags_list.split(',') if t.strip()])
         else:
             self.tags = '[]'
