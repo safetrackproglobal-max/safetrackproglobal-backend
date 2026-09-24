@@ -12,7 +12,9 @@ RUN apt-get update && apt-get install -y \
     libgomp1 \
     libpq-dev \
     gcc \
-    pikepdf \
+    qpdf \
+    libqpdf-dev \
+    pkg-config \
     wget \
     curl \
     libpango-1.0-0 \
@@ -51,7 +53,6 @@ ENV PYTHONUNBUFFERED=1 \
 
 EXPOSE 8000
 
-# ✅ Clean CMD — single worker, preload, no debug wrapper
 CMD gunicorn app:app \
     --bind 0.0.0.0:${PORT:-8000} \
     --workers 1 \
