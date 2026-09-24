@@ -12,6 +12,7 @@ RUN apt-get update && apt-get install -y \
     libgomp1 \
     libpq-dev \
     gcc \
+    pikepdf \
     wget \
     curl \
     libpango-1.0-0 \
