@@ -12,7 +12,7 @@ aiosignal==1.4.0
 alembic==1.16.5
 annotated-types==0.7.0
 anyio==4.11.0
-pikepdf
+pikepdf==8.15.1
 astunparse==1.6.3
 async-timeout==4.0.3
 attrs==25.3.0
