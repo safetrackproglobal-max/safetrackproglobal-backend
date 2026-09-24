@@ -1677,6 +1677,7 @@ class NearMiss(db.Model):
     hospital = db.relationship('Hospital', backref=db.backref('near_misses', lazy=True))
 
 class SafetyObservation(db.Model):
+    """Safety observations - extended with company isolation and recognition."""
     __tablename__ = 'safety_observations'
     
     id = db.Column(db.Integer, primary_key=True)
@@ -1684,8 +1685,8 @@ class SafetyObservation(db.Model):
     observation_number = db.Column(db.String(64), unique=True, nullable=False, index=True)
     title = db.Column(db.String(255), nullable=False)
     description = db.Column(db.Text, nullable=False)
-    type = db.Column(db.String(100), nullable=False)  # safe_behavior, unsafe_condition, positive_observation
-    category = db.Column(db.String(100))  # ppe, procedures, equipment, housekeeping, etc.
+    type = db.Column(db.String(100), nullable=False)  # safe_behavior, unsafe_condition, positive_observation, at_risk_behavior, near_miss, good_practice, improvement, hazard
+    category = db.Column(db.String(100))
     location = db.Column(db.String(255))
     department = db.Column(db.String(100))
     hospital_id = db.Column(db.Integer, db.ForeignKey('hospitals.id'))
@@ -1694,14 +1695,84 @@ class SafetyObservation(db.Model):
     risk_level = db.Column(db.String(50))
     immediate_action = db.Column(db.Text)
     recommendation = db.Column(db.Text)
-    status = db.Column(db.String(50), default='open')  # open, in_progress, closed
+    status = db.Column(db.String(50), default='open')
     created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     
+    # ✅ NEW columns (add via ALTER TABLE)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), index=True)
+    observed_person = db.Column(db.String(255))
+    observed_person_id = db.Column(db.Integer, db.ForeignKey('users.id'))
+    positive_recognition = db.Column(db.Boolean, default=False)
+    points_awarded = db.Column(db.Integer, default=0)
+    photos = db.Column(db.Text, default='[]')
+    closed_at = db.Column(db.DateTime)
+    closed_by = db.Column(db.Integer, db.ForeignKey('users.id'))
+    
     # Relationships
     observer = db.relationship('User', foreign_keys=[observed_by])
+    reporter = db.relationship('User', foreign_keys=[user_id])  # the user who created it
     hospital = db.relationship('Hospital', backref=db.backref('safety_observations', lazy=True))
-
+    
+    def to_dict(self):
+        try:
+            photos_list = json.loads(self.photos) if isinstance(self.photos, str) else (self.photos or [])
+        except Exception:
+            photos_list = []
+        
+        return {
+            'id': self.id,
+            'observation_number': self.observation_number,
+            'title': self.title,
+            'description': self.description,
+            'status': self.status,
+            
+            # Type (with alias for frontend compatibility)
+            'type': self.type,
+            'observation_type': self.type,  # alias
+            
+            'category': self.category,
+            'risk_level': self.risk_level,
+            
+            # Actions
+            'immediate_action': self.immediate_action,
+            'corrective_action': self.immediate_action,  # alias
+            'recommendation': self.recommendation,
+            
+            # Location
+            'location': self.location,
+            'department': self.department,
+            'hospital_id': self.hospital_id,
+            
+            # People
+            'user_id': self.user_id,
+            'observed_by': self.observed_by,
+            'observer': {
+                'id': self.observer.id,
+                'name': self.observer.name,
+                'email': self.observer.email,
+            } if self.observer else None,
+            'observed_person': self.observed_person,
+            'observed_person_id': self.observed_person_id,
+            
+            # Recognition
+            'positive_recognition': self.positive_recognition,
+            'points_awarded': self.points_awarded,
+            
+            # Media
+            'photos': photos_list,
+            
+            # Ownership
+            'company_id': self.company_id,
+            
+            # Dates
+            'date_observed': self.date_observed.isoformat() if self.date_observed else None,
+            'observation_date': self.date_observed.isoformat() if self.date_observed else None,  # alias
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+            'closed_at': self.closed_at.isoformat() if self.closed_at else None,
+            'closed_by': self.closed_by,
+        }
 class BiohazardIncident(db.Model):
     __tablename__ = 'biohazard_incidents'
     
