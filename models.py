@@ -6364,77 +6364,106 @@ class IncidentAuditLog(db.Model):
 
 # ==================== SAFETY OBSERVATIONS ====================
 
+# models.py (or wherever your SafetyObservation model is defined)
+
 class SafetyObservation(db.Model):
-    """Proactive safety observations."""
+    """Safety observations - matches EXISTING table schema."""
     __tablename__ = 'safety_observations'
 
     id = db.Column(db.Integer, primary_key=True)
-    observation_number = db.Column(db.String(50), unique=True, index=True)
-    observation_type = db.Column(db.String(50), nullable=False, index=True)
-    category = db.Column(db.String(50), nullable=False)
     
-    title = db.Column(db.String(500), nullable=False)
+    # ✅ EXISTING columns (match your DB)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    observation_number = db.Column(db.String, nullable=False)
+    title = db.Column(db.String, nullable=False)
     description = db.Column(db.Text, nullable=False)
-    location = db.Column(db.String(500))
-    department = db.Column(db.String(255))
+    status = db.Column(db.String, default='open')
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, onupdate=datetime.utcnow)
+    observed_by = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    date_observed = db.Column(db.DateTime, nullable=False)
+    risk_level = db.Column(db.String)
+    immediate_action = db.Column(db.Text)
+    recommendation = db.Column(db.Text)
+    type = db.Column(db.String, nullable=False)
+    category = db.Column(db.String)
+    location = db.Column(db.String)
+    department = db.Column(db.String)
+    hospital_id = db.Column(db.Integer)
     
+    # ✅ NEW columns (added via ALTER TABLE)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), index=True)
     observed_person = db.Column(db.String(255))
     observed_person_id = db.Column(db.Integer, db.ForeignKey('users.id'))
-    
-    risk_level = db.Column(db.String(20), nullable=False)
-    corrective_action = db.Column(db.Text)
     positive_recognition = db.Column(db.Boolean, default=False)
     points_awarded = db.Column(db.Integer, default=0)
-    status = db.Column(db.String(30), default='open', index=True)
     photos = db.Column(db.Text, default='[]')
-    
-    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), nullable=False, index=True)
-    observer_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False, index=True)
-    observer_name = db.Column(db.String(255))
-    observer_email = db.Column(db.String(255))
-    
-    observation_date = db.Column(db.DateTime, nullable=False, index=True)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
-    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     closed_at = db.Column(db.DateTime)
     closed_by = db.Column(db.Integer, db.ForeignKey('users.id'))
     
+    # Relationships
+    observer = db.relationship('User', foreign_keys=[user_id])
+    observed_user = db.relationship('User', foreign_keys=[observed_by])
+    
     def to_dict(self):
         try:
-            photos = json.loads(self.photos) if isinstance(self.photos, str) else (self.photos or [])
+            photos_list = json.loads(self.photos) if isinstance(self.photos, str) else (self.photos or [])
         except Exception:
-            photos = []
+            photos_list = []
         
         return {
             'id': self.id,
             'observation_number': self.observation_number,
-            'observation_type': self.observation_type,
-            'category': self.category,
             'title': self.title,
             'description': self.description,
+            'status': self.status,
+            
+            # Type (with alias for frontend)
+            'type': self.type,
+            'observation_type': self.type,  # alias
+            
+            'category': self.category,
+            'risk_level': self.risk_level,
+            
+            # Actions
+            'immediate_action': self.immediate_action,
+            'corrective_action': self.immediate_action,  # alias
+            'recommendation': self.recommendation,
+            
+            # Location
             'location': self.location,
             'department': self.department,
+            'hospital_id': self.hospital_id,
+            
+            # People
+            'user_id': self.user_id,
+            'observed_by': self.observed_by,
+            'observer': {
+                'id': self.user_id,
+                'name': self.observer.name if self.observer else None,
+                'email': self.observer.email if self.observer else None,
+            } if self.observer else None,
             'observed_person': self.observed_person,
             'observed_person_id': self.observed_person_id,
-            'risk_level': self.risk_level,
-            'corrective_action': self.corrective_action,
+            
+            # Recognition
             'positive_recognition': self.positive_recognition,
             'points_awarded': self.points_awarded,
-            'status': self.status,
-            'photos': photos,
+            
+            # Media
+            'photos': photos_list,
+            
+            # Ownership
             'company_id': self.company_id,
-            'observer': {
-                'id': self.observer_id,
-                'name': self.observer_name,
-                'email': self.observer_email,
-            },
-            'observation_date': self.observation_date.isoformat() if self.observation_date else None,
+            
+            # Dates
+            'date_observed': self.date_observed.isoformat() if self.date_observed else None,
+            'observation_date': self.date_observed.isoformat() if self.date_observed else None,  # alias
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'updated_at': self.updated_at.isoformat() if self.updated_at else None,
             'closed_at': self.closed_at.isoformat() if self.closed_at else None,
             'closed_by': self.closed_by,
         }
-
 
 # ==================== LESSONS LEARNED ====================
 
