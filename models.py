@@ -2502,6 +2502,8 @@ class ImprovementInitiative(db.Model):
     department = db.relationship('Department')
     proposer = db.relationship('User', foreign_keys=[proposed_by])
 
+# models.py - Extend your EXISTING CorrectiveAction model
+
 class CorrectiveAction(db.Model):
     __tablename__ = 'corrective_actions'
     
@@ -2509,23 +2511,98 @@ class CorrectiveAction(db.Model):
     action_number = db.Column(db.String(64), unique=True, nullable=False, index=True)
     title = db.Column(db.String(255), nullable=False)
     description = db.Column(db.Text)
-    source_type = db.Column(db.String(100))  # incident, audit, inspection, risk_assessment
-    source_id = db.Column(db.Integer)  # ID of the source record
+    source_type = db.Column(db.String(100))
+    source_id = db.Column(db.Integer)
     department_id = db.Column(db.Integer, db.ForeignKey('departments.id'))
     assigned_to = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
     due_date = db.Column(db.DateTime, nullable=False)
     completion_date = db.Column(db.DateTime)
-    status = db.Column(db.String(50), default='open')  # open, in_progress, completed, overdue
-    effectiveness = db.Column(db.String(50))  # effective, partially_effective, not_effective
+    status = db.Column(db.String(50), default='open')
+    effectiveness = db.Column(db.String(50))
     verification_date = db.Column(db.DateTime)
     verified_by = db.Column(db.Integer, db.ForeignKey('users.id'))
     created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     
-    # Relationships
+    # ✅ NEW COLUMNS for advanced features
+    action_type = db.Column(db.String(50), default='corrective')  # immediate, corrective, preventive, improvement
+    priority = db.Column(db.String(20), default='medium')  # critical, high, medium, low
+    progress_percentage = db.Column(db.Integer, default=0)
+    fishbone_analysis_id = db.Column(db.Integer, db.ForeignKey('fishbone_analyses.id', ondelete='SET NULL'))
+    estimated_cost = db.Column(db.Numeric(15, 2))
+    actual_cost = db.Column(db.Numeric(15, 2))
+    notes = db.Column(db.Text)
+    attachments = db.Column(db.Text, default='[]')  # JSON
+    started_at = db.Column(db.DateTime)
+    verification_notes = db.Column(db.Text)
+    effectiveness_rating = db.Column(db.Integer)  # 1-5
+    created_by = db.Column(db.Integer, db.ForeignKey('users.id'))
+    created_by_name = db.Column(db.String(255))
+    updated_by = db.Column(db.Integer, db.ForeignKey('users.id'))
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), index=True)
+    
+    # Relationships (keep existing + add new)
     department = db.relationship('Department')
     assignee = db.relationship('User', foreign_keys=[assigned_to])
     verifier = db.relationship('User', foreign_keys=[verified_by])
+    creator = db.relationship('User', foreign_keys=[created_by])  # NEW
+    fishbone_analysis = db.relationship('FishboneAnalysis', foreign_keys=[fishbone_analysis_id])  # NEW
+    
+    def to_dict(self):
+        """Enhanced to_dict with new fields."""
+        try:
+            atts = json.loads(self.attachments) if isinstance(self.attachments, str) else (self.attachments or [])
+        except Exception:
+            atts = []
+        
+        return {
+            'id': self.id,
+            'action_number': self.action_number,
+            'title': self.title,
+            'description': self.description,
+            'source_type': self.source_type,
+            'source_id': self.source_id,
+            'department_id': self.department_id,
+            'department': {
+                'id': self.department.id,
+                'name': self.department.name
+            } if self.department else None,
+            'assigned_to': self.assigned_to,
+            'assignee': {
+                'id': self.assignee.id,
+                'name': self.assignee.name,
+                'email': self.assignee.email
+            } if self.assignee else None,
+            'due_date': self.due_date.isoformat() if self.due_date else None,
+            'completion_date': self.completion_date.isoformat() if self.completion_date else None,
+            'status': self.status,
+            'effectiveness': self.effectiveness,
+            'verification_date': self.verification_date.isoformat() if self.verification_date else None,
+            'verified_by': self.verified_by,
+            'verifier': {
+                'id': self.verifier.id,
+                'name': self.verifier.name
+            } if self.verifier else None,
+            
+            # ✅ New fields
+            'action_type': self.action_type,
+            'priority': self.priority,
+            'progress_percentage': self.progress_percentage,
+            'fishbone_analysis_id': self.fishbone_analysis_id,
+            'estimated_cost': float(self.estimated_cost) if self.estimated_cost else None,
+            'actual_cost': float(self.actual_cost) if self.actual_cost else None,
+            'notes': self.notes,
+            'attachments': atts,
+            'started_at': self.started_at.isoformat() if self.started_at else None,
+            'verification_notes': self.verification_notes,
+            'effectiveness_rating': self.effectiveness_rating,
+            'created_by': self.created_by,
+            'created_by_name': self.created_by_name,
+            'updated_by': self.updated_by,
+            'company_id': self.company_id,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+        }
 
 class LoginAttempt(db.Model):
     __tablename__ = 'login_attempts'
@@ -5799,6 +5876,969 @@ class DocumentChange(db.Model):
             'created_at': self.created_at.isoformat() if self.created_at else None
         }
 
+class RedactionLog(db.Model):
+    """Immutable audit trail for PDF redactions (compliance requirement)."""
+    __tablename__ = 'redaction_logs'
+
+    id = db.Column(db.Integer, primary_key=True)
+    document_id = db.Column(
+        db.Integer,
+        db.ForeignKey('documents.id', ondelete='CASCADE'),
+        nullable=False,
+        index=True
+    )
+
+    # Snapshot before redaction
+    before_file_url = db.Column(db.String(500))
+    before_file_hash = db.Column(db.String(255))
+    before_version = db.Column(db.Integer)
+
+    # After redaction
+    after_file_url = db.Column(db.String(500))
+    after_file_hash = db.Column(db.String(255))
+    after_version = db.Column(db.Integer)
+
+    # What was redacted
+    regions = db.Column(db.Text, default='[]')     # JSON: [{page, x, y, w, h, text_hash}]
+    region_count = db.Column(db.Integer, default=0)
+    pages_affected = db.Column(db.Text, default='[]')  # JSON array of page numbers
+
+    # Compliance metadata
+    certificate_number = db.Column(db.String(100), unique=True, index=True)
+    reason = db.Column(db.Text)                    # e.g. "GDPR Article 17 request"
+    legal_basis = db.Column(db.String(100))        # e.g. "privacy", "security", "court_order"
+    verified_no_leaks = db.Column(db.Boolean, default=False)
+    verification_result = db.Column(db.Text, default='{}')
+
+    # Who did it
+    redacted_by = db.Column(db.Integer, db.ForeignKey('users.id'), index=True)
+    redacted_by_name = db.Column(db.String(255))
+    redacted_by_email = db.Column(db.String(255))
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), index=True)
+
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+
+    redactor = db.relationship('User', foreign_keys=[redacted_by])
+
+    def to_dict(self):
+        import json
+        try:
+            regs = json.loads(self.regions) if isinstance(self.regions, str) else (self.regions or [])
+        except Exception:
+            regs = []
+        try:
+            pages = json.loads(self.pages_affected) if isinstance(self.pages_affected, str) else (self.pages_affected or [])
+        except Exception:
+            pages = []
+        try:
+            verif = json.loads(self.verification_result) if isinstance(self.verification_result, str) else (self.verification_result or {})
+        except Exception:
+            verif = {}
+        return {
+            'id': self.id,
+            'document_id': self.document_id,
+            'before_file_url': self.before_file_url,
+            'before_file_hash': self.before_file_hash,
+            'before_version': self.before_version,
+            'after_file_url': self.after_file_url,
+            'after_file_hash': self.after_file_hash,
+            'after_version': self.after_version,
+            'regions': regs,
+            'region_count': self.region_count,
+            'pages_affected': pages,
+            'certificate_number': self.certificate_number,
+            'reason': self.reason,
+            'legal_basis': self.legal_basis,
+            'verified_no_leaks': self.verified_no_leaks,
+            'verification_result': verif,
+            'redacted_by': self.redacted_by,
+            'redacted_by_name': self.redacted_by_name or (self.redactor.name if self.redactor else None),
+            'redacted_by_email': self.redacted_by_email,
+            'company_id': self.company_id,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+        }
+
+# models/safety_features.py - All new models
+from datetime import datetime
+from extensions import db
+import json
+import uuid
+
+
+# ==================== FISHBONE ANALYSIS ====================
+
+class FishboneAnalysis(db.Model):
+    """Fishbone (Ishikawa) diagram analysis for incident investigations."""
+    __tablename__ = 'fishbone_analyses'
+
+    id = db.Column(db.Integer, primary_key=True)
+    incident_id = db.Column(
+        db.Integer,
+        db.ForeignKey('incidents.id', ondelete='CASCADE'),
+        nullable=False,
+        index=True
+    )
+    problem_statement = db.Column(db.Text, nullable=False)
+    categories = db.Column(db.Text, default='[]')
+    
+    total_causes = db.Column(db.Integer, default=0)
+    root_causes_count = db.Column(db.Integer, default=0)
+    categories_used = db.Column(db.Integer, default=0)
+    
+    version = db.Column(db.Integer, default=1)
+    is_current = db.Column(db.Boolean, default=True, index=True)
+    
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), nullable=False, index=True)
+    created_by = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False, index=True)
+    created_by_name = db.Column(db.String(255))
+    created_by_email = db.Column(db.String(255))
+    
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    last_updated_by = db.Column(db.Integer, db.ForeignKey('users.id'))
+    
+    def to_dict(self):
+        try:
+            cats = json.loads(self.categories) if isinstance(self.categories, str) else (self.categories or [])
+        except Exception:
+            cats = []
+        return {
+            'id': self.id,
+            'incident_id': self.incident_id,
+            'problem_statement': self.problem_statement,
+            'categories': cats,
+            'total_causes': self.total_causes,
+            'root_causes_count': self.root_causes_count,
+            'categories_used': self.categories_used,
+            'version': self.version,
+            'is_current': self.is_current,
+            'company_id': self.company_id,
+            'created_by': self.created_by,
+            'created_by_name': self.created_by_name,
+            'created_by_email': self.created_by_email,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+            'last_updated_by': self.last_updated_by,
+        }
+
+
+# ==================== AI ANALYSIS ====================
+
+class AIAnalysis(db.Model):
+    """AI-generated analysis using pre-trained models."""
+    __tablename__ = 'ai_analyses'
+
+    id = db.Column(db.Integer, primary_key=True)
+    incident_id = db.Column(
+        db.Integer,
+        db.ForeignKey('incidents.id', ondelete='CASCADE'),
+        nullable=False,
+        index=True
+    )
+    analysis_type = db.Column(db.String(50), nullable=False, index=True)
+    
+    # Pre-trained model info
+    model_provider = db.Column(db.String(50))       # 'openai', 'anthropic', 'ollama', 'huggingface'
+    model_name = db.Column(db.String(100))          # 'gpt-4-turbo', 'claude-3-sonnet', etc.
+    model_version = db.Column(db.String(50))
+    
+    summary = db.Column(db.Text)
+    risk_score = db.Column(db.Integer)
+    confidence_score = db.Column(db.Integer)
+    trend_analysis = db.Column(db.String(50))
+    
+    risk_factors = db.Column(db.Text, default='[]')
+    investigation_questions = db.Column(db.Text, default='[]')
+    similar_patterns = db.Column(db.Text, default='[]')
+    suggested_actions = db.Column(db.Text, default='[]')
+    root_causes = db.Column(db.Text, default='[]')
+    insights = db.Column(db.Text, default='[]')
+    conversation = db.Column(db.Text, default='[]')
+    raw_response = db.Column(db.Text)
+    
+    prompt_tokens = db.Column(db.Integer, default=0)
+    completion_tokens = db.Column(db.Integer, default=0)
+    total_tokens = db.Column(db.Integer, default=0)
+    
+    processing_time_ms = db.Column(db.Integer)
+    is_fallback = db.Column(db.Boolean, default=False)
+    error_message = db.Column(db.Text)
+    
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), nullable=False, index=True)
+    requested_by = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False, index=True)
+    requested_by_name = db.Column(db.String(255))
+    
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    expires_at = db.Column(db.DateTime)
+    
+    def to_dict(self):
+        def safe_json(field, default=None):
+            if default is None:
+                default = []
+            try:
+                return json.loads(field) if isinstance(field, str) else (field or default)
+            except Exception:
+                return default
+        
+        return {
+            'id': self.id,
+            'incident_id': self.incident_id,
+            'analysis_type': self.analysis_type,
+            'model_info': {
+                'provider': self.model_provider,
+                'name': self.model_name,
+                'version': self.model_version,
+            },
+            'summary': self.summary,
+            'risk_score': self.risk_score,
+            'confidence_score': self.confidence_score,
+            'trend_analysis': self.trend_analysis,
+            'risk_factors': safe_json(self.risk_factors),
+            'investigation_questions': safe_json(self.investigation_questions),
+            'similar_patterns': safe_json(self.similar_patterns),
+            'suggested_actions': safe_json(self.suggested_actions),
+            'root_causes': safe_json(self.root_causes),
+            'insights': safe_json(self.insights),
+            'conversation': safe_json(self.conversation),
+            'token_usage': {
+                'prompt': self.prompt_tokens,
+                'completion': self.completion_tokens,
+                'total': self.total_tokens,
+            },
+            'processing_time_ms': self.processing_time_ms,
+            'is_fallback': self.is_fallback,
+            'error_message': self.error_message,
+            'company_id': self.company_id,
+            'requested_by': self.requested_by,
+            'requested_by_name': self.requested_by_name,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+# ==================== CORRECTIVE ACTIONS ====================
+
+
+
+class IncidentComment(db.Model):
+    """Comments and discussions on incidents."""
+    __tablename__ = 'incident_comments'
+
+    id = db.Column(db.Integer, primary_key=True)
+    incident_id = db.Column(
+        db.Integer,
+        db.ForeignKey('incidents.id', ondelete='CASCADE'),
+        nullable=False,
+        index=True
+    )
+    content = db.Column(db.Text, nullable=False)
+    comment_type = db.Column(db.String(30), default='comment')
+    is_internal = db.Column(db.Boolean, default=False)
+    mentions = db.Column(db.Text, default='[]')
+    attachments = db.Column(db.Text, default='[]')
+    parent_id = db.Column(db.Integer, db.ForeignKey('incident_comments.id', ondelete='CASCADE'))
+    replies_count = db.Column(db.Integer, default=0)
+    is_edited = db.Column(db.Boolean, default=False)
+    edited_at = db.Column(db.DateTime)
+    
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), nullable=False, index=True)
+    author_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False, index=True)
+    author_name = db.Column(db.String(255))
+    author_email = db.Column(db.String(255))
+    author_role = db.Column(db.String(50))
+    
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    deleted_at = db.Column(db.DateTime)
+    
+    def to_dict(self):
+        def safe_json(field, default=None):
+            if default is None:
+                default = []
+            try:
+                return json.loads(field) if isinstance(field, str) else (field or default)
+            except Exception:
+                return default
+        
+        return {
+            'id': self.id,
+            'incident_id': self.incident_id,
+            'content': self.content,
+            'comment_type': self.comment_type,
+            'is_internal': self.is_internal,
+            'mentions': safe_json(self.mentions),
+            'attachments': safe_json(self.attachments),
+            'parent_id': self.parent_id,
+            'replies_count': self.replies_count,
+            'is_edited': self.is_edited,
+            'edited_at': self.edited_at.isoformat() if self.edited_at else None,
+            'company_id': self.company_id,
+            'author': {
+                'id': self.author_id,
+                'name': self.author_name,
+                'email': self.author_email,
+                'role': self.author_role,
+            },
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+            'deleted_at': self.deleted_at.isoformat() if self.deleted_at else None,
+        }
+
+
+# ==================== WITNESS STATEMENTS ====================
+
+class WitnessStatement(db.Model):
+    """Witness statements for incident investigations."""
+    __tablename__ = 'witness_statements'
+
+    id = db.Column(db.Integer, primary_key=True)
+    statement_number = db.Column(db.String(50), unique=True, index=True)
+    incident_id = db.Column(
+        db.Integer,
+        db.ForeignKey('incidents.id', ondelete='CASCADE'),
+        nullable=False,
+        index=True
+    )
+    
+    witness_name = db.Column(db.String(255), nullable=False)
+    witness_type = db.Column(db.String(50), nullable=False)
+    witness_email = db.Column(db.String(255))
+    witness_phone = db.Column(db.String(50))
+    witness_department = db.Column(db.String(255))
+    witness_role = db.Column(db.String(100))
+    
+    statement_text = db.Column(db.Text, nullable=False)
+    witness_location = db.Column(db.String(500))
+    date_of_statement = db.Column(db.DateTime)
+    time_of_statement = db.Column(db.String(10))
+    statement_taken_by = db.Column(db.String(255))
+    witness_acknowledged = db.Column(db.Boolean, default=False)
+    witness_signature = db.Column(db.Text)
+    attachments = db.Column(db.Text, default='[]')
+    additional_notes = db.Column(db.Text)
+    
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), nullable=False, index=True)
+    recorded_by = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False, index=True)
+    recorded_by_name = db.Column(db.String(255))
+    
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    def to_dict(self):
+        try:
+            atts = json.loads(self.attachments) if isinstance(self.attachments, str) else (self.attachments or [])
+        except Exception:
+            atts = []
+        return {
+            'id': self.id,
+            'statement_number': self.statement_number,
+            'incident_id': self.incident_id,
+            'witness_name': self.witness_name,
+            'witness_type': self.witness_type,
+            'witness_email': self.witness_email,
+            'witness_phone': self.witness_phone,
+            'witness_department': self.witness_department,
+            'witness_role': self.witness_role,
+            'statement_text': self.statement_text,
+            'witness_location': self.witness_location,
+            'date_of_statement': self.date_of_statement.isoformat() if self.date_of_statement else None,
+            'time_of_statement': self.time_of_statement,
+            'statement_taken_by': self.statement_taken_by,
+            'witness_acknowledged': self.witness_acknowledged,
+            'witness_signature': self.witness_signature,
+            'attachments': atts,
+            'additional_notes': self.additional_notes,
+            'company_id': self.company_id,
+            'recorded_by': self.recorded_by,
+            'recorded_by_name': self.recorded_by_name,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+# ==================== INVESTIGATION TEAM ====================
+
+class InvestigationTeamMember(db.Model):
+    """Investigation team members assigned to incidents."""
+    __tablename__ = 'investigation_team_members'
+
+    id = db.Column(db.Integer, primary_key=True)
+    incident_id = db.Column(
+        db.Integer,
+        db.ForeignKey('incidents.id', ondelete='CASCADE'),
+        nullable=False,
+        index=True
+    )
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False, index=True)
+    user_name = db.Column(db.String(255))
+    user_email = db.Column(db.String(255))
+    role = db.Column(db.String(50), nullable=False)
+    responsibilities = db.Column(db.Text)
+    assigned_by = db.Column(db.Integer, db.ForeignKey('users.id'))
+    assigned_at = db.Column(db.DateTime, default=datetime.utcnow)
+    due_date = db.Column(db.DateTime, index=True)
+    status = db.Column(db.String(30), default='active')
+    notifications_sent = db.Column(db.Boolean, default=False)
+    
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), nullable=False, index=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'incident_id': self.incident_id,
+            'user_id': self.user_id,
+            'user_name': self.user_name,
+            'user_email': self.user_email,
+            'role': self.role,
+            'responsibilities': self.responsibilities,
+            'assigned_by': self.assigned_by,
+            'assigned_at': self.assigned_at.isoformat() if self.assigned_at else None,
+            'due_date': self.due_date.isoformat() if self.due_date else None,
+            'status': self.status,
+            'notifications_sent': self.notifications_sent,
+            'company_id': self.company_id,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+# ==================== AUDIT LOG ====================
+
+class IncidentAuditLog(db.Model):
+    """Complete audit trail for incident changes."""
+    __tablename__ = 'incident_audit_logs'
+
+    id = db.Column(db.Integer, primary_key=True)
+    incident_id = db.Column(
+        db.Integer,
+        db.ForeignKey('incidents.id', ondelete='CASCADE'),
+        nullable=False,
+        index=True
+    )
+    action = db.Column(db.String(50), nullable=False, index=True)
+    description = db.Column(db.Text)
+    changes = db.Column(db.Text, default='{}')
+    old_values = db.Column(db.Text, default='{}')
+    new_values = db.Column(db.Text, default='{}')
+    extra_data = db.Column(db.Text, default='{}')
+    
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), index=True)
+    user_name = db.Column(db.String(255))
+    user_email = db.Column(db.String(255))
+    user_role = db.Column(db.String(50))
+    ip_address = db.Column(db.String(45))
+    user_agent = db.Column(db.String(500))
+    
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), nullable=False, index=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    
+    def to_dict(self):
+        def safe_json(field, default=None):
+            if default is None:
+                default = {}
+            try:
+                return json.loads(field) if isinstance(field, str) else (field or default)
+            except Exception:
+                return default
+        
+        return {
+            'id': self.id,
+            'incident_id': self.incident_id,
+            'action': self.action,
+            'description': self.description,
+            'changes': safe_json(self.changes),
+            'old_values': safe_json(self.old_values),
+            'new_values': safe_json(self.new_values),
+            'extra_data': safe_json(self.extra_data),
+            'user_id': self.user_id,
+            'user_name': self.user_name,
+            'user_email': self.user_email,
+            'user_role': self.user_role,
+            'ip_address': self.ip_address,
+            'user_agent': self.user_agent,
+            'company_id': self.company_id,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+# ==================== SAFETY OBSERVATIONS ====================
+
+class SafetyObservation(db.Model):
+    """Proactive safety observations."""
+    __tablename__ = 'safety_observations'
+
+    id = db.Column(db.Integer, primary_key=True)
+    observation_number = db.Column(db.String(50), unique=True, index=True)
+    observation_type = db.Column(db.String(50), nullable=False, index=True)
+    category = db.Column(db.String(50), nullable=False)
+    
+    title = db.Column(db.String(500), nullable=False)
+    description = db.Column(db.Text, nullable=False)
+    location = db.Column(db.String(500))
+    department = db.Column(db.String(255))
+    
+    observed_person = db.Column(db.String(255))
+    observed_person_id = db.Column(db.Integer, db.ForeignKey('users.id'))
+    
+    risk_level = db.Column(db.String(20), nullable=False)
+    corrective_action = db.Column(db.Text)
+    positive_recognition = db.Column(db.Boolean, default=False)
+    points_awarded = db.Column(db.Integer, default=0)
+    status = db.Column(db.String(30), default='open', index=True)
+    photos = db.Column(db.Text, default='[]')
+    
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), nullable=False, index=True)
+    observer_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False, index=True)
+    observer_name = db.Column(db.String(255))
+    observer_email = db.Column(db.String(255))
+    
+    observation_date = db.Column(db.DateTime, nullable=False, index=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    closed_at = db.Column(db.DateTime)
+    closed_by = db.Column(db.Integer, db.ForeignKey('users.id'))
+    
+    def to_dict(self):
+        try:
+            photos = json.loads(self.photos) if isinstance(self.photos, str) else (self.photos or [])
+        except Exception:
+            photos = []
+        
+        return {
+            'id': self.id,
+            'observation_number': self.observation_number,
+            'observation_type': self.observation_type,
+            'category': self.category,
+            'title': self.title,
+            'description': self.description,
+            'location': self.location,
+            'department': self.department,
+            'observed_person': self.observed_person,
+            'observed_person_id': self.observed_person_id,
+            'risk_level': self.risk_level,
+            'corrective_action': self.corrective_action,
+            'positive_recognition': self.positive_recognition,
+            'points_awarded': self.points_awarded,
+            'status': self.status,
+            'photos': photos,
+            'company_id': self.company_id,
+            'observer': {
+                'id': self.observer_id,
+                'name': self.observer_name,
+                'email': self.observer_email,
+            },
+            'observation_date': self.observation_date.isoformat() if self.observation_date else None,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+            'closed_at': self.closed_at.isoformat() if self.closed_at else None,
+            'closed_by': self.closed_by,
+        }
+
+
+# ==================== LESSONS LEARNED ====================
+
+class LessonLearned(db.Model):
+    """Lessons learned knowledge base."""
+    __tablename__ = 'lessons_learned'
+
+    id = db.Column(db.Integer, primary_key=True)
+    title = db.Column(db.String(500), nullable=False)
+    summary = db.Column(db.Text, nullable=False)
+    category = db.Column(db.String(50), nullable=False, index=True)
+    severity = db.Column(db.String(20), nullable=False, index=True)
+    
+    source_incident_id = db.Column(db.Integer, db.ForeignKey('incidents.id', ondelete='SET NULL'))
+    source_incident_number = db.Column(db.String(50))
+    source_type = db.Column(db.String(50))
+    
+    tags = db.Column(db.Text, default='[]')
+    key_takeaways = db.Column(db.Text, default='[]')
+    recommendations = db.Column(db.Text, default='[]')
+    applicable_industries = db.Column(db.Text, default='[]')
+    
+    status = db.Column(db.String(30), default='draft', nullable=False, index=True)
+    
+    views = db.Column(db.Integer, default=0)
+    shares = db.Column(db.Integer, default=0)
+    reactions_helpful = db.Column(db.Integer, default=0)
+    reactions_insightful = db.Column(db.Integer, default=0)
+    reactions_not_relevant = db.Column(db.Integer, default=0)
+    
+    attachments = db.Column(db.Text, default='[]')
+    
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), nullable=False, index=True)
+    author_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False, index=True)
+    author_name = db.Column(db.String(255))
+    author_role = db.Column(db.String(100))
+    
+    published_at = db.Column(db.DateTime)
+    published_by = db.Column(db.Integer, db.ForeignKey('users.id'))
+    
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    def to_dict(self):
+        def safe_json(field, default=None):
+            if default is None:
+                default = []
+            try:
+                return json.loads(field) if isinstance(field, str) else (field or default)
+            except Exception:
+                return default
+        
+        return {
+            'id': self.id,
+            'title': self.title,
+            'summary': self.summary,
+            'category': self.category,
+            'severity': self.severity,
+            'source_incident_id': self.source_incident_id,
+            'source_incident_number': self.source_incident_number,
+            'source_type': self.source_type,
+            'tags': safe_json(self.tags),
+            'key_takeaways': safe_json(self.key_takeaways),
+            'recommendations': safe_json(self.recommendations),
+            'applicable_industries': safe_json(self.applicable_industries),
+            'status': self.status,
+            'views': self.views,
+            'shares': self.shares,
+            'reactions': {
+                'helpful': self.reactions_helpful,
+                'insightful': self.reactions_insightful,
+                'not_relevant': self.reactions_not_relevant,
+            },
+            'attachments': safe_json(self.attachments),
+            'company_id': self.company_id,
+            'author': {
+                'id': self.author_id,
+                'name': self.author_name,
+                'role': self.author_role,
+            },
+            'published_at': self.published_at.isoformat() if self.published_at else None,
+            'published_by': self.published_by,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+# ==================== LESSON REACTIONS ====================
+
+class LessonReaction(db.Model):
+    """User reactions to lessons learned."""
+    __tablename__ = 'lesson_reactions'
+
+    id = db.Column(db.Integer, primary_key=True)
+    lesson_id = db.Column(
+        db.Integer,
+        db.ForeignKey('lessons_learned.id', ondelete='CASCADE'),
+        nullable=False,
+        index=True
+    )
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False, index=True)
+    reaction_type = db.Column(db.String(30), nullable=False)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), nullable=False, index=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    
+    __table_args__ = (
+        db.UniqueConstraint('lesson_id', 'user_id', name='unique_user_lesson_reaction'),
+    )
+    
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'lesson_id': self.lesson_id,
+            'user_id': self.user_id,
+            'reaction_type': self.reaction_type,
+            'company_id': self.company_id,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+# ==================== ESCALATION RULES ====================
+
+class EscalationRule(db.Model):
+    """Escalation rules for automated incident escalation."""
+    __tablename__ = 'escalation_rules'
+
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(255), nullable=False)
+    description = db.Column(db.Text)
+    enabled = db.Column(db.Boolean, default=True, index=True)
+    priority = db.Column(db.Integer, default=3)
+    
+    conditions = db.Column(db.Text, default='{}')
+    actions = db.Column(db.Text, default='[]')
+    
+    triggered_count = db.Column(db.Integer, default=0)
+    last_triggered_at = db.Column(db.DateTime)
+    
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), nullable=False, index=True)
+    created_by = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    created_by_name = db.Column(db.String(255))
+    updated_by = db.Column(db.Integer, db.ForeignKey('users.id'))
+    
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    def to_dict(self):
+        def safe_json(field, default=None):
+            if default is None:
+                default = {}
+            try:
+                return json.loads(field) if isinstance(field, str) else (field or default)
+            except Exception:
+                return default
+        
+        return {
+            'id': self.id,
+            'name': self.name,
+            'description': self.description,
+            'enabled': self.enabled,
+            'priority': self.priority,
+            'conditions': safe_json(self.conditions),
+            'actions': safe_json(self.actions, []),
+            'triggered_count': self.triggered_count,
+            'last_triggered_at': self.last_triggered_at.isoformat() if self.last_triggered_at else None,
+            'company_id': self.company_id,
+            'created_by': self.created_by,
+            'created_by_name': self.created_by_name,
+            'updated_by': self.updated_by,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+# ==================== ESCALATION HISTORY ====================
+
+class EscalationHistory(db.Model):
+    """History of executed escalations."""
+    __tablename__ = 'escalation_history'
+
+    id = db.Column(db.Integer, primary_key=True)
+    incident_id = db.Column(
+        db.Integer,
+        db.ForeignKey('incidents.id', ondelete='CASCADE'),
+        nullable=False,
+        index=True
+    )
+    rule_id = db.Column(
+        db.Integer,
+        db.ForeignKey('escalation_rules.id', ondelete='SET NULL'),
+        index=True
+    )
+    rule_name = db.Column(db.String(255))
+    incident_number = db.Column(db.String(50))
+    actions_executed = db.Column(db.Text, default='[]')
+    status = db.Column(db.String(30), default='completed')
+    
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), nullable=False, index=True)
+    executed_by = db.Column(db.Integer, db.ForeignKey('users.id'))
+    executed_by_name = db.Column(db.String(255))
+    escalated_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    
+    def to_dict(self):
+        try:
+            actions = json.loads(self.actions_executed) if isinstance(self.actions_executed, str) else (self.actions_executed or [])
+        except Exception:
+            actions = []
+        return {
+            'id': self.id,
+            'incident_id': self.incident_id,
+            'rule_id': self.rule_id,
+            'rule_name': self.rule_name,
+            'incident_number': self.incident_number,
+            'actions_executed': actions,
+            'status': self.status,
+            'company_id': self.company_id,
+            'executed_by': self.executed_by,
+            'executed_by_name': self.executed_by_name,
+            'escalated_at': self.escalated_at.isoformat() if self.escalated_at else None,
+        }
+
+
+# ==================== COST ANALYSIS ====================
+
+class IncidentCost(db.Model):
+    """Cost tracking for incidents."""
+    __tablename__ = 'incident_costs'
+
+    id = db.Column(db.Integer, primary_key=True)
+    incident_id = db.Column(
+        db.Integer,
+        db.ForeignKey('incidents.id', ondelete='CASCADE'),
+        nullable=False,
+        unique=True,
+        index=True
+    )
+    
+    # Direct
+    medical_treatment = db.Column(db.Numeric(15, 2), default=0)
+    lost_time_wages = db.Column(db.Numeric(15, 2), default=0)
+    property_damage = db.Column(db.Numeric(15, 2), default=0)
+    equipment_damage = db.Column(db.Numeric(15, 2), default=0)
+    legal_fees = db.Column(db.Numeric(15, 2), default=0)
+    regulatory_fines = db.Column(db.Numeric(15, 2), default=0)
+    
+    # Indirect
+    investigation_costs = db.Column(db.Numeric(15, 2), default=0)
+    retraining_costs = db.Column(db.Numeric(15, 2), default=0)
+    lost_productivity = db.Column(db.Numeric(15, 2), default=0)
+    overtime_costs = db.Column(db.Numeric(15, 2), default=0)
+    replacement_labor = db.Column(db.Numeric(15, 2), default=0)
+    administrative = db.Column(db.Numeric(15, 2), default=0)
+    
+    # Hidden
+    morale_impact = db.Column(db.Numeric(15, 2), default=0)
+    reputation_damage = db.Column(db.Numeric(15, 2), default=0)
+    insurance_increase = db.Column(db.Numeric(15, 2), default=0)
+    customer_impact = db.Column(db.Numeric(15, 2), default=0)
+    recruitment_costs = db.Column(db.Numeric(15, 2), default=0)
+    
+    # Preventive
+    training_programs = db.Column(db.Numeric(15, 2), default=0)
+    equipment_upgrade = db.Column(db.Numeric(15, 2), default=0)
+    safety_audits = db.Column(db.Numeric(15, 2), default=0)
+    ppe_investment = db.Column(db.Numeric(15, 2), default=0)
+    consulting = db.Column(db.Numeric(15, 2), default=0)
+    
+    total_direct = db.Column(db.Numeric(15, 2), default=0)
+    total_indirect = db.Column(db.Numeric(15, 2), default=0)
+    total_hidden = db.Column(db.Numeric(15, 2), default=0)
+    total_preventive = db.Column(db.Numeric(15, 2), default=0)
+    total_cost = db.Column(db.Numeric(15, 2), default=0)
+    
+    currency = db.Column(db.String(10), default='USD')
+    
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), nullable=False, index=True)
+    updated_by = db.Column(db.Integer, db.ForeignKey('users.id'))
+    updated_by_name = db.Column(db.String(255))
+    
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'incident_id': self.incident_id,
+            'direct_costs': {
+                'medical_treatment': float(self.medical_treatment or 0),
+                'lost_time_wages': float(self.lost_time_wages or 0),
+                'property_damage': float(self.property_damage or 0),
+                'equipment_damage': float(self.equipment_damage or 0),
+                'legal_fees': float(self.legal_fees or 0),
+                'regulatory_fines': float(self.regulatory_fines or 0),
+            },
+            'indirect_costs': {
+                'investigation_costs': float(self.investigation_costs or 0),
+                'retraining_costs': float(self.retraining_costs or 0),
+                'lost_productivity': float(self.lost_productivity or 0),
+                'overtime_costs': float(self.overtime_costs or 0),
+                'replacement_labor': float(self.replacement_labor or 0),
+                'administrative': float(self.administrative or 0),
+            },
+            'hidden_costs': {
+                'morale_impact': float(self.morale_impact or 0),
+                'reputation_damage': float(self.reputation_damage or 0),
+                'insurance_increase': float(self.insurance_increase or 0),
+                'customer_impact': float(self.customer_impact or 0),
+                'recruitment_costs': float(self.recruitment_costs or 0),
+            },
+            'preventive_investment': {
+                'training_programs': float(self.training_programs or 0),
+                'equipment_upgrade': float(self.equipment_upgrade or 0),
+                'safety_audits': float(self.safety_audits or 0),
+                'ppe_investment': float(self.ppe_investment or 0),
+                'consulting': float(self.consulting or 0),
+            },
+            'totals': {
+                'direct': float(self.total_direct or 0),
+                'indirect': float(self.total_indirect or 0),
+                'hidden': float(self.total_hidden or 0),
+                'preventive': float(self.total_preventive or 0),
+                'total': float(self.total_cost or 0),
+            },
+            'currency': self.currency,
+            'company_id': self.company_id,
+            'updated_by': self.updated_by,
+            'updated_by_name': self.updated_by_name,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+# ==================== REGULATORY FILINGS ====================
+
+class RegulatoryFiling(db.Model):
+    """Regulatory report filings."""
+    __tablename__ = 'regulatory_filings'
+
+    id = db.Column(db.Integer, primary_key=True)
+    filing_number = db.Column(db.String(100), unique=True, index=True)
+    confirmation_number = db.Column(db.String(100), index=True)
+    agency = db.Column(db.String(50), nullable=False, index=True)
+    form_id = db.Column(db.String(50), nullable=False)
+    form_name = db.Column(db.String(255))
+    
+    incident_id = db.Column(
+        db.Integer,
+        db.ForeignKey('incidents.id', ondelete='SET NULL'),
+        index=True
+    )
+    incident_number = db.Column(db.String(50))
+    form_data = db.Column(db.Text, default='{}')
+    deadline = db.Column(db.DateTime, index=True)
+    is_overdue = db.Column(db.Boolean, default=False)
+    status = db.Column(db.String(30), default='draft', index=True)
+    
+    submitted_at = db.Column(db.DateTime)
+    submitted_by = db.Column(db.Integer, db.ForeignKey('users.id'))
+    submitted_by_name = db.Column(db.String(255))
+    response_data = db.Column(db.Text, default='{}')
+    rejection_reason = db.Column(db.Text)
+    attachments = db.Column(db.Text, default='[]')
+    
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), nullable=False, index=True)
+    generated_by = db.Column(db.Integer, db.ForeignKey('users.id'))
+    generated_by_name = db.Column(db.String(255))
+    
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    def to_dict(self):
+        def safe_json(field, default=None):
+            if default is None:
+                default = {}
+            try:
+                return json.loads(field) if isinstance(field, str) else (field or default)
+            except Exception:
+                return default
+        
+        return {
+            'id': self.id,
+            'filing_number': self.filing_number,
+            'confirmation_number': self.confirmation_number,
+            'agency': self.agency,
+            'form_id': self.form_id,
+            'form_name': self.form_name,
+            'incident_id': self.incident_id,
+            'incident_number': self.incident_number,
+            'form_data': safe_json(self.form_data),
+            'deadline': self.deadline.isoformat() if self.deadline else None,
+            'is_overdue': self.is_overdue,
+            'status': self.status,
+            'submitted_at': self.submitted_at.isoformat() if self.submitted_at else None,
+            'submitted_by': self.submitted_by,
+            'submitted_by_name': self.submitted_by_name,
+            'response_data': safe_json(self.response_data),
+            'rejection_reason': self.rejection_reason,
+            'attachments': safe_json(self.attachments, []),
+            'company_id': self.company_id,
+            'generated_by': self.generated_by,
+            'generated_by_name': self.generated_by_name,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+        }
 
 __all__ = [
     # Core models
@@ -6146,7 +7186,10 @@ __all__ = [
     'Prediction',
     'PredictiveAlert',
     'DocumentChange',
-
+    'FishboneAnalysis', 'AIAnalysis', 'IncidentComment',
+    'WitnessStatement', 'InvestigationTeamMember', 'IncidentAuditLog',
+    'SafetyObservation', 'LessonLearned', 'LessonReaction',
+    'EscalationRule', 'EscalationHistory', 'IncidentCost', 'RegulatoryFiling',
     
 ]
 
