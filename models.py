@@ -7217,7 +7217,7 @@ __all__ = [
     'DocumentChange',
     'FishboneAnalysis', 'AIAnalysis', 'IncidentComment',
     'WitnessStatement', 'InvestigationTeamMember', 'IncidentAuditLog',
-    'SafetyObservation', 'LessonLearned', 'LessonReaction',
+     'LessonLearned', 'LessonReaction',
     'EscalationRule', 'EscalationHistory', 'IncidentCost', 'RegulatoryFiling',
     
 ]
