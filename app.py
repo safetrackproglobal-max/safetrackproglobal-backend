@@ -139431,12 +139431,10 @@ def create_signature():
         current_user = request.user
         is_super_admin = check_super_admin()
         data = request.get_json()
-        
+
         from models import Document, DocumentSignature, SignatureVerification
-        import time
-        import random
-        
-        # Validate required fields
+
+        # ---- Validate document ----
         document_id = data.get('document_id')
         if not document_id:
             return jsonify({
@@ -139444,14 +139442,14 @@ def create_signature():
                 'error': 'Document ID is required',
                 'code': 'MISSING_DOCUMENT_ID'
             }), 400
-        
-        # Parse document ID
+
         try:
             doc_id_int = int(document_id)
             id_filter = Document.id == doc_id_int
-        except ValueError:
+        except (ValueError, TypeError):
+            import uuid as _uuid
             try:
-                doc_uuid = uuid.UUID(document_id)
+                doc_uuid = _uuid.UUID(str(document_id))
                 id_filter = Document.id == doc_uuid
             except ValueError:
                 return jsonify({
@@ -139459,8 +139457,7 @@ def create_signature():
                     'error': 'Invalid document ID format',
                     'code': 'INVALID_ID'
                 }), 400
-        
-        # Get document
+
         if is_super_admin:
             document = Document.query.filter(id_filter).first()
         else:
@@ -139475,15 +139472,15 @@ def create_signature():
                     id_filter,
                     Document.user_id == current_user.id
                 ).first()
-        
+
         if not document:
             return jsonify({
                 'success': False,
                 'error': 'Document not found',
                 'code': 'DOCUMENT_NOT_FOUND'
             }), 404
-        
-        # Validate signature data
+
+        # ---- Validate signature data ----
         signature_data = data.get('signature_data')
         if not signature_data:
             return jsonify({
@@ -139491,22 +139488,15 @@ def create_signature():
                 'error': 'Signature data is required',
                 'code': 'MISSING_SIGNATURE_DATA'
             }), 400
-        
-        # Get signature type
+
         signature_type = signature_data.get('type', 'draw')
-        
-        # Generate signature ID
-        sig_id = int(time.time() * 1000000) + random.randint(1, 999)
-        
-        # Get user info
         signer_name = current_user.name or current_user.email or 'Unknown'
         signer_email = current_user.email
-        
-        # Create signature - ✅ using your model fields
+
+        # ✅ CREATE SIGNATURE — let Postgres assign the id
         signature = DocumentSignature(
-            id=sig_id,
             document_id=document.id,
-            signed_by=current_user.id,  # ✅ Your model uses signed_by
+            signed_by=current_user.id,
             signer_name=signer_name,
             signer_email=signer_email,
             signer_ip=request.remote_addr,
@@ -139514,43 +139504,52 @@ def create_signature():
             signature_type=signature_type,
             signature_data=signature_data,
             comment=data.get('comment', ''),
-            status='signed',  # ✅ pending, signed, rejected, expired, revoked
+            status='signed',
             signed_at=datetime.utcnow(),
             created_at=datetime.utcnow()
         )
-        
+
         db.session.add(signature)
-        db.session.commit()
-        
-        # ✅ Create verification record
+        db.session.flush()  # ✅ assigns signature.id
+
+        # ✅ CREATE VERIFICATION — use the DB-assigned id
         verification = SignatureVerification(
-            signature_id=sig_id,
+            signature_id=signature.id,
             verified_by=current_user.id,
             verification_type='manual',
             status='valid',
-            details={'ip': request.remote_addr, 'user_agent': request.headers.get('User-Agent')}
+            details={
+                'ip': request.remote_addr,
+                'user_agent': request.headers.get('User-Agent'),
+            }
         )
         db.session.add(verification)
-        db.session.commit()
-        
-        # Update document status
+
+        # Update document status if it was a draft
         if document.status == 'draft':
             document.status = 'review'
             document.updated_at = datetime.utcnow()
-            db.session.commit()
-        
-        # Create audit log
-        create_audit_log(
-            document_id=document.id,
-            user_id=current_user.id,
-            action='sign',
-            details={'signature_id': sig_id, 'purpose': data.get('purpose')}
-        )
-        
+
+        db.session.commit()
+
+        # Audit log (outside transaction — non-critical)
+        try:
+            create_audit_log(
+                document_id=document.id,
+                user_id=current_user.id,
+                action='sign',
+                details={
+                    'signature_id': signature.id,
+                    'purpose': data.get('purpose')
+                }
+            )
+        except Exception:
+            pass
+
         return jsonify({
             'success': True,
             'message': 'Document signed successfully',
-            'signature_id': sig_id,
+            'signature_id': signature.id,
             'signature': signature.to_dict() if hasattr(signature, 'to_dict') else {
                 'id': signature.id,
                 'document_id': signature.document_id,
@@ -139558,14 +139557,11 @@ def create_signature():
                 'signed_at': signature.signed_at.isoformat() if signature.signed_at else None
             }
         }), 201
-        
+
     except Exception as e:
         db.session.rollback()
         current_app.logger.error(f"Error creating signature: {str(e)}", exc_info=True)
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 
 @app.route('/api/documents/signatures/<signature_id>/verify', methods=['GET'])
