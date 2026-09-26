@@ -142264,6 +142264,61 @@ def use_template(template_id):
             'error': str(e)
         }), 500
 
+
+@app.route('/api/documents/<int:document_id>/changes', methods=['GET'])
+@cross_origin()
+@jwt_required
+def get_document_changes(document_id):
+    """
+    Return track-changes records for a document.
+    Returns empty list gracefully if no DocumentChange model exists yet.
+    """
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+
+        doc = Document.query.get(document_id)
+        if not doc:
+            return jsonify({'success': False, 'error': 'Document not found'}), 404
+
+        is_super_admin = check_super_admin()
+        if not is_super_admin and doc.company_id and user.company_id != doc.company_id:
+            if doc.user_id != user.id:
+                return jsonify({'success': False, 'error': 'Access denied'}), 403
+
+        # Optional: if you have a DocumentChange model
+        try:
+            from models import DocumentChange
+            changes = (
+                DocumentChange.query
+                .filter_by(document_id=document_id)
+                .order_by(DocumentChange.created_at.desc())
+                .all()
+            )
+
+            return jsonify({
+                'success': True,
+                'changes': [c.to_dict() for c in changes],
+                'pendingChanges': [
+                    c.to_dict() for c in changes if c.status == 'pending'
+                ],
+                'currentHunks': [],
+                'hasUnsavedChange': False,
+            })
+        except ImportError:
+            # No DocumentChange model yet — return empty gracefully
+            return jsonify({
+                'success': True,
+                'changes': [],
+                'pendingChanges': [],
+                'currentHunks': [],
+                'hasUnsavedChange': False,
+            })
+
+    except Exception as e:
+        current_app.logger.error(f"get_document_changes error: {e}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
 # ============================================================
 # DOCUMENT PERMISSIONS ENDPOINT
 # ============================================================
