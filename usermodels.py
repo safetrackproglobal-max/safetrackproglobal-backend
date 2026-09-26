@@ -3072,7 +3072,7 @@ class ReviewHistory(db.Model):
 class DocumentSignature(db.Model):
     __tablename__ = 'document_signatures'
     
-    id = db.Column(db.Integer, primary_key=True)
+    id = db.Column(db.BigInteger, primary_key=True)   # ← was db.Integer
     document_id = db.Column(db.Integer, db.ForeignKey('documents.id', ondelete='CASCADE'), nullable=False, index=True)
     signed_by = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
     signer_email = db.Column(db.String(255))
