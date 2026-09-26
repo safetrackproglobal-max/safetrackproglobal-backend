@@ -186,7 +186,7 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 from flask import current_app
-
+import shutil
 try:
     from paystackapi.paystack import Paystack
     from paystackapi.transaction import Transaction
@@ -315,17 +315,19 @@ else:
 WEATHER_API_BASE = 'https://api.weatherapi.com/v1'
 # ===== 7. JWT MANAGER =====
 jwt_manager = None  # Define later when JWTManager is imported
-
+BASE_UPLOAD_DIR = os.environ.get('UPLOAD_BASE_DIR', 'uploads')
 # ===== 8. DIRECTORY PATHS =====
+
 # Base upload directories
-UPLOAD_FOLDER = 'uploads/incidents'
-TEMPLATE_FOLDER = 'uploads/templates'
-MODELS_DIR = 'ml_models'
-PROFILE_UPLOAD_FOLDER = 'uploads/profiles'
-SIGNATURE_UPLOAD_FOLDER = 'uploads/signatures'
+UPLOAD_FOLDER = os.path.join(BASE_UPLOAD_DIR, 'incidents')
+TEMPLATE_FOLDER = os.path.join(BASE_UPLOAD_DIR, 'templates')
+MODELS_DIR = os.path.join(BASE_UPLOAD_DIR, 'models')
+PROFILE_UPLOAD_FOLDER = os.path.join(BASE_UPLOAD_DIR, 'profiles')
+SIGNATURE_UPLOAD_FOLDER = os.path.join(BASE_UPLOAD_DIR, 'signatures')
+DOCUMENTS_UPLOAD_FOLDER = os.path.join(BASE_UPLOAD_DIR, 'documents')
 
 # Incident evidence upload settings
-INCIDENT_UPLOAD_FOLDER = 'uploads/incidents'
+INCIDENT_UPLOAD_FOLDER = os.path.join(BASE_UPLOAD_DIR, 'incidents')
 INCIDENT_ALLOWED_EXTENSIONS = {
     # Images
     'png', 'jpg', 'jpeg', 'gif', 'bmp', 'webp', 'svg',
@@ -349,28 +351,84 @@ PROFILE_MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
 SIGNATURE_ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'webp'}
 SIGNATURE_MAX_FILE_SIZE = 2 * 1024 * 1024  # 2MB
 
-# General upload settings (for backwards compatibility)
+# General upload settings
 ALLOWED_EXTENSIONS = INCIDENT_ALLOWED_EXTENSIONS
 MAX_FILE_SIZE = INCIDENT_MAX_FILE_SIZE
 
 # ==================== UPLOAD DIRECTORY STRUCTURE ====================
 
 UPLOAD_DIRS = {
-    'incidents': 'uploads/incidents',
-    'temp': 'uploads/temp',
-    'violations': 'uploads/violations',
-    'projects': 'uploads/projects',
-    'videos': 'uploads/videos',
-    'logos': 'uploads/logos',
-    'reports': 'uploads/reports',
-    'backups': 'uploads/backups',
-    'models': 'uploads/models',
-    'profiles': 'uploads/profiles',
-    'signatures': 'uploads/signatures',
-    'templates': 'uploads/templates'
+    'incidents': os.path.join(BASE_UPLOAD_DIR, 'incidents'),
+    'documents': os.path.join(BASE_UPLOAD_DIR, 'documents'),
+    'temp': os.path.join(BASE_UPLOAD_DIR, 'temp'),
+    'violations': os.path.join(BASE_UPLOAD_DIR, 'violations'),
+    'projects': os.path.join(BASE_UPLOAD_DIR, 'projects'),
+    'videos': os.path.join(BASE_UPLOAD_DIR, 'videos'),
+    'logos': os.path.join(BASE_UPLOAD_DIR, 'logos'),
+    'reports': os.path.join(BASE_UPLOAD_DIR, 'reports'),
+    'backups': os.path.join(BASE_UPLOAD_DIR, 'backups'),
+    'models': os.path.join(BASE_UPLOAD_DIR, 'models'),
+    'profiles': os.path.join(BASE_UPLOAD_DIR, 'profiles'),
+    'signatures': os.path.join(BASE_UPLOAD_DIR, 'signatures'),
+    'templates': os.path.join(BASE_UPLOAD_DIR, 'templates'),
 }
 
 # ==================== HELPER FUNCTIONS ====================
+
+import os
+import shutil
+
+
+# ============================================================
+# PERSISTENT UPLOADS BRIDGE
+# Symlink /app/uploads -> /app/data/uploads so the app's existing
+# relative paths still work, but files land on the persistent volume.
+# ============================================================
+def _setup_persistent_uploads():
+    volume_dir = '/app/data/uploads'      # where the Railway Volume lives
+    app_dir = '/app/uploads'              # where the app expects to write
+
+    # Local dev: /app/data doesn't exist — skip silently
+    if not os.path.exists('/app/data'):
+        print('ℹ️  /app/data not found (not on Railway) — using local uploads/')
+        return
+
+    os.makedirs(volume_dir, exist_ok=True)
+
+    # Case 1: doesn't exist → create symlink
+    if not os.path.exists(app_dir):
+        os.symlink(volume_dir, app_dir)
+        print(f'✅ Symlinked {app_dir} -> {volume_dir}')
+        return
+
+    # Case 2: already a symlink → verify target
+    if os.path.islink(app_dir):
+        if os.readlink(app_dir) == volume_dir:
+            print(f'✅ {app_dir} already symlinked to {volume_dir}')
+            return
+        os.unlink(app_dir)
+        os.symlink(volume_dir, app_dir)
+        print(f'✅ Fixed symlink: {app_dir} -> {volume_dir}')
+        return
+
+    # Case 3: real directory → migrate + symlink
+    print(f'⚠️  {app_dir} is a real directory — migrating to volume')
+    for item in os.listdir(app_dir):
+        src = os.path.join(app_dir, item)
+        dst = os.path.join(volume_dir, item)
+        if os.path.exists(dst):
+            continue
+        if os.path.isdir(src):
+            shutil.copytree(src, dst)
+        else:
+            shutil.copy2(src, dst)
+    shutil.rmtree(app_dir)
+    os.symlink(volume_dir, app_dir)
+    print(f'✅ Migrated and symlinked {app_dir} -> {volume_dir}')
+
+
+# Run before Flask app is created
+_setup_persistent_uploads()
 
 def allowed_file(filename, allowed_extensions=None):
     """
