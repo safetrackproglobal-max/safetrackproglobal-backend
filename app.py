@@ -149359,9 +149359,8 @@ def stamp_pdf(document_id):
     try:
         from io import BytesIO
         import uuid, hashlib, base64, re
-        from pdf_lib_placeholder import (   # see note below
-            PDFDocument, rgb, degrees
-        )
+        # ✅ REMOVED: from pdf_lib_placeholder import (PDFDocument, rgb, degrees)
+        #    That module doesn't exist. This route uses reportlab + pypdf instead.
 
         user = getattr(request, 'user', None)
         if not user:
@@ -149421,9 +149420,7 @@ def stamp_pdf(document_id):
             pass
 
         # 2. Load PDF and stamp
-        # NOTE: use the Python package "pypdf" AND "pillow" is not enough —
-        # the cleaner way is pypdf + reportlab, or pikepdf.
-        # We'll use reportlab for image overlay since it's simplest.
+        # Uses pypdf for page manipulation + reportlab for the image overlay.
         from reportlab.pdfgen import canvas as rl_canvas
         from reportlab.lib.utils import ImageReader
         from pypdf import PdfReader, PdfWriter
@@ -149511,7 +149508,6 @@ def stamp_pdf(document_id):
         db.session.rollback()
         current_app.logger.error(f"stamp_pdf error: {e}", exc_info=True)
         return jsonify({'success': False, 'error': str(e)}), 500
-
 # ============================================================
 # PDF PAGE OPERATIONS — shared helper
 # ============================================================
