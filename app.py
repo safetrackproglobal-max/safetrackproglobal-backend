@@ -6680,6 +6680,24 @@ def filter_by_company(query, model, user):
     # If user has no company, return empty query
     return query.filter(False)
 
+# ==================== HELPER FUNCTIONS ====================
+
+def get_company_id_for_user(user):
+    """Get company_id from user, with sensible fallback."""
+    if not user:
+        return None
+    
+    # Try direct attribute
+    company_id = getattr(user, 'company_id', None)
+    if company_id:
+        return company_id
+    
+    # Try nested company relationship
+    if hasattr(user, 'company') and user.company:
+        return user.company.id
+    
+    # Fallback for super admin / system team
+    return 1
 
 # Update your EnvironmentalModelManager class in app.py
 class EnvironmentalModelManager:
