@@ -6769,6 +6769,485 @@ class RegulatoryFiling(db.Model):
             'updated_at': self.updated_at.isoformat() if self.updated_at else None,
         }
 
+class FishboneVersion(db.Model):
+    """Immutable snapshot of a fishbone at a point in time."""
+    __tablename__ = 'fishbone_versions'
+
+    id = db.Column(db.Integer, primary_key=True)
+    analysis_id = db.Column(
+        db.Integer,
+        db.ForeignKey('fishbone_analyses.id', ondelete='CASCADE'),
+        nullable=False, index=True
+    )
+    incident_id = db.Column(
+        db.Integer,
+        db.ForeignKey('incidents.id', ondelete='CASCADE'),
+        nullable=False, index=True
+    )
+    version_number = db.Column(db.Integer, nullable=False)
+
+    problem_statement = db.Column(db.Text, nullable=False)
+    categories = db.Column(db.Text, default='[]')
+    summary = db.Column(db.Text)                    # JSON string
+    ai_metadata = db.Column(db.Text)                # JSON string
+    stats = db.Column(db.Text, default='{}')        # JSON string
+
+    ai_model = db.Column(db.String(100))
+    ai_key_index = db.Column(db.Integer)
+
+    is_current = db.Column(db.Boolean, default=False, index=True)
+
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), nullable=False, index=True)
+    created_by = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False, index=True)
+    created_by_name = db.Column(db.String(255))
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+
+    def to_dict(self):
+        def safe_json(f, d=None):
+            d = [] if d is None else d
+            try:
+                return json.loads(f) if isinstance(f, str) else (f or d)
+            except Exception:
+                return d
+        return {
+            'id': self.id,
+            'analysis_id': self.analysis_id,
+            'incident_id': self.incident_id,
+            'version_number': self.version_number,
+            'problem_statement': self.problem_statement,
+            'categories': safe_json(self.categories),
+            'summary': safe_json(self.summary, {}),
+            'ai_metadata': safe_json(self.ai_metadata, {}),
+            'stats': safe_json(self.stats, {}),
+            'ai_model': self.ai_model,
+            'ai_key_index': self.ai_key_index,
+            'is_current': self.is_current,
+            'company_id': self.company_id,
+            'created_by': self.created_by,
+            'created_by_name': self.created_by_name,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+        }
+
+    __table_args__ = (
+        db.Index('idx_fishbone_ver_analysis', 'analysis_id'),
+        db.Index('idx_fishbone_ver_incident', 'incident_id'),
+        db.Index('idx_fishbone_ver_current', 'is_current'),
+        db.UniqueConstraint('analysis_id', 'version_number', name='uq_fishbone_version'),
+    )
+
+class FishboneFiveWhys(db.Model):
+    """5-Why analysis attached to a single cause within a fishbone."""
+    __tablename__ = 'fishbone_five_whys'
+
+    id = db.Column(db.Integer, primary_key=True)
+    incident_id = db.Column(
+        db.Integer,
+        db.ForeignKey('incidents.id', ondelete='CASCADE'),
+        nullable=False, index=True
+    )
+    cause_id = db.Column(db.String(100), nullable=False, index=True)
+    category_id = db.Column(db.String(100))
+    cause_description = db.Column(db.Text)
+
+    whys = db.Column(db.Text, default='[]')                 # JSON string
+    root_cause = db.Column(db.Text)
+    verification_question = db.Column(db.Text)
+    ai_metadata = db.Column(db.Text)                        # JSON string
+
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), nullable=False, index=True)
+    created_by = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False, index=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    def to_dict(self):
+        def safe_json(f, d=None):
+            d = [] if d is None else d
+            try:
+                return json.loads(f) if isinstance(f, str) else (f or d)
+            except Exception:
+                return d
+        return {
+            'id': self.id,
+            'incident_id': self.incident_id,
+            'cause_id': self.cause_id,
+            'category_id': self.category_id,
+            'cause_description': self.cause_description,
+            'whys': safe_json(self.whys),
+            'root_cause': self.root_cause,
+            'verification_question': self.verification_question,
+            'ai_metadata': safe_json(self.ai_metadata, {}),
+            'company_id': self.company_id,
+            'created_by': self.created_by,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+    __table_args__ = (
+        db.Index('idx_five_whys_incident', 'incident_id'),
+        db.Index('idx_five_whys_cause', 'cause_id'),
+    )
+
+class SimilarIncidentMatch(db.Model):
+    """Persisted similarity results for a source incident."""
+    __tablename__ = 'similar_incident_matches'
+
+    id = db.Column(db.Integer, primary_key=True)
+    source_incident_id = db.Column(
+        db.Integer,
+        db.ForeignKey('incidents.id', ondelete='CASCADE'),
+        nullable=False, index=True
+    )
+    matched_incident_id = db.Column(
+        db.Integer,
+        db.ForeignKey('incidents.id', ondelete='CASCADE'),
+        nullable=False, index=True
+    )
+
+    similarity_score = db.Column(db.Float, nullable=False)
+    method = db.Column(db.String(30), default='semantic')       # semantic | token_jaccard
+    matched_fields = db.Column(db.Text, default='[]')            # JSON string
+    semantic_reason = db.Column(db.Text)
+
+    threshold_used = db.Column(db.Integer)
+    match_field_used = db.Column(db.String(30), default='all')
+
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), nullable=False, index=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+
+    def to_dict(self):
+        def safe_json(f, d=None):
+            d = [] if d is None else d
+            try:
+                return json.loads(f) if isinstance(f, str) else (f or d)
+            except Exception:
+                return d
+        return {
+            'id': self.id,
+            'source_incident_id': self.source_incident_id,
+            'matched_incident_id': self.matched_incident_id,
+            'similarity_score': self.similarity_score,
+            'method': self.method,
+            'matched_fields': safe_json(self.matched_fields),
+            'semantic_reason': self.semantic_reason,
+            'threshold_used': self.threshold_used,
+            'match_field_used': self.match_field_used,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+        }
+
+    __table_args__ = (
+        db.Index('idx_sim_source', 'source_incident_id'),
+        db.Index('idx_sim_matched', 'matched_incident_id'),
+        db.UniqueConstraint('source_incident_id', 'matched_incident_id', name='uq_similar_pair'),
+    )
+
+
+class IncidentClusterAnalysis(db.Model):
+    """AI-written cluster narrative across similar incidents."""
+    __tablename__ = 'incident_cluster_analyses'
+
+    id = db.Column(db.Integer, primary_key=True)
+    source_incident_id = db.Column(
+        db.Integer,
+        db.ForeignKey('incidents.id', ondelete='CASCADE'),
+        nullable=False, index=True
+    )
+    similar_incident_ids = db.Column(db.Text, default='[]')      # JSON string
+
+    title = db.Column(db.String(255))
+    summary = db.Column(db.Text)
+    clusters = db.Column(db.Text, default='[]')                  # JSON string
+    common_themes = db.Column(db.Text, default='[]')             # JSON string
+    differentiators = db.Column(db.Text)
+    preventive_actions = db.Column(db.Text, default='[]')        # JSON string
+
+    confidence = db.Column(db.String(20))
+    ai_metadata = db.Column(db.Text)                             # JSON string
+
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), nullable=False, index=True)
+    created_by = db.Column(db.Integer, db.ForeignKey('users.id'), index=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+
+    def to_dict(self):
+        def safe_json(f, d=None):
+            d = [] if d is None else d
+            try:
+                return json.loads(f) if isinstance(f, str) else (f or d)
+            except Exception:
+                return d
+        return {
+            'id': self.id,
+            'source_incident_id': self.source_incident_id,
+            'similar_incident_ids': safe_json(self.similar_incident_ids),
+            'title': self.title,
+            'summary': self.summary,
+            'clusters': safe_json(self.clusters),
+            'common_themes': safe_json(self.common_themes),
+            'differentiators': self.differentiators,
+            'preventive_actions': safe_json(self.preventive_actions),
+            'confidence': self.confidence,
+            'ai_metadata': safe_json(self.ai_metadata, {}),
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+        }
+
+    __table_args__ = (
+        db.Index('idx_cluster_source', 'source_incident_id'),
+        db.Index('idx_cluster_created', 'created_at'),
+    )
+
+
+class IncidentComparison(db.Model):
+    """AI comparison between two incidents."""
+    __tablename__ = 'incident_comparisons'
+
+    id = db.Column(db.Integer, primary_key=True)
+    incident_a_id = db.Column(
+        db.Integer,
+        db.ForeignKey('incidents.id', ondelete='CASCADE'),
+        nullable=False, index=True
+    )
+    incident_b_id = db.Column(
+        db.Integer,
+        db.ForeignKey('incidents.id', ondelete='CASCADE'),
+        nullable=False, index=True
+    )
+
+    summary = db.Column(db.Text)
+    similarities = db.Column(db.Text, default='[]')             # JSON string
+    differences = db.Column(db.Text, default='[]')              # JSON string
+    root_cause_hypothesis = db.Column(db.Text)
+    lessons = db.Column(db.Text, default='[]')                  # JSON string
+    ai_metadata = db.Column(db.Text)
+
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), nullable=False, index=True)
+    created_by = db.Column(db.Integer, db.ForeignKey('users.id'), index=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+
+    def to_dict(self):
+        def safe_json(f, d=None):
+            d = [] if d is None else d
+            try:
+                return json.loads(f) if isinstance(f, str) else (f or d)
+            except Exception:
+                return d
+        return {
+            'id': self.id,
+            'incident_a_id': self.incident_a_id,
+            'incident_b_id': self.incident_b_id,
+            'summary': self.summary,
+            'similarities': safe_json(self.similarities),
+            'differences': safe_json(self.differences),
+            'root_cause_hypothesis': self.root_cause_hypothesis,
+            'lessons': safe_json(self.lessons),
+            'ai_metadata': safe_json(self.ai_metadata, {}),
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+        }
+
+    __table_args__ = (
+        db.Index('idx_comparison_a', 'incident_a_id'),
+        db.Index('idx_comparison_b', 'incident_b_id'),
+    )
+
+class PredictiveAnalyticsRun(db.Model):
+    """One row per prediction request from the dashboard."""
+    __tablename__ = 'predictive_analytics_runs'
+
+    id = db.Column(db.Integer, primary_key=True)
+
+    industry = db.Column(db.String(50), index=True)
+    severity = db.Column(db.String(30))
+    date_from = db.Column(db.Date)
+    date_to = db.Column(db.Date)
+
+    method_requested = db.Column(db.String(50))
+    model_preference = db.Column(db.String(50), default='auto')
+    model_used = db.Column(db.String(100))
+    key_index = db.Column(db.Integer)
+    is_fallback = db.Column(db.Boolean, default=False, index=True)
+
+    forecast_period = db.Column(db.Integer)
+    confidence_level = db.Column(db.Integer)
+
+    historical = db.Column(db.Text, default='{}')                # JSON string
+    forecast = db.Column(db.Text, default='{}')                  # JSON string
+
+    risk_score = db.Column(db.Integer)
+    trend = db.Column(db.String(20))
+    trend_percentage = db.Column(db.Float)
+    average_monthly = db.Column(db.Float)
+    predicted_total = db.Column(db.Integer)
+    model_accuracy = db.Column(db.Float)
+
+    insights = db.Column(db.Text, default='[]')
+    risk_factors = db.Column(db.Text, default='[]')
+    narrative = db.Column(db.Text)                               # JSON string
+    model_recommendation = db.Column(db.Text)                    # JSON string
+    anomalies = db.Column(db.Text, default='[]')
+    ai_metadata = db.Column(db.Text)
+
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), nullable=False, index=True)
+    created_by = db.Column(db.Integer, db.ForeignKey('users.id'), index=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+
+    def to_dict(self):
+        def safe_json(f, d=None):
+            d = [] if d is None else d
+            try:
+                return json.loads(f) if isinstance(f, str) else (f or d)
+            except Exception:
+                return d
+        return {
+            'id': self.id,
+            'industry': self.industry,
+            'severity': self.severity,
+            'date_from': self.date_from.isoformat() if self.date_from else None,
+            'date_to': self.date_to.isoformat() if self.date_to else None,
+            'method_requested': self.method_requested,
+            'model_preference': self.model_preference,
+            'model_used': self.model_used,
+            'is_fallback': self.is_fallback,
+            'forecast_period': self.forecast_period,
+            'confidence_level': self.confidence_level,
+            'historical': safe_json(self.historical, {}),
+            'forecast': safe_json(self.forecast, {}),
+            'risk_score': self.risk_score,
+            'trend': self.trend,
+            'trend_percentage': self.trend_percentage,
+            'average_monthly': self.average_monthly,
+            'predicted_total': self.predicted_total,
+            'model_accuracy': self.model_accuracy,
+            'insights': safe_json(self.insights),
+            'risk_factors': safe_json(self.risk_factors),
+            'narrative': safe_json(self.narrative, {}),
+            'model_recommendation': safe_json(self.model_recommendation, {}),
+            'anomalies': safe_json(self.anomalies),
+            'ai_metadata': safe_json(self.ai_metadata, {}),
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+        }
+
+    __table_args__ = (
+        db.Index('idx_pred_industry', 'industry'),
+        db.Index('idx_pred_created', 'created_at'),
+    )
+
+
+class PredictiveScenario(db.Model):
+    """A 'what-if' scenario tied to a prediction run."""
+    __tablename__ = 'predictive_scenarios'
+
+    id = db.Column(db.Integer, primary_key=True)
+    run_id = db.Column(db.Integer, db.ForeignKey('predictive_analytics_runs.id', ondelete='CASCADE'), index=True)
+    incident_id = db.Column(db.Integer, db.ForeignKey('incidents.id', ondelete='SET NULL'), index=True)
+
+    scenario_text = db.Column(db.Text, nullable=False)
+    summary = db.Column(db.Text)
+    predicted_change = db.Column(db.Float)
+    risks = db.Column(db.Text, default='[]')                     # JSON string
+    recommendations = db.Column(db.Text, default='[]')
+    ai_metadata = db.Column(db.Text)
+
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), nullable=False, index=True)
+    created_by = db.Column(db.Integer, db.ForeignKey('users.id'), index=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+
+    def to_dict(self):
+        def safe_json(f, d=None):
+            d = [] if d is None else d
+            try:
+                return json.loads(f) if isinstance(f, str) else (f or d)
+            except Exception:
+                return d
+        return {
+            'id': self.id,
+            'run_id': self.run_id,
+            'incident_id': self.incident_id,
+            'scenario_text': self.scenario_text,
+            'summary': self.summary,
+            'predicted_change': self.predicted_change,
+            'risks': safe_json(self.risks),
+            'recommendations': safe_json(self.recommendations),
+            'ai_metadata': safe_json(self.ai_metadata, {}),
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+        }
+
+    __table_args__ = (
+        db.Index('idx_pred_scenario_run', 'run_id'),
+    )
+
+
+class AIGenerationLog(db.Model):
+    """Audit log of every AI call: which model, which key, how long, which feature."""
+    __tablename__ = 'ai_generation_logs'
+
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False, index=True)
+    incident_id = db.Column(db.Integer, db.ForeignKey('incidents.id', ondelete='SET NULL'), index=True)
+
+    feature = db.Column(db.String(80), nullable=False, index=True)
+    # fishbone_full | fishbone_expand | fishbone_actions | fishbone_five_whys
+    # analysis_full | analysis_chat | analysis_report
+    # similar_search | similar_cluster | similar_compare | similar_preventive
+    # predictive_full | predictive_scenario | predictive_anomalies | predictive_narrative
+
+    sub_feature = db.Column(db.String(80))
+    model_preference = db.Column(db.String(50), default='auto')
+    model_used = db.Column(db.String(100))
+    key_index = db.Column(db.Integer)
+
+    prompt_tokens = db.Column(db.Integer)
+    completion_tokens = db.Column(db.Integer)
+    total_tokens = db.Column(db.Integer)
+
+    duration_ms = db.Column(db.Integer)
+    temperature = db.Column(db.Float)
+    depth = db.Column(db.String(30))
+    language = db.Column(db.String(30))
+
+    success = db.Column(db.Boolean, default=True, index=True)
+    error_message = db.Column(db.Text)
+    retry_count = db.Column(db.Integer, default=0)
+
+    extra = db.Column(db.Text, default='{}')                     # JSON string
+
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), nullable=False, index=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+
+    def to_dict(self):
+        def safe_json(f, d=None):
+            d = {} if d is None else d
+            try:
+                return json.loads(f) if isinstance(f, str) else (f or d)
+            except Exception:
+                return d
+        return {
+            'id': self.id,
+            'user_id': self.user_id,
+            'incident_id': self.incident_id,
+            'feature': self.feature,
+            'sub_feature': self.sub_feature,
+            'model_info': {
+                'preference': self.model_preference,
+                'name': self.model_used,
+                'key_index': self.key_index,
+            },
+            'token_usage': {
+                'prompt': self.prompt_tokens,
+                'completion': self.completion_tokens,
+                'total': self.total_tokens,
+            },
+            'duration_ms': self.duration_ms,
+            'success': self.success,
+            'error_message': self.error_message,
+            'extra': safe_json(self.extra),
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+        }
+
+    __table_args__ = (
+        db.Index('idx_ai_log_user', 'user_id'),
+        db.Index('idx_ai_log_incident', 'incident_id'),
+        db.Index('idx_ai_log_feature', 'feature'),
+        db.Index('idx_ai_log_created', 'created_at'),
+    )
+
 __all__ = [
     # Core models
     'Industry',
@@ -7118,7 +7597,8 @@ __all__ = [
     'FishboneAnalysis', 'AIAnalysis', 'IncidentComment',
     'WitnessStatement', 'InvestigationTeamMember', 'IncidentAuditLog',
      'LessonLearned', 'LessonReaction',
-    'EscalationRule', 'EscalationHistory', 'IncidentCost', 'RegulatoryFiling',
+    'EscalationRule', 'EscalationHistory', 'IncidentCost', 'RegulatoryFiling', 'FishboneVersion', 'FishboneFiveWhys', 
+    'SimilarIncidentMatch', 'IncidentComparison', 'IncidentClusterAnalysis', 'PredictiveAnalyticsRun', 'PredictiveScenario', 'AIGenerationLog', 
     
 ]
 
