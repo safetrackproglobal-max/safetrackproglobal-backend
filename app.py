@@ -185,6 +185,7 @@ import json
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
+import google.generativeai as genai
 from flask import current_app
 import shutil
 try:
@@ -235,6 +236,264 @@ except:
         locale.setlocale(locale.LC_ALL, 'C.UTF-8')
     except:
         pass
+
+GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+    current_app.logger.info("✅ Gemini AI configured successfully")
+else:
+    current_app.logger.warning("⚠️ GEMINI_API_KEY not set — AI features disabled")
+
+try:
+    import google.generativeai as genai
+    from google.api_core import exceptions as google_exceptions
+    GEMINI_AVAILABLE = True
+except ImportError:
+    GEMINI_AVAILABLE = False
+    current_app.logger.warning("google-generativeai not installed — AI features disabled") if current_app else None
+
+
+# ---------- KEY POOL ----------
+# Reads GEMINI_API_KEY_1 .. GEMINI_API_KEY_15 from environment
+class GeminiKeyPool:
+    def __init__(self):
+        self.keys = []
+        for i in range(1, 16):
+            k = os.environ.get(f'GEMINI_API_KEY_{i}')
+            if k and k.strip():
+                self.keys.append(k.strip())
+        # Fallback single key
+        if not self.keys:
+            k = os.environ.get('GEMINI_API_KEY')
+            if k and k.strip():
+                self.keys.append(k.strip())
+
+        self.current_index = 0
+        self.rate_limited = {}       # key -> reset_timestamp
+        self.daily_usage = {}        # key -> {'date': 'YYYY-MM-DD', 'count': N}
+
+    def available(self):
+        return GEMINI_AVAILABLE and len(self.keys) > 0
+
+    def _today(self):
+        return datetime.utcnow().strftime('%Y-%m-%d')
+
+    def _reset_if_new_day(self, key):
+        today = self._today()
+        if key not in self.daily_usage or self.daily_usage[key]['date'] != today:
+            self.daily_usage[key] = {'date': today, 'count': 0}
+
+    def get_key(self):
+        """Return (key, index) of next usable key, or raise."""
+        if not self.keys:
+            raise RuntimeError('No Gemini API keys configured')
+
+        now = time.time()
+        n = len(self.keys)
+
+        for offset in range(n):
+            idx = (self.current_index + offset) % n
+            key = self.keys[idx]
+
+            # Rate-limited?
+            reset_at = self.rate_limited.get(key, 0)
+            if reset_at > now:
+                continue
+
+            # Daily cap (Gemini free tier ≈ 1500/day; leave buffer)
+            self._reset_if_new_day(key)
+            if self.daily_usage[key]['count'] >= 1400:
+                continue
+
+            self.current_index = idx
+            return key, idx
+
+        raise RuntimeError('All Gemini API keys exhausted or rate-limited')
+
+    def record_use(self, key):
+        self._reset_if_new_day(key)
+        self.daily_usage[key]['count'] += 1
+
+    def mark_rate_limited(self, key, seconds=60):
+        self.rate_limited[key] = time.time() + seconds
+
+    def status(self):
+        now = time.time()
+        today = self._today()
+        avail = 0
+        rows = []
+        for i, key in enumerate(self.keys):
+            rl = self.rate_limited.get(key, 0) > now
+            self._reset_if_new_day(key)
+            used = self.daily_usage[key]['count']
+            if not rl and used < 1400:
+                avail += 1
+            rows.append({
+                'index': i + 1,
+                'preview': f"{key[:8]}...{key[-4:]}",
+                'rate_limited': rl,
+                'used_today': used,
+            })
+        return {
+            'available': GEMINI_AVAILABLE and len(self.keys) > 0 and avail > 0,
+            'totalKeys': len(self.keys),
+            'availableKeys': avail,
+            'keys': rows,
+            'models': ['gemini-1.5-flash', 'gemini-1.5-pro']
+        }
+
+
+key_pool = GeminiKeyPool()
+
+
+# ---------- ENVELOPE ----------
+def ai_envelope(analysis, model_info=None, usage=None, extra=None):
+    """Standard response wrapper every AI endpoint returns."""
+    payload = {
+        'success': True,
+        'analysis': analysis,
+        'model_info': model_info or {'name': 'unknown', 'provider': 'google'},
+        'usage': usage or {'prompt_tokens': 0, 'completion_tokens': 0, 'total_tokens': 0},
+        'generated_at': datetime.utcnow().isoformat() + 'Z',
+    }
+    if extra:
+        payload.update(extra)
+    return payload
+
+
+# ---------- GEMINI CALL ----------
+RCA_SYSTEM_INSTRUCTION = (
+    "You are a world-class Root Cause Analysis specialist with 25+ years of "
+    "experience across healthcare, construction, oil & gas, manufacturing, "
+    "aviation, chemical, and mining. You apply ISO 45001, OSHA, TapRooT, "
+    "Apollo RCA, 5-Why, Swiss Cheese model, and Hierarchy of Controls. "
+    "You are specific, evidence-based, and use industry terminology. "
+    "Always return valid JSON. Never include markdown code fences."
+)
+
+
+def _clean_json(text):
+    """Strip markdown fences if the model included them."""
+    t = text.strip()
+    if t.startswith('```'):
+        # Remove first line (```json or ```)
+        lines = t.split('\n', 1)
+        if len(lines) > 1:
+            t = lines[1]
+        t = t.rsplit('```', 1)[0].strip()
+    return t
+
+
+def call_gemini(prompt,
+                system_instruction=None,
+                json_mode=True,
+                temperature=0.7,
+                max_tokens=8192,
+                model_name=None):
+    """Call Gemini with key rotation. Returns (parsed_body, model_info, usage, duration_ms)."""
+    if not key_pool.available():
+        raise RuntimeError('AI service unavailable — no Gemini keys configured')
+
+    pref = model_name or 'gemini-1.5-flash'
+    start = time.time()
+    last_err = None
+
+    for attempt in range(3):
+        key, key_idx = key_pool.get_key()
+        try:
+            genai.configure(api_key=key)
+            model = genai.GenerativeModel(
+                model_name=pref,
+                system_instruction=system_instruction or RCA_SYSTEM_INSTRUCTION
+            )
+
+            cfg = {
+                'temperature': temperature,
+                'max_output_tokens': max_tokens,
+                'top_p': 0.95,
+                'top_k': 40,
+            }
+            if json_mode:
+                cfg['response_mime_type'] = 'application/json'
+
+            resp = model.generate_content(prompt, generation_config=cfg)
+            key_pool.record_use(key)
+
+            text = resp.text or ''
+            usage = {
+                'prompt_tokens': getattr(resp.usage_metadata, 'prompt_token_count', 0),
+                'completion_tokens': getattr(resp.usage_metadata, 'candidates_token_count', 0),
+                'total_tokens': getattr(resp.usage_metadata, 'total_token_count', 0),
+            }
+            duration = int((time.time() - start) * 1000)
+
+            if json_mode:
+                parsed = json.loads(_clean_json(text))
+            else:
+                parsed = text
+
+            model_info = {
+                'name': pref,
+                'provider': 'google',
+                'key_index': key_idx + 1,
+            }
+            return parsed, model_info, usage, duration
+
+        except google_exceptions.ResourceExhausted:
+            key_pool.mark_rate_limited(key, 60)
+            last_err = 'rate_limited'
+            continue
+        except json.JSONDecodeError as e:
+            last_err = f'Invalid JSON from AI: {e}'
+            continue
+        except Exception as e:
+            last_err = str(e)
+            if 'quota' in last_err.lower() or 'rate' in last_err.lower():
+                key_pool.mark_rate_limited(key, 60)
+                continue
+            # Other error — retry once then bail
+            if attempt >= 1:
+                break
+
+    raise RuntimeError(last_err or 'Gemini call failed')
+
+
+# ---------- LOG HELPER ----------
+def log_ai_call(feature, incident_id=None, sub_feature=None,
+                model_info=None, usage=None, duration_ms=None,
+                success=True, error_message=None, extra=None,
+                current_user=None, company_id=None,
+                temperature=None, depth=None, language=None):
+    """Best-effort insert into ai_generation_logs. Never raises."""
+    try:
+        log = AIGenerationLog(
+            user_id=current_user.id if current_user else None,
+            incident_id=incident_id,
+            feature=feature,
+            sub_feature=sub_feature,
+            model_preference=extra.get('model_preference') if extra else None,
+            model_used=model_info.get('name') if model_info else None,
+            key_index=model_info.get('key_index') if model_info else None,
+            prompt_tokens=usage.get('prompt_tokens') if usage else None,
+            completion_tokens=usage.get('completion_tokens') if usage else None,
+            total_tokens=usage.get('total_tokens') if usage else None,
+            duration_ms=duration_ms,
+            temperature=temperature,
+            depth=depth,
+            language=language,
+            success=success,
+            error_message=error_message,
+            extra=json.dumps(extra or {}),
+            company_id=company_id,
+        )
+        db.session.add(log)
+        db.session.commit()
+    except Exception as e:
+        db.session.rollback()
+        try:
+            current_app.logger.warning(f"log_ai_call failed: {e}")
+        except Exception:
+            pass
 
 # ===== 5. CONFIGURE LOGGING ONCE =====
 class SafeStreamHandler(logging.StreamHandler):
@@ -27475,9 +27734,7 @@ def has_document_feature_access(user, feature_name):
     return feature_name in available_features
 
 
-# ============================================================================
-# GET DOCUMENTS - FULLY UPDATED
-# ============================================================================
+
 
 @app.route('/api/documents', methods=['GET'])
 @jwt_required
@@ -43187,12 +43444,6 @@ def fishbone_versions(incident_id):
             'error': 'Failed to fetch versions',
             'code': 'INTERNAL_ERROR'
         }), 500
-
-
-# =============================================================================
-# CORRECTIVE ACTIONS ENDPOINTS
-# =============================================================================
-
 
 
 # =============================================================================
@@ -150887,6 +151138,1638 @@ def apply_pdf_text_edits(document_id):
         db.session.rollback()
         current_app.logger.error(f"apply_pdf_text_edits error: {e}", exc_info=True)
         return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/ai/status', methods=['GET', 'OPTIONS'])
+@jwt_required
+def ai_status():
+    """Report AI availability (used to enable/disable AI buttons in the UI)."""
+    if request.method == 'OPTIONS':
+        return jsonify({'status': 'ok'}), 200
+    return jsonify(key_pool.status()), 200
+
+# =============================================================================
+# FISHBONE AI
+# =============================================================================
+
+@app.route('/api/incidents/<int:incident_id>/fishbone/ai-generate',
+           methods=['POST', 'OPTIONS'])
+@jwt_required
+def fishbone_ai_generate(incident_id):
+    """AI-generate a full fishbone analysis."""
+    if request.method == 'OPTIONS':
+        return jsonify({'status': 'ok'}), 200
+
+    try:
+        current_user = request.user
+        incident, error, code = check_incident_access(incident_id, current_user)
+        if error:
+            return jsonify(error), code
+
+        data = request.get_json() or {}
+        ai_opts = data.get('ai_options') or {}
+        industry = data.get('industry', 'general')
+        depth = ai_opts.get('depth', 'comprehensive')
+        language = ai_opts.get('language', 'English')
+        model_pref = ai_opts.get('model_preference', 'auto')
+        temperature = float(ai_opts.get('temperature', 0.7))
+        focus_areas = data.get('focusAreas') or []
+
+        depth_cfg = {
+            'quick':         {'causes': 3, 'qs': False, 'acts': False},
+            'standard':      {'causes': 5, 'qs': True,  'acts': True},
+            'comprehensive': {'causes': 7, 'qs': True,  'acts': True},
+        }.get(depth, {'causes': 5, 'qs': True, 'acts': True})
+
+        cats_instruction = (
+            "Choose the 6-8 MOST RELEVANT categories for a " + industry +
+            " incident. For general: Man, Machine, Method, Material, Measurement, "
+            "Environment, Management, Communication. For healthcare: Patient, Staff, "
+            "Protocols, Medical Equipment, Communication, Medication, Environment, "
+            "Management. For construction: Worker, Equipment, Method, Materials, Site, "
+            "Management, Contractor, Design. For oil & gas: Personnel, Equipment, "
+            "Process, Chemicals, Environment, Management, Barriers, Maintenance."
+        )
+
+        prompt = f"""Analyze this incident and return a comprehensive Fishbone (Ishikawa) analysis in {language}.
+
+INCIDENT
+Title: {incident.title or ''}
+Description: {incident.description or ''}
+Industry: {industry}
+Category: {getattr(incident, 'type', None) or 'N/A'}
+Severity: {getattr(incident, 'severity', None) or 'N/A'}
+Date: {incident.date_occurred.isoformat() if getattr(incident, 'date_occurred', None) else 'N/A'}
+Location: {getattr(incident, 'location', None) or 'N/A'}
+{('Focus areas: ' + ', '.join(focus_areas)) if focus_areas else ''}
+
+REQUIREMENTS
+1. Problem statement — one sentence, max 25 words.
+2. Categories: {cats_instruction}
+   Assign a single-emoji icon and a distinct hex color to each.
+3. Causes — {depth_cfg['causes']}+ per category. Each cause must include:
+   - description (specific, observable, 5-20 words)
+   - likelihood: high | medium | low
+   - isRootCause: true only if systemic/underlying
+   - evidence: what evidence would confirm it
+   {('- correctiveAction + controlLevel: elimination|substitution|engineering|administrative|ppe') if depth_cfg['acts'] else ''}
+   {('- investigationQuestion: one probing question') if depth_cfg['qs'] else ''}
+4. Summary object with: primaryRootCause, contributingFactors (3-5),
+   immediateActions (3-5), confidenceLevel (high|medium|low), confidenceReasoning.
+5. Methodology: {{ frameworksApplied: [...] }}
+
+Return ONLY this JSON (no markdown):
+{{
+  "problemStatement": "...",
+  "categories": [
+    {{ "id":"slug","name":"...","icon":"emoji","color":"#hex","description":"...",
+       "causes":[ {{ "id":"c1","description":"...","likelihood":"medium","isRootCause":false,
+                     "evidence":"..."{',"correctiveAction":"...","controlLevel":"administrative"' if depth_cfg['acts'] else ''}{',"investigationQuestion":"..."' if depth_cfg['qs'] else ''} }} ] }}
+  ],
+  "summary": {{ "primaryRootCause":"...","contributingFactors":["..."],"immediateActions":["..."],
+                "confidenceLevel":"medium","confidenceReasoning":"..." }},
+  "methodology": {{ "frameworksApplied":["5-Why","Fishbone"] }}
+}}"""
+
+        try:
+            result, model_info, usage, dur = call_gemini(
+                prompt,
+                temperature=temperature,
+                max_tokens=8192 if depth == 'comprehensive' else 4096,
+            )
+        except Exception as ai_err:
+            log_ai_call('fishbone_full', incident_id=incident_id,
+                        success=False, error_message=str(ai_err),
+                        current_user=current_user,
+                        company_id=get_company_id_for_user(current_user))
+            return jsonify({
+                'success': False,
+                'error': 'AI generation failed',
+                'details': str(ai_err) if current_app.debug else None,
+                'code': 'AI_UNAVAILABLE'
+            }), 503
+
+        log_ai_call('fishbone_full', incident_id=incident_id,
+                    model_info=model_info, usage=usage, duration_ms=dur,
+                    current_user=current_user,
+                    company_id=get_company_id_for_user(current_user),
+                    temperature=temperature, depth=depth, language=language,
+                    extra={'industry': industry, 'focusAreas': focus_areas})
+
+        return jsonify(ai_envelope(result, model_info, usage)), 200
+
+    except Exception as e:
+        current_app.logger.error(f"fishbone_ai_generate error: {e}")
+        return jsonify({'success': False, 'error': 'Server error', 'code': 'INTERNAL_ERROR'}), 500
+
+
+@app.route('/api/incidents/<int:incident_id>/fishbone/ai-expand-category',
+           methods=['POST', 'OPTIONS'])
+@jwt_required
+def fishbone_ai_expand_category(incident_id):
+    """Add more causes to an existing category."""
+    if request.method == 'OPTIONS':
+        return jsonify({'status': 'ok'}), 200
+
+    try:
+        current_user = request.user
+        incident, error, code = check_incident_access(incident_id, current_user)
+        if error:
+            return jsonify(error), code
+
+        data = request.get_json() or {}
+        cat = data.get('category') or {}
+        existing = data.get('existingCauses') or []
+        count = int(data.get('count', 5))
+        ai_opts = data.get('ai_options') or {}
+
+        if not cat.get('name'):
+            return jsonify({'success': False, 'error': 'category.name required', 'code': 'MISSING_CATEGORY'}), 400
+
+        existing_lines = '\n'.join([f"- {c.get('description', '')}" for c in existing]) or '(none)'
+
+        prompt = f"""Incident: {incident.title}
+{incident.description or ''}
+
+Category: {cat.get('name')} — {cat.get('description') or ''}
+
+Existing causes (DO NOT duplicate):
+{existing_lines}
+
+Generate {count} NEW causes for this category.
+Return JSON:
+{{ "causes":[ {{"description":"...","likelihood":"high|medium|low","isRootCause":false,
+                "evidence":"...","correctiveAction":"...","controlLevel":"administrative",
+                "investigationQuestion":"..." }} ] }}"""
+
+        try:
+            result, model_info, usage, dur = call_gemini(
+                prompt,
+                temperature=float(ai_opts.get('temperature', 0.7)),
+                max_tokens=4096,
+            )
+        except Exception as ai_err:
+            log_ai_call('fishbone_expand', incident_id=incident_id, success=False,
+                        error_message=str(ai_err), current_user=current_user,
+                        company_id=get_company_id_for_user(current_user))
+            return jsonify({'success': False, 'error': 'AI failed', 'code': 'AI_UNAVAILABLE'}), 503
+
+        # Normalize: give each cause an id
+        causes = result.get('causes') or []
+        for i, c in enumerate(causes):
+            c.setdefault('id', f"c_{int(time.time()*1000)}_{i}")
+
+        log_ai_call('fishbone_expand', incident_id=incident_id,
+                    model_info=model_info, usage=usage, duration_ms=dur,
+                    current_user=current_user,
+                    company_id=get_company_id_for_user(current_user),
+                    extra={'category': cat.get('name')})
+
+        return jsonify(ai_envelope({'causes': causes}, model_info, usage)), 200
+
+    except Exception as e:
+        current_app.logger.error(f"fishbone_ai_expand_category error: {e}")
+        return jsonify({'success': False, 'error': 'Server error', 'code': 'INTERNAL_ERROR'}), 500
+
+
+@app.route('/api/incidents/<int:incident_id>/fishbone/ai-suggest-actions',
+           methods=['POST', 'OPTIONS'])
+@jwt_required
+def fishbone_ai_suggest_actions(incident_id):
+    """Suggest corrective actions for one cause using Hierarchy of Controls."""
+    if request.method == 'OPTIONS':
+        return jsonify({'status': 'ok'}), 200
+
+    try:
+        current_user = request.user
+        incident, error, code = check_incident_access(incident_id, current_user)
+        if error:
+            return jsonify(error), code
+
+        data = request.get_json() or {}
+        cat = data.get('category') or {}
+        cause = data.get('cause') or {}
+        ai_opts = data.get('ai_options') or {}
+
+        if not cause.get('description'):
+            return jsonify({'success': False, 'error': 'cause.description required', 'code': 'MISSING_CAUSE'}), 400
+
+        prompt = f"""Incident: {incident.title}
+{incident.description or ''}
+
+Category: {cat.get('name')}
+Cause: {cause.get('description')}
+
+Provide 4 ranked corrective actions using the Hierarchy of Controls.
+Return JSON:
+{{ "actions":[
+  {{ "description":"...","controlLevel":"elimination|substitution|engineering|administrative|ppe",
+     "effort":"low|medium|high","impact":"low|medium|high","timeline":"immediate|short-term|long-term" }}
+] }}"""
+
+        try:
+            result, model_info, usage, dur = call_gemini(
+                prompt, temperature=float(ai_opts.get('temperature', 0.7)),
+                max_tokens=2048,
+            )
+        except Exception as ai_err:
+            log_ai_call('fishbone_actions', incident_id=incident_id, success=False,
+                        error_message=str(ai_err), current_user=current_user,
+                        company_id=get_company_id_for_user(current_user))
+            return jsonify({'success': False, 'error': 'AI failed', 'code': 'AI_UNAVAILABLE'}), 503
+
+        log_ai_call('fishbone_actions', incident_id=incident_id,
+                    model_info=model_info, usage=usage, duration_ms=dur,
+                    current_user=current_user,
+                    company_id=get_company_id_for_user(current_user),
+                    extra={'cause_id': cause.get('id')})
+
+        return jsonify(ai_envelope(result, model_info, usage)), 200
+
+    except Exception as e:
+        current_app.logger.error(f"fishbone_ai_suggest_actions error: {e}")
+        return jsonify({'success': False, 'error': 'Server error', 'code': 'INTERNAL_ERROR'}), 500
+
+
+@app.route('/api/incidents/<int:incident_id>/fishbone/ai-five-whys',
+           methods=['POST', 'OPTIONS'])
+@jwt_required
+def fishbone_ai_five_whys(incident_id):
+    """Run 5-Why analysis on a single cause."""
+    if request.method == 'OPTIONS':
+        return jsonify({'status': 'ok'}), 200
+
+    try:
+        current_user = request.user
+        incident, error, code = check_incident_access(incident_id, current_user)
+        if error:
+            return jsonify(error), code
+
+        data = request.get_json() or {}
+        cause = data.get('cause') or {}
+        ai_opts = data.get('ai_options') or {}
+
+        if not cause.get('description'):
+            return jsonify({'success': False, 'error': 'cause.description required', 'code': 'MISSING_CAUSE'}), 400
+
+        prompt = f"""Perform a 5-Why analysis.
+
+Incident: {incident.title}
+{incident.description or ''}
+Starting problem: {cause.get('description')}
+
+Return JSON:
+{{
+  "whys": [
+    {{"level":1,"question":"Why did X happen?","answer":"Because Y"}},
+    ... up to level 5
+  ],
+  "rootCause": "...",
+  "verificationQuestion": "..."
+}}"""
+
+        try:
+            result, model_info, usage, dur = call_gemini(
+                prompt, temperature=float(ai_opts.get('temperature', 0.7)),
+                max_tokens=2048,
+            )
+        except Exception as ai_err:
+            log_ai_call('fishbone_five_whys', incident_id=incident_id, success=False,
+                        error_message=str(ai_err), current_user=current_user,
+                        company_id=get_company_id_for_user(current_user))
+            return jsonify({'success': False, 'error': 'AI failed', 'code': 'AI_UNAVAILABLE'}), 503
+
+        log_ai_call('fishbone_five_whys', incident_id=incident_id,
+                    model_info=model_info, usage=usage, duration_ms=dur,
+                    current_user=current_user,
+                    company_id=get_company_id_for_user(current_user),
+                    extra={'cause_id': cause.get('id')})
+
+        return jsonify(ai_envelope(result, model_info, usage)), 200
+
+    except Exception as e:
+        current_app.logger.error(f"fishbone_ai_five_whys error: {e}")
+        return jsonify({'success': False, 'error': 'Server error', 'code': 'INTERNAL_ERROR'}), 500
+
+
+@app.route('/api/incidents/<int:incident_id>/fishbone/ai-chat',
+           methods=['POST', 'OPTIONS'])
+@jwt_required
+def fishbone_ai_chat(incident_id):
+    """Contextual chat about the fishbone."""
+    if request.method == 'OPTIONS':
+        return jsonify({'status': 'ok'}), 200
+
+    try:
+        current_user = request.user
+        incident, error, code = check_incident_access(incident_id, current_user)
+        if error:
+            return jsonify(error), code
+
+        data = request.get_json() or {}
+        question = (data.get('question') or '').strip()
+        ctx = data.get('fishboneContext') or {}
+        history = data.get('history') or []
+        ai_opts = data.get('ai_options') or {}
+
+        if not question:
+            return jsonify({'success': False, 'error': 'question required', 'code': 'MISSING_QUESTION'}), 400
+
+        # Build context string
+        cat_lines = []
+        for c in ctx.get('categories', []):
+            causes = '; '.join([x.get('description', '') for x in c.get('causes', [])])
+            cat_lines.append(f"- {c.get('name')}: {causes}")
+        ctx_block = '\n'.join(cat_lines) or '(no categories yet)'
+
+        hist_block = '\n'.join([
+            f"{'Q' if m.get('role') == 'user' else 'A'}: {m.get('content', '')}"
+            for m in history[-6:]
+        ])
+
+        prompt = f"""You are an RCA expert helping an investigator.
+Incident: {incident.title}
+{incident.description or ''}
+
+Current fishbone:
+Problem: {ctx.get('problemStatement') or 'N/A'}
+{ctx_block}
+
+Conversation so far:
+{hist_block}
+
+Q: {question}
+
+Answer in 2-4 sentences. If the answer isn't determinable from the data, say so and suggest what evidence is needed."""
+
+        try:
+            text, model_info, usage, dur = call_gemini(
+                prompt,
+                json_mode=False,
+                temperature=float(ai_opts.get('temperature', 0.5)),
+                max_tokens=1024,
+            )
+        except Exception as ai_err:
+            log_ai_call('fishbone_chat', incident_id=incident_id, success=False,
+                        error_message=str(ai_err), current_user=current_user,
+                        company_id=get_company_id_for_user(current_user))
+            return jsonify({'success': False, 'error': 'AI failed', 'code': 'AI_UNAVAILABLE'}), 503
+
+        log_ai_call('fishbone_chat', incident_id=incident_id,
+                    model_info=model_info, usage=usage, duration_ms=dur,
+                    current_user=current_user,
+                    company_id=get_company_id_for_user(current_user))
+
+        return jsonify(ai_envelope({'answer': text}, model_info, usage)), 200
+
+    except Exception as e:
+        current_app.logger.error(f"fishbone_ai_chat error: {e}")
+        return jsonify({'success': False, 'error': 'Server error', 'code': 'INTERNAL_ERROR'}), 500
+
+
+@app.route('/api/incidents/<int:incident_id>/fishbone/causes/<cause_id>/five-whys',
+           methods=['POST', 'OPTIONS'])
+@jwt_required
+def fishbone_save_five_whys(incident_id, cause_id):
+    """Persist a 5-Why result against a cause."""
+    if request.method == 'OPTIONS':
+        return jsonify({'status': 'ok'}), 200
+
+    try:
+        current_user = request.user
+        incident, error, code = check_incident_access(incident_id, current_user)
+        if error:
+            return jsonify(error), code
+
+        data = request.get_json() or {}
+        company_id = get_company_id_for_user(current_user)
+
+        row = FishboneFiveWhys.query.filter_by(
+            incident_id=incident_id, cause_id=cause_id, company_id=company_id
+        ).first()
+
+        if not row:
+            row = FishboneFiveWhys(
+                incident_id=incident_id,
+                cause_id=cause_id,
+                company_id=company_id,
+                created_by=current_user.id,
+            )
+            db.session.add(row)
+
+        row.category_id = data.get('categoryId')
+        row.cause_description = data.get('causeDescription')
+        row.whys = json.dumps(data.get('whys', []))
+        row.root_cause = data.get('rootCause')
+        row.verification_question = data.get('verificationQuestion')
+        row.ai_metadata = json.dumps(data.get('ai_metadata') or {})
+        row.updated_at = datetime.utcnow()
+
+        db.session.commit()
+
+        return jsonify({'success': True, 'five_whys': row.to_dict()}), 200
+
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"save_five_whys error: {e}")
+        return jsonify({'success': False, 'error': 'Server error', 'code': 'INTERNAL_ERROR'}), 500
+
+
+@app.route('/api/incidents/<int:incident_id>/fishbone/versions/<int:version_id>/restore',
+           methods=['POST', 'OPTIONS'])
+@jwt_required
+def fishbone_restore_version(incident_id, version_id):
+    """Restore a specific fishbone version.
+
+    NOTE: `version_id` here refers to `fishbone_analyses.id` (the historical row),
+    matching what /fishbone/versions returns.
+    """
+    if request.method == 'OPTIONS':
+        return jsonify({'status': 'ok'}), 200
+
+    try:
+        current_user = request.user
+        incident, error, code = check_incident_access(incident_id, current_user)
+        if error:
+            return jsonify(error), code
+
+        company_id = get_company_id_for_user(current_user)
+
+        # version_id = fishbone_analyses.id (historical)
+        old = FishboneAnalysis.query.filter_by(
+            id=version_id,
+            incident_id=incident_id,
+            company_id=company_id
+        ).first()
+
+        if not old:
+            return jsonify({
+                'success': False,
+                'error': 'Version not found',
+                'code': 'NOT_FOUND'
+            }), 404
+
+        # Archive current
+        current = FishboneAnalysis.query.filter_by(
+            incident_id=incident_id, company_id=company_id, is_current=True
+        ).first()
+
+        if current:
+            current.is_current = False
+            next_v = current.version + 1
+        else:
+            next_v = 1
+
+        # Create a NEW analysis row copying the old one
+        restored = FishboneAnalysis(
+            incident_id=incident_id,
+            problem_statement=old.problem_statement,
+            categories=old.categories,
+            total_causes=old.total_causes,
+            root_causes_count=old.root_causes_count,
+            categories_used=old.categories_used,
+            version=next_v,
+            is_current=True,
+            company_id=company_id,
+            created_by=current_user.id,
+            created_by_name=getattr(current_user, 'name', None) or current_user.email,
+            created_by_email=current_user.email,
+        )
+        db.session.add(restored)
+        db.session.flush()
+
+        log_incident_audit(
+            incident_id=incident_id,
+            action='fishbone_restored',
+            description=f'Fishbone restored from v{old.version} → new v{next_v}',
+            current_user=current_user,
+            extra_data={'restored_from_id': version_id, 'new_id': restored.id}
+        )
+
+        db.session.commit()
+
+        return jsonify({'success': True, 'analysis': restored.to_dict()}), 200
+
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"restore_version error: {e}")
+        return jsonify({'success': False, 'error': 'Server error', 'code': 'INTERNAL_ERROR'}), 500
+
+@app.route('/api/incidents/<int:incident_id>/fishbone/ai-save',
+           methods=['POST', 'OPTIONS'])
+@jwt_required
+def fishbone_ai_save(incident_id):
+    """Save an AI-generated fishbone + attach ai_metadata."""
+    if request.method == 'OPTIONS':
+        return jsonify({'status': 'ok'}), 200
+
+    try:
+        current_user = request.user
+        incident, error, code = check_incident_access(incident_id, current_user)
+        if error:
+            return jsonify(error), code
+
+        data = request.get_json() or {}
+        company_id = get_company_id_for_user(current_user)
+
+        categories = data.get('categories') or []
+        problem_statement = data.get('problem_statement') or incident.title or ''
+
+        total_causes = sum(len(c.get('causes', [])) for c in categories)
+        root_causes_count = sum(
+            len([x for x in c.get('causes', []) if x.get('isRootCause')])
+            for c in categories
+        )
+        categories_used = len([c for c in categories if c.get('causes')])
+
+        existing = FishboneAnalysis.query.filter_by(
+            incident_id=incident_id, company_id=company_id, is_current=True
+        ).first()
+        if existing:
+            existing.is_current = False
+            next_v = existing.version + 1
+        else:
+            next_v = 1
+
+        ai_meta = data.get('ai_metadata') or {}
+
+        analysis = FishboneAnalysis(
+            incident_id=incident_id,
+            problem_statement=problem_statement,
+            categories=json.dumps(categories),
+            total_causes=total_causes,
+            root_causes_count=root_causes_count,
+            categories_used=categories_used,
+            version=next_v,
+            is_current=True,
+            company_id=company_id,
+            created_by=current_user.id,
+            created_by_name=getattr(current_user, 'name', None) or current_user.email,
+            created_by_email=current_user.email,
+        )
+        db.session.add(analysis)
+        db.session.flush()
+
+        # Also snapshot into fishbone_versions
+        snapshot = FishboneVersion(
+            analysis_id=analysis.id,
+            incident_id=incident_id,
+            version_number=next_v,
+            problem_statement=problem_statement,
+            categories=json.dumps(categories),
+            summary=json.dumps(data.get('summary') or {}),
+            ai_metadata=json.dumps(ai_meta),
+            stats=json.dumps({'total_causes': total_causes, 'root_causes_count': root_causes_count}),
+            ai_model=(ai_meta.get('modelInfo') or {}).get('name'),
+            ai_key_index=(ai_meta.get('modelInfo') or {}).get('key_index'),
+            is_current=True,
+            company_id=company_id,
+            created_by=current_user.id,
+            created_by_name=getattr(current_user, 'name', None) or current_user.email,
+        )
+        db.session.add(snapshot)
+
+        # Un-mark previous version in fishbone_versions
+        FishboneVersion.query.filter_by(
+            incident_id=incident_id, company_id=company_id
+        ).filter(FishboneVersion.id != snapshot.id).update({'is_current': False})
+
+        log_incident_audit(
+            incident_id=incident_id,
+            action='fishbone_ai_saved',
+            description=f'AI fishbone saved (v{next_v})',
+            current_user=current_user,
+            extra_data={'model': (ai_meta.get('modelInfo') or {}).get('name')}
+        )
+
+        db.session.commit()
+
+        return jsonify({'success': True, 'analysis': analysis.to_dict()}), 200
+
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"fishbone_ai_save error: {e}")
+        return jsonify({'success': False, 'error': 'Server error', 'code': 'INTERNAL_ERROR'}), 500
+
+# =============================================================================
+# AI INVESTIGATION ASSISTANT
+# =============================================================================
+
+@app.route('/api/incidents/<int:incident_id>/ai-analysis',
+           methods=['POST', 'OPTIONS'])
+@jwt_required
+def ai_analysis_generate(incident_id):
+    """Full incident analysis: summary, risks, questions, actions, insights."""
+    if request.method == 'OPTIONS':
+        return jsonify({'status': 'ok'}), 200
+
+    try:
+        current_user = request.user
+        incident, error, code = check_incident_access(incident_id, current_user)
+        if error:
+            return jsonify(error), code
+
+        data = request.get_json() or {}
+        ai_opts = data.get('ai_options') or {}
+        industry = getattr(incident, 'company', None) and 'general' or 'general'
+
+        prompt = f"""Analyze this incident deeply and return a structured JSON.
+
+INCIDENT
+Title: {incident.title}
+Description: {incident.description or ''}
+Severity: {getattr(incident, 'severity', None)}
+Type: {getattr(incident, 'type', None)}
+Location: {getattr(incident, 'location', None) or 'N/A'}
+Date: {incident.date_occurred.isoformat() if getattr(incident, 'date_occurred', None) else 'N/A'}
+
+Return JSON:
+{{
+  "summary": "...",
+  "risk_score": 0-100,
+  "confidence_score": 0-100,
+  "risk_factors": [{{ "factor":"...","level":"high|medium|low","description":"..." }}],
+  "investigation_questions": [{{ "category":"...","question":"...","answered":false }}],
+  "similar_patterns": [{{ "commonCauses":["..."],"preventiveMeasures":["..."] }}],
+  "suggested_actions": [{{ "type":"immediate|investigation|corrective","priority":"critical|high|medium|low",
+                           "action":"...","category":"...","timeframe":"..." }}],
+  "root_causes": ["..."],
+  "insights": [{{ "type":"warning|info|success","title":"...","description":"..." }}],
+  "trend_analysis": "stable|increasing|decreasing"
+}}"""
+
+        try:
+            result, model_info, usage, dur = call_gemini(
+                prompt, temperature=float(ai_opts.get('temperature', 0.7)),
+                max_tokens=6144,
+            )
+        except Exception as ai_err:
+            log_ai_call('analysis_full', incident_id=incident_id, success=False,
+                        error_message=str(ai_err), current_user=current_user,
+                        company_id=get_company_id_for_user(current_user))
+            return jsonify({'success': False, 'error': 'AI failed', 'code': 'AI_UNAVAILABLE'}), 503
+
+        log_ai_call('analysis_full', incident_id=incident_id,
+                    model_info=model_info, usage=usage, duration_ms=dur,
+                    current_user=current_user,
+                    company_id=get_company_id_for_user(current_user))
+
+        return jsonify(ai_envelope(result, model_info, usage)), 200
+
+    except Exception as e:
+        current_app.logger.error(f"ai_analysis_generate error: {e}")
+        return jsonify({'success': False, 'error': 'Server error', 'code': 'INTERNAL_ERROR'}), 500
+
+
+@app.route('/api/incidents/<int:incident_id>/ai-analysis/ask',
+           methods=['POST', 'OPTIONS'])
+@jwt_required
+def ai_analysis_ask(incident_id):
+    """Free-form chat with AI about an incident."""
+    if request.method == 'OPTIONS':
+        return jsonify({'status': 'ok'}), 200
+
+    try:
+        current_user = request.user
+        incident, error, code = check_incident_access(incident_id, current_user)
+        if error:
+            return jsonify(error), code
+
+        data = request.get_json() or {}
+        question = (data.get('question') or '').strip()
+        context = data.get('context') or {}
+        ai_opts = data.get('ai_options') or {}
+
+        if not question:
+            return jsonify({'success': False, 'error': 'question required', 'code': 'MISSING_QUESTION'}), 400
+
+        history = context.get('conversation') or []
+        hist_block = '\n'.join([
+            f"{'Q' if m.get('role') == 'user' else 'A'}: {m.get('content', '')}"
+            for m in history[-6:]
+        ])
+
+        prompt = f"""Incident: {incident.title}
+{incident.description or ''}
+
+{hist_block}
+
+Q: {question}
+
+Answer in 3-6 sentences. Be specific and reference incident details."""
+
+        try:
+            text, model_info, usage, dur = call_gemini(
+                prompt, json_mode=False,
+                temperature=float(ai_opts.get('temperature', 0.5)),
+                max_tokens=1024,
+            )
+        except Exception as ai_err:
+            log_ai_call('analysis_chat', incident_id=incident_id, success=False,
+                        error_message=str(ai_err), current_user=current_user,
+                        company_id=get_company_id_for_user(current_user))
+            return jsonify({'success': False, 'error': 'AI failed', 'code': 'AI_UNAVAILABLE'}), 503
+
+        log_ai_call('analysis_chat', incident_id=incident_id,
+                    model_info=model_info, usage=usage, duration_ms=dur,
+                    current_user=current_user,
+                    company_id=get_company_id_for_user(current_user))
+
+        return jsonify(ai_envelope({'answer': text}, model_info, usage)), 200
+
+    except Exception as e:
+        current_app.logger.error(f"ai_analysis_ask error: {e}")
+        return jsonify({'success': False, 'error': 'Server error', 'code': 'INTERNAL_ERROR'}), 500
+
+
+@app.route('/api/incidents/<int:incident_id>/ai-analysis/save',
+           methods=['POST', 'OPTIONS'])
+@jwt_required
+def ai_analysis_save(incident_id):
+    """Persist an AI analysis result."""
+    if request.method == 'OPTIONS':
+        return jsonify({'status': 'ok'}), 200
+
+    try:
+        current_user = request.user
+        incident, error, code = check_incident_access(incident_id, current_user)
+        if error:
+            return jsonify(error), code
+
+        data = request.get_json() or {}
+        company_id = get_company_id_for_user(current_user)
+
+        row = AIAnalysis(
+            incident_id=incident_id,
+            analysis_type=data.get('analysis_type', 'full'),
+            model_provider='google',
+            model_name=data.get('model_name'),
+            summary=data.get('summary'),
+            risk_score=data.get('risk_score'),
+            confidence_score=data.get('confidence_score'),
+            trend_analysis=data.get('trend_analysis'),
+            risk_factors=json.dumps(data.get('risk_factors') or []),
+            investigation_questions=json.dumps(data.get('investigation_questions') or []),
+            similar_patterns=json.dumps(data.get('similar_patterns') or []),
+            suggested_actions=json.dumps(data.get('suggested_actions') or []),
+            root_causes=json.dumps(data.get('root_causes') or []),
+            insights=json.dumps(data.get('insights') or []),
+            conversation=json.dumps(data.get('conversation') or []),
+            raw_response=json.dumps(data.get('raw_response') or {}),
+            company_id=company_id,
+            requested_by=current_user.id,
+            requested_by_name=getattr(current_user, 'name', None) or current_user.email,
+        )
+        db.session.add(row)
+        db.session.commit()
+
+        return jsonify({'success': True, 'analysis': row.to_dict()}), 200
+
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"ai_analysis_save error: {e}")
+        return jsonify({'success': False, 'error': 'Server error', 'code': 'INTERNAL_ERROR'}), 500
+
+
+@app.route('/api/incidents/<int:incident_id>/ai-analysis/history',
+           methods=['GET', 'OPTIONS'])
+@jwt_required
+def ai_analysis_history(incident_id):
+    """Return prior AI generations for an incident (History tab)."""
+    if request.method == 'OPTIONS':
+        return jsonify({'status': 'ok'}), 200
+
+    try:
+        current_user = request.user
+        incident, error, code = check_incident_access(incident_id, current_user)
+        if error:
+            return jsonify(error), code
+
+        company_id = get_company_id_for_user(current_user)
+
+        rows = AIGenerationLog.query.filter_by(
+            incident_id=incident_id, company_id=company_id
+        ).order_by(AIGenerationLog.created_at.desc()).limit(50).all()
+
+        return jsonify({
+            'success': True,
+            'history': [r.to_dict() for r in rows],
+        }), 200
+
+    except Exception as e:
+        current_app.logger.error(f"ai_analysis_history error: {e}")
+        return jsonify({'success': True, 'history': []}), 200
+
+
+@app.route('/api/incidents/<int:incident_id>/ai-analysis/log',
+           methods=['POST', 'OPTIONS'])
+@jwt_required
+def ai_analysis_log(incident_id):
+    """Frontend can explicitly log an AI generation event."""
+    if request.method == 'OPTIONS':
+        return jsonify({'status': 'ok'}), 200
+
+    try:
+        current_user = request.user
+        incident, error, code = check_incident_access(incident_id, current_user)
+        if error:
+            return jsonify(error), code
+
+        data = request.get_json() or {}
+        company_id = get_company_id_for_user(current_user)
+
+        log_ai_call(
+            feature=data.get('type', 'unknown'),
+            incident_id=incident_id,
+            model_info={'name': data.get('model')} if data.get('model') else None,
+            usage=None,
+            current_user=current_user,
+            company_id=company_id,
+            extra=data,
+        )
+        return jsonify({'success': True}), 200
+
+    except Exception as e:
+        current_app.logger.error(f"ai_analysis_log error: {e}")
+        return jsonify({'success': True}), 200
+
+
+@app.route('/api/incidents/<int:incident_id>/ai-analysis/generate-report',
+           methods=['POST', 'OPTIONS'])
+@jwt_required
+def ai_analysis_generate_report(incident_id):
+    """Generate a full investigation report (returns summary text; PDF generation optional)."""
+    if request.method == 'OPTIONS':
+        return jsonify({'status': 'ok'}), 200
+
+    try:
+        current_user = request.user
+        incident, error, code = check_incident_access(incident_id, current_user)
+        if error:
+            return jsonify(error), code
+
+        data = request.get_json() or {}
+        report_type = data.get('reportType', 'full')
+        ai_opts = data.get('ai_options') or {}
+
+        prompt = f"""Write a professional incident investigation report ({report_type}).
+
+Incident: {incident.title}
+Severity: {getattr(incident, 'severity', None)}
+Description: {incident.description or ''}
+
+Return JSON:
+{{
+  "title":"...",
+  "executive_summary":"...",
+  "incident_overview":"...",
+  "investigation_findings":["..."],
+  "root_causes":["..."],
+  "corrective_actions":["..."],
+  "preventive_recommendations":["..."],
+  "conclusion":"..."
+}}"""
+
+        try:
+            result, model_info, usage, dur = call_gemini(
+                prompt, temperature=float(ai_opts.get('temperature', 0.6)),
+                max_tokens=6144,
+            )
+        except Exception as ai_err:
+            log_ai_call('analysis_report', incident_id=incident_id, success=False,
+                        error_message=str(ai_err), current_user=current_user,
+                        company_id=get_company_id_for_user(current_user))
+            return jsonify({'success': False, 'error': 'AI failed', 'code': 'AI_UNAVAILABLE'}), 503
+
+        log_ai_call('analysis_report', incident_id=incident_id,
+                    model_info=model_info, usage=usage, duration_ms=dur,
+                    current_user=current_user,
+                    company_id=get_company_id_for_user(current_user))
+
+        return jsonify(ai_envelope(result, model_info, usage)), 200
+
+    except Exception as e:
+        current_app.logger.error(f"ai_analysis_generate_report error: {e}")
+        return jsonify({'success': False, 'error': 'Server error', 'code': 'INTERNAL_ERROR'}), 500
+
+# =============================================================================
+# SIMILAR INCIDENTS AI
+# =============================================================================
+
+@app.route('/api/incidents/<int:incident_id>/similar/ai',
+           methods=['POST', 'OPTIONS'])
+@jwt_required
+def similar_ai_search(incident_id):
+    """Semantic similarity search."""
+    if request.method == 'OPTIONS':
+        return jsonify({'status': 'ok'}), 200
+
+    try:
+        current_user = request.user
+        incident, error, code = check_incident_access(incident_id, current_user)
+        if error:
+            return jsonify(error), code
+
+        data = request.get_json() or {}
+        ai_opts = data.get('ai_options') or {}
+        threshold = int(data.get('threshold', 60))
+        match_field = data.get('matchField', 'all')
+        limit = int(data.get('limit', 20))
+
+        company_id = get_company_id_for_user(current_user)
+
+        # Get other incidents from this company (recent)
+        candidates = Incident.query.filter(
+            Incident.company_id == company_id,
+            Incident.id != incident_id,
+        ).order_by(Incident.date_occurred.desc()).limit(80).all()
+
+        if not candidates:
+            return jsonify(ai_envelope({'similar': []})), 200
+
+        # Build compact listing for the AI
+        blocks = []
+        for c in candidates:
+            blocks.append({
+                'id': c.id,
+                'title': c.title,
+                'description': (c.description or '')[:400],
+                'type': getattr(c, 'type', None),
+                'severity': getattr(c, 'severity', None),
+                'department': getattr(c, 'department', None),
+                'location': getattr(c, 'location', None),
+                'date': c.date_occurred.isoformat() if getattr(c, 'date_occurred', None) else None,
+            })
+
+        prompt = f"""Compare this incident to the list below. Return ONLY the incidents that are
+semantically similar (score >= {threshold}). Match on meaning, not just words.
+
+SOURCE INCIDENT
+Title: {incident.title}
+Description: {incident.description or ''}
+Type: {getattr(incident, 'type', None)}
+Severity: {getattr(incident, 'severity', None)}
+Location: {getattr(incident, 'location', None) or 'N/A'}
+
+CANDIDATES (JSON array):
+{json.dumps(blocks)}
+
+Return JSON:
+{{ "similar": [
+  {{ "id": <int>, "similarity_score": 0-100,
+     "semantic_reason": "one-sentence why",
+     "matched_fields": ["Type","Severity","Location",...] }}
+] }}
+
+Sort by similarity_score desc. Max {limit} results."""
+
+        try:
+            result, model_info, usage, dur = call_gemini(
+                prompt, temperature=float(ai_opts.get('temperature', 0.4)),
+                max_tokens=4096,
+            )
+        except Exception as ai_err:
+            log_ai_call('similar_search', incident_id=incident_id, success=False,
+                        error_message=str(ai_err), current_user=current_user,
+                        company_id=company_id)
+            return jsonify({'success': False, 'error': 'AI failed', 'code': 'AI_UNAVAILABLE'}), 503
+
+        # Enrich with full incident data
+        scored = {row['id']: row for row in (result.get('similar') or [])}
+        out = []
+        for c in candidates:
+            if c.id in scored:
+                full = c.to_dict() if hasattr(c, 'to_dict') else {
+                    'id': c.id, 'title': c.title, 'description': c.description,
+                    'severity': getattr(c, 'severity', None),
+                    'type': getattr(c, 'type', None),
+                    'location': getattr(c, 'location', None),
+                    'department': getattr(c, 'department', None),
+                    'date_occurred': c.date_occurred.isoformat() if getattr(c, 'date_occurred', None) else None,
+                }
+                full['similarity_score'] = scored[c.id].get('similarity_score', 0)
+                full['semantic_reason'] = scored[c.id].get('semantic_reason', '')
+                full['matched_fields'] = scored[c.id].get('matched_fields', [])
+                out.append(full)
+
+        # Persist matches (best-effort)
+        try:
+            for m in out[:20]:
+                existing = SimilarIncidentMatch.query.filter_by(
+                    source_incident_id=incident_id,
+                    matched_incident_id=m['id']
+                ).first()
+                if existing:
+                    existing.similarity_score = m['similarity_score']
+                    existing.semantic_reason = m['semantic_reason']
+                    existing.matched_fields = json.dumps(m['matched_fields'])
+                else:
+                    db.session.add(SimilarIncidentMatch(
+                        source_incident_id=incident_id,
+                        matched_incident_id=m['id'],
+                        similarity_score=m['similarity_score'],
+                        method='semantic',
+                        matched_fields=json.dumps(m['matched_fields']),
+                        semantic_reason=m['semantic_reason'],
+                        threshold_used=threshold,
+                        match_field_used=match_field,
+                        company_id=company_id,
+                    ))
+            db.session.commit()
+        except Exception as persist_err:
+            db.session.rollback()
+            current_app.logger.warning(f"persist similar matches failed: {persist_err}")
+
+        log_ai_call('similar_search', incident_id=incident_id,
+                    model_info=model_info, usage=usage, duration_ms=dur,
+                    current_user=current_user, company_id=company_id,
+                    extra={'threshold': threshold, 'matches': len(out)})
+
+        return jsonify(ai_envelope({'similar': out}, model_info, usage)), 200
+
+    except Exception as e:
+        current_app.logger.error(f"similar_ai_search error: {e}")
+        return jsonify({'success': False, 'error': 'Server error', 'code': 'INTERNAL_ERROR'}), 500
+
+
+@app.route('/api/incidents/<int:incident_id>/similar/cluster-analysis',
+           methods=['POST', 'OPTIONS'])
+@jwt_required
+def similar_cluster_analysis(incident_id):
+    """AI writes a cluster narrative across similar incidents."""
+    if request.method == 'OPTIONS':
+        return jsonify({'status': 'ok'}), 200
+
+    try:
+        current_user = request.user
+        incident, error, code = check_incident_access(incident_id, current_user)
+        if error:
+            return jsonify(error), code
+
+        data = request.get_json() or {}
+        similar_ids = data.get('similar_incident_ids') or []
+        ai_opts = data.get('ai_options') or {}
+        company_id = get_company_id_for_user(current_user)
+
+        if not similar_ids:
+            return jsonify(ai_envelope({
+                'title': 'No similar incidents to analyze',
+                'summary': '', 'clusters': [], 'common_themes': []
+            })), 200
+
+        rows = Incident.query.filter(
+            Incident.id.in_(similar_ids),
+            Incident.company_id == company_id
+        ).all()
+
+        blocks = [{
+            'id': r.id, 'title': r.title,
+            'description': (r.description or '')[:400],
+            'severity': getattr(r, 'severity', None),
+            'type': getattr(r, 'type', None),
+            'location': getattr(r, 'location', None),
+            'department': getattr(r, 'department', None),
+        } for r in rows]
+
+        prompt = f"""Analyze patterns across these incidents.
+
+SOURCE: {incident.title}
+{incident.description or ''}
+
+RELATED ({len(blocks)}):
+{json.dumps(blocks)}
+
+Return JSON:
+{{
+  "title": "...",
+  "summary": "one paragraph narrative",
+  "clusters": [{{ "name":"...","incident_ids":[...],"explanation":"...",
+                  "shared_factors":["..."],"recommendation":"..." }}],
+  "common_themes": ["..."],
+  "differentiators": "what makes the source incident different"
+}}"""
+
+        try:
+            result, model_info, usage, dur = call_gemini(
+                prompt, temperature=float(ai_opts.get('temperature', 0.4)),
+                max_tokens=4096,
+            )
+        except Exception as ai_err:
+            log_ai_call('similar_cluster', incident_id=incident_id, success=False,
+                        error_message=str(ai_err), current_user=current_user,
+                        company_id=company_id)
+            return jsonify({'success': False, 'error': 'AI failed', 'code': 'AI_UNAVAILABLE'}), 503
+
+        # Persist
+        try:
+            row = IncidentClusterAnalysis(
+                source_incident_id=incident_id,
+                similar_incident_ids=json.dumps(similar_ids),
+                title=result.get('title'),
+                summary=result.get('summary'),
+                clusters=json.dumps(result.get('clusters') or []),
+                common_themes=json.dumps(result.get('common_themes') or []),
+                differentiators=result.get('differentiators'),
+                preventive_actions=json.dumps(result.get('preventive_actions') or []),
+                ai_metadata=json.dumps({'modelInfo': model_info, 'usage': usage}),
+                company_id=company_id,
+                created_by=current_user.id,
+            )
+            db.session.add(row)
+            db.session.commit()
+        except Exception as pe:
+            db.session.rollback()
+            current_app.logger.warning(f"persist cluster failed: {pe}")
+
+        log_ai_call('similar_cluster', incident_id=incident_id,
+                    model_info=model_info, usage=usage, duration_ms=dur,
+                    current_user=current_user, company_id=company_id)
+
+        return jsonify(ai_envelope(result, model_info, usage)), 200
+
+    except Exception as e:
+        current_app.logger.error(f"similar_cluster_analysis error: {e}")
+        return jsonify({'success': False, 'error': 'Server error', 'code': 'INTERNAL_ERROR'}), 500
+
+
+@app.route('/api/incidents/<int:incident_id>/similar/compare',
+           methods=['POST', 'OPTIONS'])
+@jwt_required
+def similar_compare(incident_id):
+    """AI compare two incidents."""
+    if request.method == 'OPTIONS':
+        return jsonify({'status': 'ok'}), 200
+
+    try:
+        current_user = request.user
+        incident, error, code = check_incident_access(incident_id, current_user)
+        if error:
+            return jsonify(error), code
+
+        data = request.get_json() or {}
+        other_id = data.get('other_incident_id')
+        ai_opts = data.get('ai_options') or {}
+        company_id = get_company_id_for_user(current_user)
+
+        other = Incident.query.filter_by(id=other_id, company_id=company_id).first()
+        if not other:
+            return jsonify({'success': False, 'error': 'Other incident not found', 'code': 'NOT_FOUND'}), 404
+
+        prompt = f"""Compare these two incidents and return JSON.
+
+INCIDENT A: {incident.title}
+{incident.description or ''}
+Severity: {getattr(incident, 'severity', None)}
+Type: {getattr(incident, 'type', None)}
+
+INCIDENT B: {other.title}
+{other.description or ''}
+Severity: {getattr(other, 'severity', None)}
+Type: {getattr(other, 'type', None)}
+
+Return JSON:
+{{
+  "summary": "...",
+  "similarities": ["..."],
+  "differences": ["..."],
+  "root_cause_hypothesis": "...",
+  "lessons": ["..."]
+}}"""
+
+        try:
+            result, model_info, usage, dur = call_gemini(
+                prompt, temperature=float(ai_opts.get('temperature', 0.4)),
+                max_tokens=3072,
+            )
+        except Exception as ai_err:
+            log_ai_call('similar_compare', incident_id=incident_id, success=False,
+                        error_message=str(ai_err), current_user=current_user,
+                        company_id=company_id)
+            return jsonify({'success': False, 'error': 'AI failed', 'code': 'AI_UNAVAILABLE'}), 503
+
+        try:
+            db.session.add(IncidentComparison(
+                incident_a_id=incident_id,
+                incident_b_id=other_id,
+                summary=result.get('summary'),
+                similarities=json.dumps(result.get('similarities') or []),
+                differences=json.dumps(result.get('differences') or []),
+                root_cause_hypothesis=result.get('root_cause_hypothesis'),
+                lessons=json.dumps(result.get('lessons') or []),
+                ai_metadata=json.dumps({'modelInfo': model_info, 'usage': usage}),
+                company_id=company_id,
+                created_by=current_user.id,
+            ))
+            db.session.commit()
+        except Exception as pe:
+            db.session.rollback()
+            current_app.logger.warning(f"persist comparison failed: {pe}")
+
+        log_ai_call('similar_compare', incident_id=incident_id,
+                    model_info=model_info, usage=usage, duration_ms=dur,
+                    current_user=current_user, company_id=company_id,
+                    extra={'other_incident_id': other_id})
+
+        return jsonify(ai_envelope(result, model_info, usage)), 200
+
+    except Exception as e:
+        current_app.logger.error(f"similar_compare error: {e}")
+        return jsonify({'success': False, 'error': 'Server error', 'code': 'INTERNAL_ERROR'}), 500
+
+
+@app.route('/api/incidents/<int:incident_id>/similar/preventive-actions',
+           methods=['POST', 'OPTIONS'])
+@jwt_required
+def similar_preventive_actions(incident_id):
+    """AI derives preventive actions from a cluster."""
+    if request.method == 'OPTIONS':
+        return jsonify({'status': 'ok'}), 200
+
+    try:
+        current_user = request.user
+        incident, error, code = check_incident_access(incident_id, current_user)
+        if error:
+            return jsonify(error), code
+
+        data = request.get_json() or {}
+        similar_ids = data.get('similar_incident_ids') or []
+        ai_opts = data.get('ai_options') or {}
+        company_id = get_company_id_for_user(current_user)
+
+        rows = Incident.query.filter(
+            Incident.id.in_(similar_ids), Incident.company_id == company_id
+        ).all() if similar_ids else []
+
+        prompt = f"""Given this incident and {len(rows)} related ones, propose preventive actions.
+
+SOURCE: {incident.title}
+{incident.description or ''}
+
+RELATED:
+{json.dumps([{'id': r.id, 'title': r.title, 'description': (r.description or '')[:300]} for r in rows])}
+
+Return JSON:
+{{ "actions":[
+  {{ "description":"...","controlLevel":"elimination|substitution|engineering|administrative|ppe",
+     "impact":"low|medium|high","effort":"low|medium|high","timeline":"immediate|short-term|long-term" }}
+] }}"""
+
+        try:
+            result, model_info, usage, dur = call_gemini(
+                prompt, temperature=float(ai_opts.get('temperature', 0.6)),
+                max_tokens=2048,
+            )
+        except Exception as ai_err:
+            log_ai_call('similar_preventive', incident_id=incident_id, success=False,
+                        error_message=str(ai_err), current_user=current_user,
+                        company_id=company_id)
+            return jsonify({'success': False, 'error': 'AI failed', 'code': 'AI_UNAVAILABLE'}), 503
+
+        log_ai_call('similar_preventive', incident_id=incident_id,
+                    model_info=model_info, usage=usage, duration_ms=dur,
+                    current_user=current_user, company_id=company_id)
+
+        return jsonify(ai_envelope(result, model_info, usage)), 200
+
+    except Exception as e:
+        current_app.logger.error(f"similar_preventive_actions error: {e}")
+        return jsonify({'success': False, 'error': 'Server error', 'code': 'INTERNAL_ERROR'}), 500
+
+
+# =============================================================================
+# PREDICTIVE ANALYTICS AI
+# =============================================================================
+
+@app.route('/api/analytics/predictive/ai', methods=['POST', 'OPTIONS'])
+@jwt_required
+def predictive_ai(incident_id=None):
+    """AI-driven forecast."""
+    if request.method == 'OPTIONS':
+        return jsonify({'status': 'ok'}), 200
+
+    try:
+        current_user = request.user
+        company_id = get_company_id_for_user(current_user)
+        data = request.get_json() or {}
+        ai_opts = data.get('ai_options') or {}
+
+        industry = data.get('industry')
+        severity = data.get('severity')
+        months = int(data.get('forecast_period', 3))
+
+        # Gather historical data
+        q = Incident.query.filter(Incident.company_id == company_id)
+        if industry:
+            q = q.filter(Incident.industry_id == industry) if hasattr(Incident, 'industry_id') else q
+        if severity:
+            q = q.filter(Incident.severity == severity)
+        q = q.filter(Incident.date_occurred >= datetime.utcnow() - timedelta(days=365))
+        rows = q.all()
+
+        # Monthly buckets
+        buckets = {}
+        now = datetime.utcnow()
+        for i in range(11, -1, -1):
+            m = (now - timedelta(days=30 * i)).strftime('%Y-%m')
+            buckets[m] = 0
+        for r in rows:
+            if r.date_occurred:
+                mk = r.date_occurred.strftime('%Y-%m')
+                if mk in buckets:
+                    buckets[mk] += 1
+
+        historical = {
+            'labels': list(buckets.keys()),
+            'values': list(buckets.values()),
+        }
+
+        prompt = f"""Forecast incidents for the next {months} months based on this data.
+
+Historical (last 12 months):
+{json.dumps(historical)}
+
+Return JSON:
+{{
+  "historical": {json.dumps(historical)},
+  "forecast": {{ "labels":[...{months} items...],"values":[...],"upperBound":[...],"lowerBound":[...] }},
+  "risk_score": 0-100,
+  "trend": "increasing|decreasing|stable",
+  "trend_percentage": <float>,
+  "average_monthly": <float>,
+  "predicted_total": <int>,
+  "model_accuracy": 0-100,
+  "methodology": {{ "frameworksApplied": ["..."] }},
+  "insights": [{{ "type":"info|warning|error","title":"...","description":"...","priority":"low|medium|high|critical" }}],
+  "risk_factors": [{{ "factor":"...","value":"...","impact":<num>,"risk":"low|medium|high","recommendation":"..." }}],
+  "narrative": {{ "summary":"...","keyRisks":["..."],"recommendations":["..."] }},
+  "model_recommendation": {{ "reasoning":"...","recommended_model":"...","confidence":"low|medium|high" }}
+}}"""
+
+        try:
+            result, model_info, usage, dur = call_gemini(
+                prompt, temperature=float(ai_opts.get('temperature', 0.6)),
+                max_tokens=6144,
+            )
+        except Exception as ai_err:
+            log_ai_call('predictive_full', success=False, error_message=str(ai_err),
+                        current_user=current_user, company_id=company_id)
+            return jsonify({'success': False, 'error': 'AI failed', 'code': 'AI_UNAVAILABLE'}), 503
+
+        # Persist
+        try:
+            row = PredictiveAnalyticsRun(
+                industry=industry, severity=severity,
+                method_requested=data.get('model', 'ai_auto'),
+                model_preference=ai_opts.get('model_preference', 'auto'),
+                model_used=model_info.get('name'),
+                key_index=model_info.get('key_index'),
+                forecast_period=months,
+                confidence_level=data.get('confidence_level', 95),
+                historical=json.dumps(result.get('historical') or historical),
+                forecast=json.dumps(result.get('forecast') or {}),
+                risk_score=result.get('risk_score'),
+                trend=result.get('trend'),
+                trend_percentage=result.get('trend_percentage'),
+                average_monthly=result.get('average_monthly'),
+                predicted_total=result.get('predicted_total'),
+                model_accuracy=result.get('model_accuracy'),
+                insights=json.dumps(result.get('insights') or []),
+                risk_factors=json.dumps(result.get('risk_factors') or []),
+                narrative=json.dumps(result.get('narrative') or {}),
+                model_recommendation=json.dumps(result.get('model_recommendation') or {}),
+                anomalies=json.dumps(result.get('anomalies') or []),
+                ai_metadata=json.dumps({'modelInfo': model_info, 'usage': usage}),
+                company_id=company_id, created_by=current_user.id,
+            )
+            db.session.add(row)
+            db.session.commit()
+        except Exception as pe:
+            db.session.rollback()
+            current_app.logger.warning(f"persist predictive failed: {pe}")
+
+        log_ai_call('predictive_full', model_info=model_info, usage=usage,
+                    duration_ms=dur, current_user=current_user, company_id=company_id)
+
+        return jsonify(ai_envelope(result, model_info, usage)), 200
+
+    except Exception as e:
+        current_app.logger.error(f"predictive_ai error: {e}")
+        return jsonify({'success': False, 'error': 'Server error', 'code': 'INTERNAL_ERROR'}), 500
+
+
+@app.route('/api/analytics/predictive/scenario', methods=['POST', 'OPTIONS'])
+@jwt_required
+def predictive_scenario():
+    if request.method == 'OPTIONS':
+        return jsonify({'status': 'ok'}), 200
+
+    try:
+        current_user = request.user
+        company_id = get_company_id_for_user(current_user)
+        data = request.get_json() or {}
+        scenario = (data.get('scenario') or '').strip()
+        incident_id = data.get('incident_id')
+        ai_opts = data.get('ai_options') or {}
+
+        if not scenario:
+            return jsonify({'success': False, 'error': 'scenario required', 'code': 'MISSING_SCENARIO'}), 400
+
+        prompt = f"""A safety manager is considering this change: "{scenario}"
+
+Forecast the impact. Return JSON:
+{{ "summary":"...","predicted_change":<float percent>,
+   "risks":["..."],"recommendations":["..."] }}"""
+
+        try:
+            result, model_info, usage, dur = call_gemini(
+                prompt, temperature=float(ai_opts.get('temperature', 0.6)),
+                max_tokens=2048,
+            )
+        except Exception as ai_err:
+            log_ai_call('predictive_scenario', incident_id=incident_id,
+                        success=False, error_message=str(ai_err),
+                        current_user=current_user, company_id=company_id)
+            return jsonify({'success': False, 'error': 'AI failed', 'code': 'AI_UNAVAILABLE'}), 503
+
+        try:
+            db.session.add(PredictiveScenario(
+                incident_id=incident_id,
+                scenario_text=scenario,
+                summary=result.get('summary'),
+                predicted_change=result.get('predicted_change'),
+                risks=json.dumps(result.get('risks') or []),
+                recommendations=json.dumps(result.get('recommendations') or []),
+                ai_metadata=json.dumps({'modelInfo': model_info, 'usage': usage}),
+                company_id=company_id, created_by=current_user.id,
+            ))
+            db.session.commit()
+        except Exception as pe:
+            db.session.rollback()
+            current_app.logger.warning(f"persist scenario failed: {pe}")
+
+        log_ai_call('predictive_scenario', incident_id=incident_id,
+                    model_info=model_info, usage=usage, duration_ms=dur,
+                    current_user=current_user, company_id=company_id)
+
+        return jsonify(ai_envelope(result, model_info, usage)), 200
+
+    except Exception as e:
+        current_app.logger.error(f"predictive_scenario error: {e}")
+        return jsonify({'success': False, 'error': 'Server error', 'code': 'INTERNAL_ERROR'}), 500
+
+
+@app.route('/api/analytics/anomalies/ai', methods=['POST', 'OPTIONS'])
+@jwt_required
+def predictive_anomalies():
+    if request.method == 'OPTIONS':
+        return jsonify({'status': 'ok'}), 200
+
+    try:
+        current_user = request.user
+        company_id = get_company_id_for_user(current_user)
+        data = request.get_json() or {}
+        ai_opts = data.get('ai_options') or {}
+
+        cutoff = datetime.utcnow() - timedelta(days=180)
+        rows = Incident.query.filter(
+            Incident.company_id == company_id,
+            Incident.date_occurred >= cutoff
+        ).all()
+
+        compact = [{
+            'id': r.id, 'title': r.title,
+            'severity': getattr(r, 'severity', None),
+            'type': getattr(r, 'type', None),
+            'location': getattr(r, 'location', None),
+            'date': r.date_occurred.isoformat() if r.date_occurred else None,
+        } for r in rows]
+
+        prompt = f"""Detect anomalies in this incident set.
+
+INCIDENTS:
+{json.dumps(compact)}
+
+Return JSON:
+{{ "anomalies": [
+  {{ "title":"...","description":"...","explanation":"...","severity":"low|medium|high" }}
+] }}"""
+
+        try:
+            result, model_info, usage, dur = call_gemini(
+                prompt, temperature=float(ai_opts.get('temperature', 0.4)),
+                max_tokens=2048,
+            )
+        except Exception as ai_err:
+            log_ai_call('predictive_anomalies', success=False, error_message=str(ai_err),
+                        current_user=current_user, company_id=company_id)
+            return jsonify({'success': False, 'error': 'AI failed', 'code': 'AI_UNAVAILABLE'}), 503
+
+        log_ai_call('predictive_anomalies', model_info=model_info, usage=usage,
+                    duration_ms=dur, current_user=current_user, company_id=company_id)
+
+        return jsonify(ai_envelope(result, model_info, usage)), 200
+
+    except Exception as e:
+        current_app.logger.error(f"predictive_anomalies error: {e}")
+        return jsonify({'success': False, 'error': 'Server error', 'code': 'INTERNAL_ERROR'}), 500
+
+
+@app.route('/api/analytics/risk-narrative/ai', methods=['POST', 'OPTIONS'])
+@jwt_required
+def predictive_narrative():
+    if request.method == 'OPTIONS':
+        return jsonify({'status': 'ok'}), 200
+
+    try:
+        current_user = request.user
+        company_id = get_company_id_for_user(current_user)
+        data = request.get_json() or {}
+        ai_opts = data.get('ai_options') or {}
+
+        cutoff = datetime.utcnow() - timedelta(days=180)
+        rows = Incident.query.filter(
+            Incident.company_id == company_id,
+            Incident.date_occurred >= cutoff
+        ).all()
+
+        summary = {
+            'total': len(rows),
+            'by_severity': {},
+            'by_type': {},
+        }
+        for r in rows:
+            s = getattr(r, 'severity', None) or 'unknown'
+            t = getattr(r, 'type', None) or 'unknown'
+            summary['by_severity'][s] = summary['by_severity'].get(s, 0) + 1
+            summary['by_type'][t] = summary['by_type'].get(t, 0) + 1
+
+        prompt = f"""Write a 1-2 paragraph risk narrative for leadership based on this data:
+
+{json.dumps(summary)}
+
+Return JSON:
+{{ "narrative": {{ "summary":"...","keyRisks":["..."],"recommendations":["..."] }} }}"""
+
+        try:
+            result, model_info, usage, dur = call_gemini(
+                prompt, temperature=float(ai_opts.get('temperature', 0.6)),
+                max_tokens=2048,
+            )
+        except Exception as ai_err:
+            log_ai_call('predictive_narrative', success=False, error_message=str(ai_err),
+                        current_user=current_user, company_id=company_id)
+            return jsonify({'success': False, 'error': 'AI failed', 'code': 'AI_UNAVAILABLE'}), 503
+
+        log_ai_call('predictive_narrative', model_info=model_info, usage=usage,
+                    duration_ms=dur, current_user=current_user, company_id=company_id)
+
+        return jsonify(ai_envelope(result, model_info, usage)), 200
+
+    except Exception as e:
+        current_app.logger.error(f"predictive_narrative error: {e}")
+        return jsonify({'success': False, 'error': 'Server error', 'code': 'INTERNAL_ERROR'}), 500
+
+
+@app.route('/api/analytics/model-recommendation', methods=['POST', 'OPTIONS'])
+@jwt_required
+def predictive_model_recommendation():
+    if request.method == 'OPTIONS':
+        return jsonify({'status': 'ok'}), 200
+
+    try:
+        current_user = request.user
+        company_id = get_company_id_for_user(current_user)
+        data = request.get_json() or {}
+
+        # Compute quick stats
+        rows = Incident.query.filter(Incident.company_id == company_id).limit(500).all()
+
+        prompt = f"""Given a safety incident dataset with {len(rows)} records,
+recommend the best forecasting model.
+
+Options: linear_regression, arima, prophet, lstm, ensemble.
+
+Return JSON:
+{{ "reasoning":"...","recommended_model":"ensemble","confidence":"low|medium|high" }}"""
+
+        try:
+            result, model_info, usage, dur = call_gemini(
+                prompt, temperature=0.4, max_tokens=1024,
+            )
+        except Exception as ai_err:
+            log_ai_call('predictive_model_recommendation', success=False,
+                        error_message=str(ai_err), current_user=current_user,
+                        company_id=company_id)
+            return jsonify({'success': False, 'error': 'AI failed', 'code': 'AI_UNAVAILABLE'}), 503
+
+        log_ai_call('predictive_model_recommendation', model_info=model_info,
+                    usage=usage, duration_ms=dur,
+                    current_user=current_user, company_id=company_id)
+
+        return jsonify(ai_envelope(result, model_info, usage)), 200
+
+    except Exception as e:
+        current_app.logger.error(f"model_recommendation error: {e}")
+        return jsonify({'success': False, 'error': 'Server error', 'code': 'INTERNAL_ERROR'}), 500
 
 # -- ERROR HANDLERS --
 
