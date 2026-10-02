@@ -831,6 +831,16 @@ ai_manager = None
 paystack = None
 PAYSTACK_AVAILABLE = True
 
+import sys
+import traceback
+
+def _excepthook(exc_type, exc_value, exc_tb):
+    print("=== UNCAUGHT EXCEPTION AT STARTUP ===", file=sys.stderr)
+    traceback.print_exception(exc_type, exc_value, exc_tb)
+    print("=== END TRACEBACK ===", file=sys.stderr)
+
+sys.excepthook = _excepthook
+
 # ===== ADVANCED COMPUTER VISION SYSTEM CLASS =====
 
 class AdvancedComputerVisionSystem:
