@@ -193,6 +193,19 @@ try:
     from paystackapi.transaction import Transaction
 except ImportError:
     pass
+
+import sys
+import traceback
+
+def _global_excepthook(exc_type, exc_value, exc_tb):
+    print("\n========== UNCAUGHT EXCEPTION ==========", file=sys.stderr, flush=True)
+    traceback.print_exception(exc_type, exc_value, exc_tb)
+    print("========== END EXCEPTION ==========\n", file=sys.stderr, flush=True)
+
+sys.excepthook = _global_excepthook
+print(">>> A: starting app.py", flush=True)
+
+
 # ===== 1. SET ENVIRONMENT VARIABLES FIRST =====
 os.environ['PYTHONIOENCODING'] = 'utf-8'
 os.environ['PYTHONUTF8'] = '1'
@@ -831,15 +844,9 @@ ai_manager = None
 paystack = None
 PAYSTACK_AVAILABLE = True
 
-import sys
-import traceback
+import os
+print(">>> B: os imported", flush=True)
 
-def _excepthook(exc_type, exc_value, exc_tb):
-    print("=== UNCAUGHT EXCEPTION AT STARTUP ===", file=sys.stderr)
-    traceback.print_exception(exc_type, exc_value, exc_tb)
-    print("=== END TRACEBACK ===", file=sys.stderr)
-
-sys.excepthook = _excepthook
 
 # ===== ADVANCED COMPUTER VISION SYSTEM CLASS =====
 
@@ -2944,10 +2951,17 @@ def create_app():
     )
     
     return app
+from flask import Flask
+print(">>> C: flask imported", flush=True)
 
+# ... whatever else you import BEFORE models
+print(">>> D: pre-models imports done", flush=True)
 from classes import *
+print(">>> E: classes", flush=True)
 from models import *
+print(">>> E: models imported", flush=True)
 from HSE import *
+print(">>> E: HSE", flush=True)
 
 app = create_app()
 # Initialize Paystack with enhanced error handling
