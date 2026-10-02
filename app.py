@@ -254,246 +254,6 @@ except ImportError:
 
 
 # ---------- KEY POOL ----------
-# Reads GEMINI_API_KEY_1 .. GEMINI_API_KEY_15 from environment
-class GeminiKeyPool:
-    def __init__(self):
-        self.keys = []
-        for i in range(1, 16):
-            k = os.environ.get(f'GEMINI_API_KEY_{i}')
-            if k and k.strip():
-                self.keys.append(k.strip())
-        # Fallback single key
-        if not self.keys:
-            k = os.environ.get('GEMINI_API_KEY')
-            if k and k.strip():
-                self.keys.append(k.strip())
-
-        self.current_index = 0
-        self.rate_limited = {}       # key -> reset_timestamp
-        self.daily_usage = {}        # key -> {'date': 'YYYY-MM-DD', 'count': N}
-
-    def available(self):
-        return GEMINI_AVAILABLE and len(self.keys) > 0
-
-    def _today(self):
-        return datetime.utcnow().strftime('%Y-%m-%d')
-
-    def _reset_if_new_day(self, key):
-        today = self._today()
-        if key not in self.daily_usage or self.daily_usage[key]['date'] != today:
-            self.daily_usage[key] = {'date': today, 'count': 0}
-
-    def get_key(self):
-        """Return (key, index) of next usable key, or raise."""
-        if not self.keys:
-            raise RuntimeError('No Gemini API keys configured')
-
-        now = time.time()
-        n = len(self.keys)
-
-        for offset in range(n):
-            idx = (self.current_index + offset) % n
-            key = self.keys[idx]
-
-            # Rate-limited?
-            reset_at = self.rate_limited.get(key, 0)
-            if reset_at > now:
-                continue
-
-            # Daily cap (Gemini free tier ≈ 1500/day; leave buffer)
-            self._reset_if_new_day(key)
-            if self.daily_usage[key]['count'] >= 1400:
-                continue
-
-            self.current_index = idx
-            return key, idx
-
-        raise RuntimeError('All Gemini API keys exhausted or rate-limited')
-
-    def record_use(self, key):
-        self._reset_if_new_day(key)
-        self.daily_usage[key]['count'] += 1
-
-    def mark_rate_limited(self, key, seconds=60):
-        self.rate_limited[key] = time.time() + seconds
-
-    def status(self):
-        now = time.time()
-        today = self._today()
-        avail = 0
-        rows = []
-        for i, key in enumerate(self.keys):
-            rl = self.rate_limited.get(key, 0) > now
-            self._reset_if_new_day(key)
-            used = self.daily_usage[key]['count']
-            if not rl and used < 1400:
-                avail += 1
-            rows.append({
-                'index': i + 1,
-                'preview': f"{key[:8]}...{key[-4:]}",
-                'rate_limited': rl,
-                'used_today': used,
-            })
-        return {
-            'available': GEMINI_AVAILABLE and len(self.keys) > 0 and avail > 0,
-            'totalKeys': len(self.keys),
-            'availableKeys': avail,
-            'keys': rows,
-            'models': ['gemini-1.5-flash', 'gemini-1.5-pro']
-        }
-
-
-key_pool = GeminiKeyPool()
-
-
-# ---------- ENVELOPE ----------
-def ai_envelope(analysis, model_info=None, usage=None, extra=None):
-    """Standard response wrapper every AI endpoint returns."""
-    payload = {
-        'success': True,
-        'analysis': analysis,
-        'model_info': model_info or {'name': 'unknown', 'provider': 'google'},
-        'usage': usage or {'prompt_tokens': 0, 'completion_tokens': 0, 'total_tokens': 0},
-        'generated_at': datetime.utcnow().isoformat() + 'Z',
-    }
-    if extra:
-        payload.update(extra)
-    return payload
-
-
-# ---------- GEMINI CALL ----------
-RCA_SYSTEM_INSTRUCTION = (
-    "You are a world-class Root Cause Analysis specialist with 25+ years of "
-    "experience across healthcare, construction, oil & gas, manufacturing, "
-    "aviation, chemical, and mining. You apply ISO 45001, OSHA, TapRooT, "
-    "Apollo RCA, 5-Why, Swiss Cheese model, and Hierarchy of Controls. "
-    "You are specific, evidence-based, and use industry terminology. "
-    "Always return valid JSON. Never include markdown code fences."
-)
-
-
-def _clean_json(text):
-    """Strip markdown fences if the model included them."""
-    t = text.strip()
-    if t.startswith('```'):
-        # Remove first line (```json or ```)
-        lines = t.split('\n', 1)
-        if len(lines) > 1:
-            t = lines[1]
-        t = t.rsplit('```', 1)[0].strip()
-    return t
-
-
-def call_gemini(prompt,
-                system_instruction=None,
-                json_mode=True,
-                temperature=0.7,
-                max_tokens=8192,
-                model_name=None):
-    """Call Gemini with key rotation. Returns (parsed_body, model_info, usage, duration_ms)."""
-    if not key_pool.available():
-        raise RuntimeError('AI service unavailable — no Gemini keys configured')
-
-    pref = model_name or 'gemini-1.5-flash'
-    start = time.time()
-    last_err = None
-
-    for attempt in range(3):
-        key, key_idx = key_pool.get_key()
-        try:
-            genai.configure(api_key=key)
-            model = genai.GenerativeModel(
-                model_name=pref,
-                system_instruction=system_instruction or RCA_SYSTEM_INSTRUCTION
-            )
-
-            cfg = {
-                'temperature': temperature,
-                'max_output_tokens': max_tokens,
-                'top_p': 0.95,
-                'top_k': 40,
-            }
-            if json_mode:
-                cfg['response_mime_type'] = 'application/json'
-
-            resp = model.generate_content(prompt, generation_config=cfg)
-            key_pool.record_use(key)
-
-            text = resp.text or ''
-            usage = {
-                'prompt_tokens': getattr(resp.usage_metadata, 'prompt_token_count', 0),
-                'completion_tokens': getattr(resp.usage_metadata, 'candidates_token_count', 0),
-                'total_tokens': getattr(resp.usage_metadata, 'total_token_count', 0),
-            }
-            duration = int((time.time() - start) * 1000)
-
-            if json_mode:
-                parsed = json.loads(_clean_json(text))
-            else:
-                parsed = text
-
-            model_info = {
-                'name': pref,
-                'provider': 'google',
-                'key_index': key_idx + 1,
-            }
-            return parsed, model_info, usage, duration
-
-        except google_exceptions.ResourceExhausted:
-            key_pool.mark_rate_limited(key, 60)
-            last_err = 'rate_limited'
-            continue
-        except json.JSONDecodeError as e:
-            last_err = f'Invalid JSON from AI: {e}'
-            continue
-        except Exception as e:
-            last_err = str(e)
-            if 'quota' in last_err.lower() or 'rate' in last_err.lower():
-                key_pool.mark_rate_limited(key, 60)
-                continue
-            # Other error — retry once then bail
-            if attempt >= 1:
-                break
-
-    raise RuntimeError(last_err or 'Gemini call failed')
-
-
-# ---------- LOG HELPER ----------
-def log_ai_call(feature, incident_id=None, sub_feature=None,
-                model_info=None, usage=None, duration_ms=None,
-                success=True, error_message=None, extra=None,
-                current_user=None, company_id=None,
-                temperature=None, depth=None, language=None):
-    """Best-effort insert into ai_generation_logs. Never raises."""
-    try:
-        log = AIGenerationLog(
-            user_id=current_user.id if current_user else None,
-            incident_id=incident_id,
-            feature=feature,
-            sub_feature=sub_feature,
-            model_preference=extra.get('model_preference') if extra else None,
-            model_used=model_info.get('name') if model_info else None,
-            key_index=model_info.get('key_index') if model_info else None,
-            prompt_tokens=usage.get('prompt_tokens') if usage else None,
-            completion_tokens=usage.get('completion_tokens') if usage else None,
-            total_tokens=usage.get('total_tokens') if usage else None,
-            duration_ms=duration_ms,
-            temperature=temperature,
-            depth=depth,
-            language=language,
-            success=success,
-            error_message=error_message,
-            extra=json.dumps(extra or {}),
-            company_id=company_id,
-        )
-        db.session.add(log)
-        db.session.commit()
-    except Exception as e:
-        db.session.rollback()
-        try:
-            current_app.logger.warning(f"log_ai_call failed: {e}")
-        except Exception:
-            pass
 
 # ===== 5. CONFIGURE LOGGING ONCE =====
 class SafeStreamHandler(logging.StreamHandler):
@@ -3887,6 +3647,249 @@ def user_to_dict(user):
         'preferred_language': getattr(user, 'preferred_language', 'en'),
         'stage': getattr(user, 'stage', '')
     }
+
+# Reads GEMINI_API_KEY_1 .. GEMINI_API_KEY_15 from environment
+class GeminiKeyPool:
+    def __init__(self):
+        self.keys = []
+        for i in range(1, 16):
+            k = os.environ.get(f'GEMINI_API_KEY_{i}')
+            if k and k.strip():
+                self.keys.append(k.strip())
+        # Fallback single key
+        if not self.keys:
+            k = os.environ.get('GEMINI_API_KEY')
+            if k and k.strip():
+                self.keys.append(k.strip())
+
+        self.current_index = 0
+        self.rate_limited = {}       # key -> reset_timestamp
+        self.daily_usage = {}        # key -> {'date': 'YYYY-MM-DD', 'count': N}
+
+    def available(self):
+        return GEMINI_AVAILABLE and len(self.keys) > 0
+
+    def _today(self):
+        return datetime.utcnow().strftime('%Y-%m-%d')
+
+    def _reset_if_new_day(self, key):
+        today = self._today()
+        if key not in self.daily_usage or self.daily_usage[key]['date'] != today:
+            self.daily_usage[key] = {'date': today, 'count': 0}
+
+    def get_key(self):
+        """Return (key, index) of next usable key, or raise."""
+        if not self.keys:
+            raise RuntimeError('No Gemini API keys configured')
+
+        now = time.time()
+        n = len(self.keys)
+
+        for offset in range(n):
+            idx = (self.current_index + offset) % n
+            key = self.keys[idx]
+
+            # Rate-limited?
+            reset_at = self.rate_limited.get(key, 0)
+            if reset_at > now:
+                continue
+
+            # Daily cap (Gemini free tier ≈ 1500/day; leave buffer)
+            self._reset_if_new_day(key)
+            if self.daily_usage[key]['count'] >= 1400:
+                continue
+
+            self.current_index = idx
+            return key, idx
+
+        raise RuntimeError('All Gemini API keys exhausted or rate-limited')
+
+    def record_use(self, key):
+        self._reset_if_new_day(key)
+        self.daily_usage[key]['count'] += 1
+
+    def mark_rate_limited(self, key, seconds=60):
+        self.rate_limited[key] = time.time() + seconds
+
+    def status(self):
+        now = time.time()
+        today = self._today()
+        avail = 0
+        rows = []
+        for i, key in enumerate(self.keys):
+            rl = self.rate_limited.get(key, 0) > now
+            self._reset_if_new_day(key)
+            used = self.daily_usage[key]['count']
+            if not rl and used < 1400:
+                avail += 1
+            rows.append({
+                'index': i + 1,
+                'preview': f"{key[:8]}...{key[-4:]}",
+                'rate_limited': rl,
+                'used_today': used,
+            })
+        return {
+            'available': GEMINI_AVAILABLE and len(self.keys) > 0 and avail > 0,
+            'totalKeys': len(self.keys),
+            'availableKeys': avail,
+            'keys': rows,
+            'models': ['gemini-1.5-flash', 'gemini-1.5-pro']
+        }
+
+
+key_pool = GeminiKeyPool()
+
+
+# ---------- ENVELOPE ----------
+def ai_envelope(analysis, model_info=None, usage=None, extra=None):
+    """Standard response wrapper every AI endpoint returns."""
+    payload = {
+        'success': True,
+        'analysis': analysis,
+        'model_info': model_info or {'name': 'unknown', 'provider': 'google'},
+        'usage': usage or {'prompt_tokens': 0, 'completion_tokens': 0, 'total_tokens': 0},
+        'generated_at': datetime.utcnow().isoformat() + 'Z',
+    }
+    if extra:
+        payload.update(extra)
+    return payload
+
+
+# ---------- GEMINI CALL ----------
+RCA_SYSTEM_INSTRUCTION = (
+    "You are a world-class Root Cause Analysis specialist with 25+ years of "
+    "experience across healthcare, construction, oil & gas, manufacturing, "
+    "aviation, chemical, and mining. You apply ISO 45001, OSHA, TapRooT, "
+    "Apollo RCA, 5-Why, Swiss Cheese model, and Hierarchy of Controls. "
+    "You are specific, evidence-based, and use industry terminology. "
+    "Always return valid JSON. Never include markdown code fences."
+)
+
+
+def _clean_json(text):
+    """Strip markdown fences if the model included them."""
+    t = text.strip()
+    if t.startswith('```'):
+        # Remove first line (```json or ```)
+        lines = t.split('\n', 1)
+        if len(lines) > 1:
+            t = lines[1]
+        t = t.rsplit('```', 1)[0].strip()
+    return t
+
+
+def call_gemini(prompt,
+                system_instruction=None,
+                json_mode=True,
+                temperature=0.7,
+                max_tokens=8192,
+                model_name=None):
+    """Call Gemini with key rotation. Returns (parsed_body, model_info, usage, duration_ms)."""
+    if not key_pool.available():
+        raise RuntimeError('AI service unavailable — no Gemini keys configured')
+
+    pref = model_name or 'gemini-1.5-flash'
+    start = time.time()
+    last_err = None
+
+    for attempt in range(3):
+        key, key_idx = key_pool.get_key()
+        try:
+            genai.configure(api_key=key)
+            model = genai.GenerativeModel(
+                model_name=pref,
+                system_instruction=system_instruction or RCA_SYSTEM_INSTRUCTION
+            )
+
+            cfg = {
+                'temperature': temperature,
+                'max_output_tokens': max_tokens,
+                'top_p': 0.95,
+                'top_k': 40,
+            }
+            if json_mode:
+                cfg['response_mime_type'] = 'application/json'
+
+            resp = model.generate_content(prompt, generation_config=cfg)
+            key_pool.record_use(key)
+
+            text = resp.text or ''
+            usage = {
+                'prompt_tokens': getattr(resp.usage_metadata, 'prompt_token_count', 0),
+                'completion_tokens': getattr(resp.usage_metadata, 'candidates_token_count', 0),
+                'total_tokens': getattr(resp.usage_metadata, 'total_token_count', 0),
+            }
+            duration = int((time.time() - start) * 1000)
+
+            if json_mode:
+                parsed = json.loads(_clean_json(text))
+            else:
+                parsed = text
+
+            model_info = {
+                'name': pref,
+                'provider': 'google',
+                'key_index': key_idx + 1,
+            }
+            return parsed, model_info, usage, duration
+
+        except google_exceptions.ResourceExhausted:
+            key_pool.mark_rate_limited(key, 60)
+            last_err = 'rate_limited'
+            continue
+        except json.JSONDecodeError as e:
+            last_err = f'Invalid JSON from AI: {e}'
+            continue
+        except Exception as e:
+            last_err = str(e)
+            if 'quota' in last_err.lower() or 'rate' in last_err.lower():
+                key_pool.mark_rate_limited(key, 60)
+                continue
+            # Other error — retry once then bail
+            if attempt >= 1:
+                break
+
+    raise RuntimeError(last_err or 'Gemini call failed')
+
+
+# ---------- LOG HELPER ----------
+def log_ai_call(feature, incident_id=None, sub_feature=None,
+                model_info=None, usage=None, duration_ms=None,
+                success=True, error_message=None, extra=None,
+                current_user=None, company_id=None,
+                temperature=None, depth=None, language=None):
+    """Best-effort insert into ai_generation_logs. Never raises."""
+    try:
+        log = AIGenerationLog(
+            user_id=current_user.id if current_user else None,
+            incident_id=incident_id,
+            feature=feature,
+            sub_feature=sub_feature,
+            model_preference=extra.get('model_preference') if extra else None,
+            model_used=model_info.get('name') if model_info else None,
+            key_index=model_info.get('key_index') if model_info else None,
+            prompt_tokens=usage.get('prompt_tokens') if usage else None,
+            completion_tokens=usage.get('completion_tokens') if usage else None,
+            total_tokens=usage.get('total_tokens') if usage else None,
+            duration_ms=duration_ms,
+            temperature=temperature,
+            depth=depth,
+            language=language,
+            success=success,
+            error_message=error_message,
+            extra=json.dumps(extra or {}),
+            company_id=company_id,
+        )
+        db.session.add(log)
+        db.session.commit()
+    except Exception as e:
+        db.session.rollback()
+        try:
+            current_app.logger.warning(f"log_ai_call failed: {e}")
+        except Exception:
+            pass
+
+
 
 class MedicalAISystem:
     def __init__(self, app=None):
