@@ -250,20 +250,6 @@ except:
     except:
         pass
 
-GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
-    current_app.logger.info("✅ Gemini AI configured successfully")
-else:
-    current_app.logger.warning("⚠️ GEMINI_API_KEY not set — AI features disabled")
-
-try:
-    import google.generativeai as genai
-    from google.api_core import exceptions as google_exceptions
-    GEMINI_AVAILABLE = True
-except ImportError:
-    GEMINI_AVAILABLE = False
-    current_app.logger.warning("google-generativeai not installed — AI features disabled") if current_app else None
 
 
 # ---------- KEY POOL ----------
@@ -330,6 +316,44 @@ def setup_logging():
 
 # Setup logging ONCE
 logger = setup_logging()
+
+# ---------- Gemini SDK import ----------
+try:
+    import google.generativeai as genai
+    from google.api_core import exceptions as google_exceptions
+    GEMINI_AVAILABLE = True
+except ImportError:
+    GEMINI_AVAILABLE = False
+    genai = None
+    google_exceptions = None
+    logger.warning("⚠️ google-generativeai not installed — AI features disabled")
+
+
+# ---------- Gemini API key(s) ----------
+GEMINI_API_KEYS = []
+for _i in range(1, 16):
+    _k = os.environ.get(f'GEMINI_API_KEY_{_i}')
+    if _k and _k.strip():
+        GEMINI_API_KEYS.append(_k.strip())
+
+if not GEMINI_API_KEYS:
+    _single = os.environ.get('GEMINI_API_KEY')
+    if _single and _single.strip():
+        GEMINI_API_KEYS.append(_single.strip())
+
+
+# ---------- Configure SDK with the first key ----------
+if GEMINI_AVAILABLE and GEMINI_API_KEYS:
+    try:
+        genai.configure(api_key=GEMINI_API_KEYS[0])
+        logger.info("✅ Gemini AI configured — %d key(s) available", len(GEMINI_API_KEYS))
+    except Exception as _e:
+        logger.warning("⚠️ Gemini configure failed: %s", _e)
+else:
+    if not GEMINI_AVAILABLE:
+        logger.warning("⚠️ Gemini SDK not available — AI features disabled")
+    if not GEMINI_API_KEYS:
+        logger.warning("⚠️ No GEMINI_API_KEY(_1.._15) set — AI features disabled")
 
 # ===== 6. DEEPSEEK CONFIGURATION =====
 deepseek_api_key = os.environ.get('DEEPSEEK_API_KEY')
