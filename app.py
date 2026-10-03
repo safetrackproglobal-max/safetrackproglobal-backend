@@ -12443,6 +12443,157 @@ def analyze_documents_multi():
             'details': str(e) if current_app.debug else 'An unexpected error occurred during batch processing.'
         }), 500
 
+# =============================================================================
+# AI ASSISTANT CHAT PERSISTENCE
+# =============================================================================
+
+@app.route('/api/incidents/<int:incident_id>/ai-assistant/session',
+           methods=['POST', 'OPTIONS'])
+@jwt_required
+def ai_fishbones_assistant_session(incident_id):
+    """Get or create the current AI Assistant chat session for this incident + user."""
+    if request.method == 'OPTIONS':
+        return jsonify({'status': 'ok'}), 200
+
+    try:
+        current_user = request.user
+        incident, error, code = check_incident_access(incident_id, current_user)
+        if error:
+            return jsonify(error), code
+
+        from models import db, AIAssistantSession
+
+        session = AIAssistantSession.query.filter_by(
+            incident_id=incident_id,
+            user_id=current_user.id,
+            is_archived=False,
+        ).order_by(AIAssistantSession.updated_at.desc()).first()
+
+        if not session:
+            session = AIAssistantSession(
+                incident_id=incident_id,
+                user_id=current_user.id,
+                scope='assistant',
+                title=f'Chat about incident #{incident_id}',
+            )
+            db.session.add(session)
+            db.session.commit()
+
+        return jsonify({'success': True, 'session': session.to_dict()}), 200
+
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"ai_assistant_session error: {e}")
+        return jsonify({
+            'success': False,
+            'error': 'Failed to load chat session',
+            'code': 'INTERNAL_ERROR'
+        }), 500
+
+
+@app.route('/api/incidents/<int:incident_id>/ai-assistant/messages',
+           methods=['GET', 'POST', 'OPTIONS'])
+@jwt_required
+def ai_fishbone_assistant_messages(incident_id):
+    """List or append AI Assistant chat messages for the current user."""
+    if request.method == 'OPTIONS':
+        return jsonify({'status': 'ok'}), 200
+
+    try:
+        current_user = request.user
+        incident, error, code = check_incident_access(incident_id, current_user)
+        if error:
+            return jsonify(error), code
+
+        from models import db, AIAssistantSession, AIAssistantMessage
+
+        session = AIAssistantSession.query.filter_by(
+            incident_id=incident_id,
+            user_id=current_user.id,
+            is_archived=False,
+        ).order_by(AIAssistantSession.updated_at.desc()).first()
+
+        # ---------- GET ----------
+        if request.method == 'GET':
+            if not session:
+                return jsonify({
+                    'success': True,
+                    'session_id': None,
+                    'messages': [],
+                }), 200
+
+            msgs = AIAssistantMessage.query.filter_by(session_id=session.id) \
+                .order_by(AIAssistantMessage.created_at.asc()).all()
+
+            return jsonify({
+                'success': True,
+                'session_id': session.id,
+                'messages': [m.to_dict() for m in msgs],
+            }), 200
+
+        # ---------- POST ----------
+        data = request.get_json() or {}
+        role = (data.get('role') or '').strip()
+        content = (data.get('content') or '').strip()
+
+        if role not in ('user', 'assistant'):
+            return jsonify({
+                'success': False,
+                'error': 'role must be "user" or "assistant"',
+                'code': 'INVALID_ROLE',
+            }), 400
+        if not content:
+            return jsonify({
+                'success': False,
+                'error': 'content is required',
+                'code': 'MISSING_CONTENT',
+            }), 400
+
+        # Lazy-create session on first POST
+        if not session:
+            session = AIAssistantSession(
+                incident_id=incident_id,
+                user_id=current_user.id,
+                scope='assistant',
+                title=f'Chat about incident #{incident_id}',
+            )
+            db.session.add(session)
+            db.session.flush()
+
+        msg = AIAssistantMessage(
+            session_id=session.id,
+            role=role,
+            content=content,
+            model_used=data.get('model_used'),
+            key_index=data.get('key_index'),
+            prompt_tokens=data.get('prompt_tokens'),
+            completion_tokens=data.get('completion_tokens'),
+            total_tokens=data.get('total_tokens'),
+            duration_ms=data.get('duration_ms'),
+            is_fallback=bool(data.get('is_fallback', False)),
+        )
+        db.session.add(msg)
+        session.updated_at = datetime.utcnow()
+        db.session.commit()
+
+        return jsonify({
+            'success': True,
+            'session_id': session.id,
+            'message': msg.to_dict(),
+        }), 201
+
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"ai_assistant_messages error: {e}")
+        import traceback
+        current_app.logger.error(traceback.format_exc())
+        return jsonify({
+            'success': False,
+            'error': 'Failed to process chat message',
+            'code': 'INTERNAL_ERROR',
+        }), 500
+
+
 # Incidents - Report
 @app.route('/api/incidents/report', methods=['POST', 'OPTIONS'])
 @jwt_required
