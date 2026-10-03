@@ -3836,7 +3836,7 @@ def call_gemini(prompt,
     if not key_pool.available():
         raise RuntimeError('AI service unavailable — no Gemini keys configured')
 
-    pref = model_name or 'gemini-1.5-flash'
+    pref = model_name or 'gemini-flash-latest'
     start = time.time()
     last_err = None
 
