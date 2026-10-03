@@ -3905,15 +3905,71 @@ def log_ai_call(feature, incident_id=None, sub_feature=None,
                 model_info=None, usage=None, duration_ms=None,
                 success=True, error_message=None, extra=None,
                 current_user=None, company_id=None,
-                temperature=None, depth=None, language=None):
-    """Best-effort insert into ai_generation_logs. Never raises."""
+                temperature=None, depth=None, language=None,
+                model_preference=None):
+    """
+    Best-effort insert into ai_generation_logs. NEVER raises.
+
+    - user_id      : required. If missing, the log is skipped (nothing to record).
+    - company_id   : optional. Auto-resolved from incident/user when not given.
+                     If the resolved id doesn't exist in `companies`, it is
+                     silently dropped to NULL. NO fallback id is ever invented.
+    - Never propagates an exception — an AI call must never fail because
+      logging failed.
+    """
     try:
+        # ---- Resolve user_id (required) ----
+        user_id = None
+        if current_user is not None:
+            user_id = getattr(current_user, 'id', None)
+        elif extra and extra.get('user_id'):
+            user_id = extra.get('user_id')
+
+        if not user_id:
+            try:
+                current_app.logger.warning(
+                    f"log_ai_call skipped — no user_id (feature={feature})"
+                )
+            except Exception:
+                pass
+            return
+
+        # ---- Resolve company_id (optional, NO fallback) ----
+        if company_id is None and incident_id:
+            try:
+                from models import Incident
+                inc = Incident.query.get(incident_id)
+                if inc is not None:
+                    company_id = getattr(inc, 'company_id', None)
+            except Exception:
+                pass
+
+        if company_id is None and current_user is not None:
+            company_id = getattr(current_user, 'company_id', None)
+
+        # ---- Verify the resolved company_id actually exists ----
+        # Prevents FK failures when a stale id slips through.
+        if company_id is not None:
+            try:
+                from models import Company
+                exists = db.session.query(
+                    Company.query.filter_by(id=company_id).exists()
+                ).scalar()
+                if not exists:
+                    company_id = None
+            except Exception:
+                company_id = None
+
+        # ---- Insert ----
         log = AIGenerationLog(
-            user_id=current_user.id if current_user else None,
+            user_id=user_id,
             incident_id=incident_id,
             feature=feature,
             sub_feature=sub_feature,
-            model_preference=extra.get('model_preference') if extra else None,
+            model_preference=(
+                model_preference
+                or (extra.get('model_preference') if extra else None)
+            ),
             model_used=model_info.get('name') if model_info else None,
             key_index=model_info.get('key_index') if model_info else None,
             prompt_tokens=usage.get('prompt_tokens') if usage else None,
@@ -3925,18 +3981,23 @@ def log_ai_call(feature, incident_id=None, sub_feature=None,
             language=language,
             success=success,
             error_message=error_message,
+            retry_count=0,
             extra=json.dumps(extra or {}),
-            company_id=company_id,
+            company_id=company_id,          # may legitimately be None
         )
         db.session.add(log)
         db.session.commit()
+
     except Exception as e:
-        db.session.rollback()
+        # Fire-and-forget: never break the AI call because logging failed.
         try:
-            current_app.logger.warning(f"log_ai_call failed: {e}")
+            db.session.rollback()
         except Exception:
             pass
-
+        try:
+            current_app.logger.warning(f"log_ai_call failed (non-fatal): {e}")
+        except Exception:
+            pass
 
 
 class MedicalAISystem:
@@ -6272,75 +6333,108 @@ def jwt_required(f):
             
             # ==================== 10. USAGE STATS CALCULATION ====================
             print(f"\n📈 USAGE STATS CALCULATION:")
-            
-            # Get plan limits from normalized data
-            plan_limits = normalized_plan_data['limits']
-            
-            # Get today's AI usage (only from DB for accuracy)
+
+            # ---------- SAFE HELPERS (null-safe arithmetic) ----------
+            def safe_int(value, default=0):
+                """
+                Coerce any value to int. Returns `default` when value is None
+                or un-convertible. This is the ONLY way we do arithmetic on
+                user counters — prevents 'int - None' crashes.
+                """
+                if value is None:
+                    return default
+                try:
+                    return int(value)
+                except (ValueError, TypeError):
+                    return default
+
+            def get_limit_value(limit, fallback=0):
+                """Convert plan limit to int. Handles 'Unlimited', None, strings."""
+                if limit == 'Unlimited':
+                    return 999999
+                if limit is None:
+                    return fallback
+                try:
+                    return int(limit)
+                except (ValueError, TypeError):
+                    return fallback
+
+            # Use NORMALIZED plan limits (already fetched in section 9)
+            plan_limits = normalized_plan_data.get('limits', {}) or {}
+
+            # ---------- Today's AI usage (best-effort) ----------
             today = datetime.utcnow().date()
             ai_documents_today = 0
             ai_chat_today = 0
-            
+
             if not cached_data:
                 try:
-                    # Try to get AI document generations
                     if 'AIDocumentGeneration' in globals():
                         ai_documents_today = AIDocumentGeneration.query.filter(
                             AIDocumentGeneration.user_id == user.id,
                             db.func.date(AIDocumentGeneration.created_at) == today
-                        ).count()
+                        ).count() or 0
                 except Exception as e:
                     print(f"  ⚠️  Could not get AI document count: {e}")
-                
+
                 try:
-                    # Try to get AI chat messages
                     if 'AIChatMessage' in globals():
                         ai_chat_today = AIChatMessage.query.filter(
                             AIChatMessage.user_id == user.id,
                             db.func.date(AIChatMessage.created_at) == today
-                        ).count()
+                        ).count() or 0
                 except Exception as e:
                     print(f"  ⚠️  Could not get AI chat count: {e}")
-            
-            # Convert plan limits to appropriate types
-            def get_limit_value(limit):
-                """Convert limit to integer, handling 'Unlimited'"""
-                if limit == 'Unlimited' or limit is None:
-                    return 999999  # Large number for unlimited
-                try:
-                    return int(limit)
-                except (ValueError, TypeError):
-                    return 0
-            
-            # Set usage stats (use cached or DB values)
+
+            # ---------- Normalize ALL values to int ----------
+            api_calls_used     = safe_int(getattr(user, 'monthly_api_calls_used', 0))
+            api_calls_limit    = get_limit_value(plan_limits.get('api_calls_per_month'), 50)
+
+            uploads_limit      = get_limit_value(plan_limits.get('uploads_per_month'), 5)
+            ai_requests_limit  = get_limit_value(plan_limits.get('ai_requests_per_month'), 10)
+            video_limit        = get_limit_value(plan_limits.get('video_analysis_minutes'), 10)
+
+            # storage_used_mb is a real column now but keep safe_int for defense
+            storage_used_mb    = safe_int(getattr(user, 'storage_used_mb', 0))
+            storage_limit_mb   = 1024
+
+            video_used         = safe_int(getattr(user, 'monthly_video_minutes_used', 0))
+
+            ai_documents_today = safe_int(ai_documents_today)
+            ai_chat_today      = safe_int(ai_chat_today)
+
+            daily_upload_limit = max(1, uploads_limit // 30)
+            daily_chat_limit   = max(1, ai_requests_limit // 30)
+
+            # ---------- Build usage stats (no subtraction can hit None now) ----------
             usage_stats = {
                 'api_calls': {
-                    'used': getattr(user, 'monthly_api_calls_used', 0),
-                    'limit': get_limit_value(plan_limits.get('api_calls_per_month', 50)),
-                    'remaining': max(0, get_limit_value(plan_limits.get('api_calls_per_month', 50)) - getattr(user, 'monthly_api_calls_used', 0))
+                    'used': api_calls_used,
+                    'limit': api_calls_limit,
+                    'remaining': max(0, api_calls_limit - api_calls_used),
                 },
                 'ai_documents': {
                     'today': ai_documents_today,
-                    'daily_limit': get_limit_value(plan_limits.get('uploads_per_month', 5)) // 30,
-                    'remaining': max(0, get_limit_value(plan_limits.get('uploads_per_month', 5)) // 30 - ai_documents_today)
+                    'daily_limit': daily_upload_limit,
+                    'remaining': max(0, daily_upload_limit - ai_documents_today),
                 },
                 'ai_chat': {
                     'today': ai_chat_today,
-                    'daily_limit': get_limit_value(plan_limits.get('ai_requests_per_month', 10)) // 30,
-                    'remaining': max(0, get_limit_value(plan_limits.get('ai_requests_per_month', 10)) // 30 - ai_chat_today)
+                    'daily_limit': daily_chat_limit,
+                    'remaining': max(0, daily_chat_limit - ai_chat_today),
                 },
                 'storage': {
-                    'used_mb': getattr(user, 'storage_used_mb', 0),
-                    'limit_mb': 1024,
-                    'remaining_mb': max(0, 1024 - getattr(user, 'storage_used_mb', 0))
+                    'used_mb': storage_used_mb,
+                    'limit_mb': storage_limit_mb,
+                    'remaining_mb': max(0, storage_limit_mb - storage_used_mb),
                 },
                 'video_analysis': {
-                    'used_minutes': getattr(user, 'monthly_video_minutes_used', 0),
-                    'limit_minutes': get_limit_value(plan_limits.get('video_analysis_minutes', 10)),
-                    'remaining_minutes': max(0, get_limit_value(plan_limits.get('video_analysis_minutes', 10)) - getattr(user, 'monthly_video_minutes_used', 0))
-                }
+                    'used_minutes': video_used,
+                    'limit_minutes': video_limit,
+                    'remaining_minutes': max(0, video_limit - video_used),
+                },
             }
-            
+
             print(f"  Usage stats calculated:")
             print(f"    API calls: {usage_stats['api_calls']['used']}/{usage_stats['api_calls']['limit']}")
             print(f"    AI documents: {usage_stats['ai_documents']['today']}/{usage_stats['ai_documents']['daily_limit']}")
@@ -6415,7 +6509,25 @@ def jwt_required(f):
             print("❌"*50)
             print(f"Error: {str(e)}")
             import traceback
-            traceback.print_exc()
+            tb = traceback.format_exc()
+            print(tb)
+
+            # Log to logger.error so Railway doesn't drop it under load
+            try:
+                current_app.logger.error("=" * 70)
+                current_app.logger.error("❌ JWT DECORATOR ERROR")
+                current_app.logger.error(f"Error: {e}")
+                try:
+                    current_app.logger.error(f"Path: {request.path}")
+                    current_app.logger.error(f"Method: {request.method}")
+                except Exception:
+                    pass
+                current_app.logger.error("Full traceback:")
+                current_app.logger.error(tb)
+                current_app.logger.error("=" * 70)
+            except Exception:
+                pass
+
             return jsonify({
                 'success': False,
                 'error': 'Authentication failed',
@@ -6993,21 +7105,42 @@ def filter_by_company(query, model, user):
 # ==================== HELPER FUNCTIONS ====================
 
 def get_company_id_for_user(user):
-    """Get company_id from user, with sensible fallback."""
+    """
+    Return the effective company_id for a user, or None.
+
+    Returns None when:
+      - user is falsy
+      - user is a bypass user (super_admin, system_team, platform_owner)
+      - user has no company association
+
+    NEVER returns a fallback id. When there is no real company,
+    the caller must handle None appropriately (e.g. allow NULL company_id).
+    """
     if not user:
         return None
-    
-    # Try direct attribute
+
+    # Bypass users have no single company context
+    if (
+        getattr(user, 'is_super_admin', False) or
+        getattr(user, 'is_system_team', False) or
+        getattr(user, 'is_platform_owner', False)
+    ):
+        return None
+
+    # 1) Direct column
     company_id = getattr(user, 'company_id', None)
     if company_id:
         return company_id
-    
-    # Try nested company relationship
-    if hasattr(user, 'company') and user.company:
-        return user.company.id
-    
-    # Fallback for super admin / system team
-    return 1
+
+    # 2) Relationship fallback (still a real company, not a guess)
+    company = getattr(user, 'company', None)
+    if company is not None:
+        cid = getattr(company, 'id', None)
+        if cid:
+            return cid
+
+    # 3) No company — return None, do NOT default to 1
+    return None
 
 def check_incident_access(incident_id, user):
     """
