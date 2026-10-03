@@ -7175,13 +7175,32 @@ class PredictiveScenario(db.Model):
 
 
 class AIGenerationLog(db.Model):
-    """Audit log of every AI call: which model, which key, how long, which feature."""
+    """Audit log of every AI call: which model, which key, how long, which feature.
+
+    Two independent identifiers:
+      - user_id     : the individual who triggered the AI call (required)
+      - company_id  : the organisation context, when applicable (optional)
+    """
     __tablename__ = 'ai_generation_logs'
 
     id = db.Column(db.Integer, primary_key=True)
-    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False, index=True)
-    incident_id = db.Column(db.Integer, db.ForeignKey('incidents.id', ondelete='SET NULL'), index=True)
 
+    # ---- Who (always present) ----
+    user_id = db.Column(
+        db.Integer,
+        db.ForeignKey('users.id'),
+        nullable=False,
+        index=True
+    )
+
+    # ---- What incident (optional) ----
+    incident_id = db.Column(
+        db.Integer,
+        db.ForeignKey('incidents.id', ondelete='SET NULL'),
+        index=True
+    )
+
+    # ---- Which feature ----
     feature = db.Column(db.String(80), nullable=False, index=True)
     # fishbone_full | fishbone_expand | fishbone_actions | fishbone_five_whys
     # analysis_full | analysis_chat | analysis_report
@@ -7189,26 +7208,41 @@ class AIGenerationLog(db.Model):
     # predictive_full | predictive_scenario | predictive_anomalies | predictive_narrative
 
     sub_feature = db.Column(db.String(80))
+
+    # ---- Which AI model / key served the call ----
     model_preference = db.Column(db.String(50), default='auto')
     model_used = db.Column(db.String(100))
     key_index = db.Column(db.Integer)
 
+    # ---- Token usage ----
     prompt_tokens = db.Column(db.Integer)
     completion_tokens = db.Column(db.Integer)
     total_tokens = db.Column(db.Integer)
 
+    # ---- Timings & config ----
     duration_ms = db.Column(db.Integer)
     temperature = db.Column(db.Float)
     depth = db.Column(db.String(30))
     language = db.Column(db.String(30))
 
+    # ---- Outcome ----
     success = db.Column(db.Boolean, default=True, index=True)
     error_message = db.Column(db.Text)
     retry_count = db.Column(db.Integer, default=0)
 
-    extra = db.Column(db.Text, default='{}')                     # JSON string
+    # ---- Extras (JSON string) ----
+    extra = db.Column(db.Text, default='{}')
 
-    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), nullable=False, index=True)
+    # ---- Which organisation (optional) ----
+    # Super admins / system team / users without a company → NULL
+    # ON DELETE SET NULL so removing a company keeps the audit log
+    company_id = db.Column(
+        db.Integer,
+        db.ForeignKey('companies.id', ondelete='SET NULL'),
+        nullable=True,
+        index=True
+    )
+
     created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
 
     def to_dict(self):
@@ -7218,10 +7252,12 @@ class AIGenerationLog(db.Model):
                 return json.loads(f) if isinstance(f, str) else (f or d)
             except Exception:
                 return d
+
         return {
             'id': self.id,
             'user_id': self.user_id,
             'incident_id': self.incident_id,
+            'company_id': self.company_id,           # 👈 surfaced now
             'feature': self.feature,
             'sub_feature': self.sub_feature,
             'model_info': {
@@ -7235,8 +7271,12 @@ class AIGenerationLog(db.Model):
                 'total': self.total_tokens,
             },
             'duration_ms': self.duration_ms,
+            'temperature': self.temperature,
+            'depth': self.depth,
+            'language': self.language,
             'success': self.success,
             'error_message': self.error_message,
+            'retry_count': self.retry_count,
             'extra': safe_json(self.extra),
             'created_at': self.created_at.isoformat() if self.created_at else None,
         }
@@ -7244,6 +7284,7 @@ class AIGenerationLog(db.Model):
     __table_args__ = (
         db.Index('idx_ai_log_user', 'user_id'),
         db.Index('idx_ai_log_incident', 'incident_id'),
+        db.Index('idx_ai_log_company', 'company_id'),   # 👈 added
         db.Index('idx_ai_log_feature', 'feature'),
         db.Index('idx_ai_log_created', 'created_at'),
     )
