@@ -40,15 +40,15 @@ class User(db.Model):
     documents_uploaded_at = db.Column(db.DateTime, nullable=True)
     
     # ==================== ACTIVITY TRACKING ====================
-    login_count = db.Column(db.Integer, default=0)
-    activity_count = db.Column(db.Integer, default=0)
-    total_session_duration = db.Column(db.Integer, default=0)
+    login_count = db.Column(db.Integer, default=0, server_default='0')
+    activity_count = db.Column(db.Integer, default=0, server_default='0')
+    total_session_duration = db.Column(db.Integer, default=0, server_default='0')
     last_activity = db.Column(db.DateTime, nullable=True)
-    performance_score = db.Column(db.Integer, default=0)
-    performance_grade = db.Column(db.String(5), default='F')
-    login_frequency = db.Column(db.Float, default=0)
-    activity_rate = db.Column(db.Float, default=0)
-    avg_session_duration = db.Column(db.Float, default=0)
+    performance_score = db.Column(db.Integer, default=0, server_default='0')
+    performance_grade = db.Column(db.String(5), default='F', server_default='F')
+    login_frequency = db.Column(db.Float, default=0, server_default='0')
+    activity_rate = db.Column(db.Float, default=0, server_default='0')
+    avg_session_duration = db.Column(db.Float, default=0, server_default='0')
     
     # ==================== ADMIN FIELDS ====================
     admin_tier = db.Column(db.String(20), default='company')
@@ -81,18 +81,35 @@ class User(db.Model):
     last_payment_date = db.Column(db.DateTime, nullable=True)
     next_payment_date = db.Column(db.DateTime, nullable=True)
     
-    monthly_uploads_used = db.Column(db.Integer, default=0)
-    monthly_api_calls_used = db.Column(db.Integer, default=0)
-    monthly_ai_requests_used = db.Column(db.Integer, default=0)
-    monthly_video_minutes_used = db.Column(db.Integer, default=0)
+    # ==================== USAGE TRACKING (monthly counters) ====================
+    # ✅ All NOT NULL with DB default 0. Cannot store NULL.
+    monthly_uploads_used = db.Column(
+        db.Integer, nullable=False, default=0, server_default='0'
+    )
+    monthly_api_calls_used = db.Column(
+        db.Integer, nullable=False, default=0, server_default='0'
+    )
+    monthly_ai_requests_used = db.Column(
+        db.Integer, nullable=False, default=0, server_default='0'
+    )
+    monthly_video_minutes_used = db.Column(
+        db.Integer, nullable=False, default=0, server_default='0'
+    )
     usage_reset_date = db.Column(db.DateTime, default=datetime.utcnow)
+    
+    # ✅ Storage counter — column was missing from the DB.
+    #    The decorator reads this via getattr with a 0 fallback,
+    #    but we declare it so the model and schema agree.
+    storage_used_mb = db.Column(
+        db.Integer, nullable=False, default=0, server_default='0'
+    )
     
     is_enterprise = db.Column(db.Boolean, default=False)
     enterprise_features = db.Column(db.JSON, nullable=True)
     custom_requirements = db.Column(db.Text, nullable=True)
     
     employee_id = db.Column(db.String(50), unique=True, nullable=True, index=True) 
-    employee_count = db.Column(db.Integer, default=0)
+    employee_count = db.Column(db.Integer, default=0, server_default='0')
     department = db.Column(db.String(128), nullable=True)
     phone = db.Column(db.String(20), nullable=True)
     address = db.Column(db.Text, nullable=True)
@@ -108,15 +125,14 @@ class User(db.Model):
     avatar_url = db.Column(db.String(500), nullable=True)
 
     # ==================== PDF GENERATION ====================
-    daily_pdf_generations = db.Column(db.Integer, default=0)
-    monthly_pdf_generations = db.Column(db.Integer, default=0)
-    total_pdf_documents = db.Column(db.Integer, default=0)
+    daily_pdf_generations = db.Column(db.Integer, default=0, server_default='0')
+    monthly_pdf_generations = db.Column(db.Integer, default=0, server_default='0')
+    total_pdf_documents = db.Column(db.Integer, default=0, server_default='0')
     last_pdf_generation_at = db.Column(db.DateTime, nullable=True)
-    pdf_templates_created = db.Column(db.Integer, default=0)
-    max_pdf_templates = db.Column(db.Integer, default=10)
+    pdf_templates_created = db.Column(db.Integer, default=0, server_default='0')
+    max_pdf_templates = db.Column(db.Integer, default=10, server_default='10')
 
     # ==================== RELATIONSHIPS ====================
-    # ✅ All relationships with foreign_keys specified
     assigned_tasks = db.relationship('Task', back_populates='assigned_to', foreign_keys='Task.assigned_to_id')
     training_records = db.relationship('TrainingRecord', back_populates='user', foreign_keys='TrainingRecord.user_id')
     camera_feeds = db.relationship('CameraFeed', backref='user', lazy=True, cascade='all, delete-orphan')
@@ -143,6 +159,18 @@ class User(db.Model):
     approved_admins = db.relationship('User', backref=db.backref('approver', remote_side=[id]))
     subscription_history = db.relationship('SubscriptionHistory', backref='user', lazy=True, cascade='all, delete-orphan')
     payment_history = db.relationship('PaymentHistory', backref='user', lazy=True, cascade='all, delete-orphan')
+
+    # ---------- Null-safe helper ----------
+    @staticmethod
+    def _safe_int(value, default=0):
+        """Coerce any value to int. Returns default if None or un-convertible."""
+        if value is None:
+            return default
+        try:
+            return int(value)
+        except (ValueError, TypeError):
+            return default
+
     def to_dict(self):
         """Convert user to dictionary with admin-specific fields"""
         base_dict = {
@@ -176,14 +204,14 @@ class User(db.Model):
             'hospital_id': self.hospital_id,
             'is_enterprise': self.is_enterprise,
             'enterprise_features': self.enterprise_features,
-            'logo_url': self.company_logo,  # User's company logo
-            'company_logo': self.company_logo,  # Alternative name for consistency
-            'company_id': self.company_id,  # Also include company_id for reference
+            'logo_url': self.company_logo,
+            'company_logo': self.company_logo,
+            'company_id': self.company_id,
             'company': {
                 'id': self.company_id,
                 'name': self.company_name,
                 'logo_url': self.company_logo
-        } if self.company_id else None
+            } if self.company_id else None
         }
         
         # Add document-related fields
@@ -223,28 +251,29 @@ class User(db.Model):
             }
             base_dict.update(admin_dict)
         
-        # Add usage tracking fields for all users
+        # Add usage tracking fields for all users (null-safe)
         usage_dict = {
-            'monthly_uploads_used': self.monthly_uploads_used,
-            'monthly_api_calls_used': self.monthly_api_calls_used,
-            'monthly_ai_requests_used': self.monthly_ai_requests_used,
-            'monthly_video_minutes_used': self.monthly_video_minutes_used,
+            'monthly_uploads_used': self._safe_int(self.monthly_uploads_used),
+            'monthly_api_calls_used': self._safe_int(self.monthly_api_calls_used),
+            'monthly_ai_requests_used': self._safe_int(self.monthly_ai_requests_used),
+            'monthly_video_minutes_used': self._safe_int(self.monthly_video_minutes_used),
+            'storage_used_mb': self._safe_int(getattr(self, 'storage_used_mb', 0)),
             'remaining_limits': self.get_remaining_limits(),
             'usage_reset_date': self.usage_reset_date.isoformat() if self.usage_reset_date else None
         }
         base_dict.update(usage_dict)
         
-        # Add activity tracking fields
+        # Add activity tracking fields (null-safe)
         activity_dict = {
-            'login_count': self.login_count,
-            'activity_count': self.activity_count,
-            'performance_score': self.performance_score,
-            'performance_grade': self.performance_grade,
-            'login_frequency': self.login_frequency,
-            'activity_rate': self.activity_rate,
-            'avg_session_duration': self.avg_session_duration,
+            'login_count': self._safe_int(self.login_count),
+            'activity_count': self._safe_int(self.activity_count),
+            'performance_score': self._safe_int(self.performance_score),
+            'performance_grade': self.performance_grade or 'F',
+            'login_frequency': self.login_frequency or 0,
+            'activity_rate': self.activity_rate or 0,
+            'avg_session_duration': self.avg_session_duration or 0,
             'last_activity': self.last_activity.isoformat() if self.last_activity else None,
-            'total_session_duration': self.total_session_duration
+            'total_session_duration': self._safe_int(self.total_session_duration)
         }
         base_dict.update(activity_dict)
         
@@ -254,9 +283,9 @@ class User(db.Model):
         """Check if admin is approved and active"""
         if self.user_type not in ['admin', 'safetypro', 'system', 'platform_owner']:
             return False
-        return (self.verified and  # Email verified
-                self.approval_status == 'approved' and  # Manually approved
-                self.is_active)  # Account active
+        return (self.verified and
+                self.approval_status == 'approved' and
+                self.is_active)
     
     def can_login(self):
         """Check if user can login"""
@@ -272,43 +301,28 @@ class User(db.Model):
         return True, "OK"
     
     def get_remaining_limits(self):
-        """Get remaining usage limits based on subscription plan"""
-        # Define limits for each plan
+        """Get remaining usage limits based on subscription plan (null-safe)."""
         limits = {
-            'free': {
-                'uploads': 10,
-                'api_calls': 100,
-                'ai_requests': 50,
-                'video_minutes': 60
-            },
-            'basic': {
-                'uploads': 100,
-                'api_calls': 1000,
-                'ai_requests': 500,
-                'video_minutes': 600
-            },
-            'pro': {
-                'uploads': 1000,
-                'api_calls': 10000,
-                'ai_requests': 5000,
-                'video_minutes': 6000
-            },
-            'enterprise': {
-                'uploads': float('inf'),
-                'api_calls': float('inf'),
-                'ai_requests': float('inf'),
-                'video_minutes': float('inf')
-            }
+            'free':       {'uploads': 10,   'api_calls': 100,   'ai_requests': 50,   'video_minutes': 60},
+            'basic':      {'uploads': 100,  'api_calls': 1000,  'ai_requests': 500,  'video_minutes': 600},
+            'pro':        {'uploads': 1000, 'api_calls': 10000, 'ai_requests': 5000, 'video_minutes': 6000},
+            'enterprise': {'uploads': float('inf'), 'api_calls': float('inf'),
+                           'ai_requests': float('inf'), 'video_minutes': float('inf')}
         }
         
         effective_plan = self.get_effective_plan()
         plan_limits = limits.get(effective_plan, limits['free'])
         
+        uploads_used = self._safe_int(self.monthly_uploads_used)
+        api_calls_used = self._safe_int(self.monthly_api_calls_used)
+        ai_requests_used = self._safe_int(self.monthly_ai_requests_used)
+        video_minutes_used = self._safe_int(self.monthly_video_minutes_used)
+        
         return {
-            'uploads_remaining': max(0, plan_limits['uploads'] - self.monthly_uploads_used),
-            'api_calls_remaining': max(0, plan_limits['api_calls'] - self.monthly_api_calls_used),
-            'ai_requests_remaining': max(0, plan_limits['ai_requests'] - self.monthly_ai_requests_used),
-            'video_minutes_remaining': max(0, plan_limits['video_minutes'] - self.monthly_video_minutes_used),
+            'uploads_remaining': max(0, plan_limits['uploads'] - uploads_used),
+            'api_calls_remaining': max(0, plan_limits['api_calls'] - api_calls_used),
+            'ai_requests_remaining': max(0, plan_limits['ai_requests'] - ai_requests_used),
+            'video_minutes_remaining': max(0, plan_limits['video_minutes'] - video_minutes_used),
             'uploads_limit': plan_limits['uploads'],
             'api_calls_limit': plan_limits['api_calls'],
             'ai_requests_limit': plan_limits['ai_requests'],
@@ -318,7 +332,9 @@ class User(db.Model):
     def reset_monthly_usage(self):
         """Reset monthly usage counters"""
         now = datetime.utcnow()
-        if now.month != self.usage_reset_date.month or now.year != self.usage_reset_date.year:
+        if (not self.usage_reset_date or
+            now.month != self.usage_reset_date.month or
+            now.year != self.usage_reset_date.year):
             self.monthly_uploads_used = 0
             self.monthly_api_calls_used = 0
             self.monthly_ai_requests_used = 0
@@ -329,30 +345,23 @@ class User(db.Model):
     
     def get_effective_plan(self):
         """Get current effective plan (considering trial)"""
-        # Check if trial is active
         if self.trial_ends_at and datetime.utcnow() < self.trial_ends_at:
-            return self.trial_plan or 'pro'  # Default trial to pro
-        
-        # Check if subscription is active
+            return self.trial_plan or 'pro'
         if self.subscription_status != 'active':
             return 'free'
-        
         return self.subscription_plan or 'free'
     
     def is_trial_active(self):
         """Check if user is in trial period"""
         if not self.trial_ends_at:
             return False
-        
         return datetime.utcnow() < self.trial_ends_at
     
     def get_pricing_info(self):
         """Get pricing info for user's country and plan"""
-        # This assumes you have COUNTRY_PRICING configured in your app
         try:
-            from app import COUNTRY_PRICING  # Import your pricing config
+            from app import COUNTRY_PRICING
         except ImportError:
-            # Default pricing if not configured
             COUNTRY_PRICING = {
                 'default': {
                     'free': {'price': 0, 'currency': 'USD'},
@@ -364,24 +373,20 @@ class User(db.Model):
         
         country = self.country or 'default'
         plan = self.get_effective_plan()
-        
         country_pricing = COUNTRY_PRICING.get(country, COUNTRY_PRICING['default'])
         return country_pricing.get(plan, country_pricing['free'])
     
     def can_access_feature(self, feature_name):
-        """Check if user can access a specific feature"""
-        # This assumes you have PLANS and PLAN_REQUIREMENTS configured
+        """Check if user can access a specific feature (null-safe)."""
         try:
-            from app import PLANS, PLAN_REQUIREMENTS  # Import your plans config
+            from app import PLANS, PLAN_REQUIREMENTS
         except ImportError:
-            # Default configuration if not set
             PLANS = {
                 'free': {'limits': {'uploads_per_month': 10, 'api_calls_per_month': 100}},
                 'basic': {'limits': {'uploads_per_month': 100, 'api_calls_per_month': 1000}},
                 'pro': {'limits': {'uploads_per_month': 1000, 'api_calls_per_month': 10000}},
                 'enterprise': {'limits': {}}
             }
-            
             PLAN_REQUIREMENTS = {
                 'ai_analysis': ('pro', 'ai_requests_per_month', 'AI analysis requires Pro plan'),
                 'video_analysis': ('pro', 'video_analysis_minutes', 'Video analysis requires Pro plan'),
@@ -391,12 +396,11 @@ class User(db.Model):
             }
         
         if not PLAN_REQUIREMENTS.get(feature_name):
-            return True, None  # No restriction defined
+            return True, None
         
         required_plan, limit_field, error_msg = PLAN_REQUIREMENTS[feature_name]
         effective_plan = self.get_effective_plan()
         
-        # Check plan hierarchy
         plan_hierarchy = {'free': 0, 'basic': 1, 'pro': 2, 'enterprise': 3}
         user_level = plan_hierarchy.get(effective_plan, 0)
         required_level = plan_hierarchy.get(required_plan, 0)
@@ -404,21 +408,19 @@ class User(db.Model):
         if user_level < required_level:
             return False, error_msg
         
-        # Check usage limits if applicable
         if limit_field:
             plan_limits = PLANS.get(effective_plan, PLANS['free'])['limits']
             limit = plan_limits.get(limit_field)
             
             if limit and limit != "Unlimited":
-                # Get current usage
                 if limit_field == 'uploads_per_month':
-                    used = self.monthly_uploads_used
+                    used = self._safe_int(self.monthly_uploads_used)
                 elif limit_field == 'api_calls_per_month':
-                    used = self.monthly_api_calls_used
+                    used = self._safe_int(self.monthly_api_calls_used)
                 elif limit_field == 'ai_requests_per_month':
-                    used = self.monthly_ai_requests_used
+                    used = self._safe_int(self.monthly_ai_requests_used)
                 elif limit_field == 'video_analysis_minutes':
-                    used = self.monthly_video_minutes_used
+                    used = self._safe_int(self.monthly_video_minutes_used)
                 else:
                     used = 0
                 
@@ -430,9 +432,8 @@ class User(db.Model):
     def check_and_reset_usage(self):
         """Reset monthly usage counters if needed"""
         current_date = datetime.utcnow()
-        
-        # Reset on month change
-        if current_date.month != self.usage_reset_date.month:
+        if (not self.usage_reset_date or
+            current_date.month != self.usage_reset_date.month):
             self.monthly_uploads_used = 0
             self.monthly_api_calls_used = 0
             self.monthly_ai_requests_used = 0
@@ -442,29 +443,27 @@ class User(db.Model):
         return False
     
     def increment_usage(self, usage_type, amount=1):
-        """Increment usage counter for a specific type"""
-        self.check_and_reset_usage()  # Check if we need to reset first
+        """Increment usage counter for a specific type (null-safe)."""
+        self.check_and_reset_usage()
         
         if usage_type == 'uploads':
-            self.monthly_uploads_used += amount
+            self.monthly_uploads_used = self._safe_int(self.monthly_uploads_used) + amount
         elif usage_type == 'api_calls':
-            self.monthly_api_calls_used += amount
+            self.monthly_api_calls_used = self._safe_int(self.monthly_api_calls_used) + amount
         elif usage_type == 'ai_requests':
-            self.monthly_ai_requests_used += amount
+            self.monthly_ai_requests_used = self._safe_int(self.monthly_ai_requests_used) + amount
         elif usage_type == 'video_minutes':
-            self.monthly_video_minutes_used += amount
+            self.monthly_video_minutes_used = self._safe_int(self.monthly_video_minutes_used) + amount
         
         return True
     
     def get_subscription_days_left(self):
         """Get number of days left in subscription/trial"""
         if self.is_trial_active() and self.trial_ends_at:
-            from datetime import datetime
             days_left = (self.trial_ends_at - datetime.utcnow()).days
             return max(0, days_left)
         
         if self.subscription_ends_at and self.subscription_status == 'active':
-            from datetime import datetime
             days_left = (self.subscription_ends_at - datetime.utcnow()).days
             return max(0, days_left)
         
@@ -484,12 +483,8 @@ class User(db.Model):
         """Check if user has specific platform permission"""
         if not self.platform_permissions:
             return False
-        
-        # Platform owners have all permissions
         if self.is_platform_owner:
             return True
-        
-        # Check user-specific permissions
         return permission_name in self.platform_permissions
 
 
