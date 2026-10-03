@@ -7289,6 +7289,93 @@ class AIGenerationLog(db.Model):
         db.Index('idx_ai_log_created', 'created_at'),
     )
 
+# ============================================================================
+# AI ASSISTANT CHAT (session-based — separate from the query-log table)
+# ============================================================================
+
+class AIAssistantSession(db.Model):
+    """A persistent chat session between a user and the AI Assistant about an incident."""
+    __tablename__ = 'ai_assistant_sessions'
+
+    id = db.Column(db.Integer, primary_key=True)
+    incident_id = db.Column(
+        db.Integer,
+        db.ForeignKey('incidents.id', ondelete='CASCADE'),
+        nullable=False,
+        index=True,
+    )
+    user_id = db.Column(
+        db.Integer,
+        db.ForeignKey('users.id', ondelete='CASCADE'),
+        nullable=False,
+        index=True,
+    )
+    scope = db.Column(db.String(30), default='assistant')
+    title = db.Column(db.String(255))
+    is_archived = db.Column(db.Boolean, default=False, index=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(
+        db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
+    )
+
+    messages = db.relationship(
+        'AIAssistantMessage',
+        back_populates='session',
+        cascade='all, delete-orphan',
+        order_by='AIAssistantMessage.created_at',
+    )
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'incident_id': self.incident_id,
+            'user_id': self.user_id,
+            'scope': self.scope,
+            'title': self.title,
+            'is_archived': self.is_archived,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class AIAssistantMessage(db.Model):
+    """One message in an AI Assistant chat session."""
+    __tablename__ = 'ai_assistant_messages'
+
+    id = db.Column(db.Integer, primary_key=True)
+    session_id = db.Column(
+        db.Integer,
+        db.ForeignKey('ai_assistant_sessions.id', ondelete='CASCADE'),
+        nullable=False,
+        index=True,
+    )
+    role = db.Column(db.String(20), nullable=False)     # 'user' | 'assistant'
+    content = db.Column(db.Text, nullable=False)
+    model_used = db.Column(db.String(100))
+    key_index = db.Column(db.Integer)
+    prompt_tokens = db.Column(db.Integer)
+    completion_tokens = db.Column(db.Integer)
+    total_tokens = db.Column(db.Integer)
+    duration_ms = db.Column(db.Integer)
+    is_fallback = db.Column(db.Boolean, default=False)
+    extra = db.Column(db.JSON, default=dict)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+
+    session = db.relationship('AIAssistantSession', back_populates='messages')
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'session_id': self.session_id,
+            'role': self.role,
+            'content': self.content,
+            'model_used': self.model_used,
+            'total_tokens': self.total_tokens,
+            'is_fallback': self.is_fallback,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+        }
+
+
 __all__ = [
     # Core models
     'Industry',
@@ -7638,7 +7725,7 @@ __all__ = [
     'FishboneAnalysis', 'AIAnalysis', 'IncidentComment',
     'WitnessStatement', 'InvestigationTeamMember', 'IncidentAuditLog',
      'LessonLearned', 'LessonReaction',
-    'EscalationRule', 'EscalationHistory', 'IncidentCost', 'RegulatoryFiling', 'FishboneVersion', 'FishboneFiveWhys', 
+    'EscalationRule', 'EscalationHistory', 'IncidentCost', 'RegulatoryFiling', 'FishboneVersion', 'FishboneFiveWhys', 'AIAssistantSession', 'AIAssistantMessage', 
     'SimilarIncidentMatch', 'IncidentComparison', 'IncidentClusterAnalysis', 'PredictiveAnalyticsRun', 'PredictiveScenario', 'AIGenerationLog', 
     
 ]
