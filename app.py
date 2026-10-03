@@ -152281,10 +152281,31 @@ def ai_analysis_ask(incident_id):
         context = data.get('context') or {}
         ai_opts = data.get('ai_options') or {}
 
+        # ✅ Defensive: the frontend historically double-wrapped the payload
+        #    as { context: { context: { conversation: [...] } } }.
+        #    Unwrap if we detect that shape.
+        if isinstance(context, dict) and 'context' in context and 'conversation' not in context:
+            context = context.get('context') or {}
+
         if not question:
-            return jsonify({'success': False, 'error': 'question required', 'code': 'MISSING_QUESTION'}), 400
+            return jsonify({
+                'success': False,
+                'error': 'question required',
+                'code': 'MISSING_QUESTION'
+            }), 400
 
         history = context.get('conversation') or []
+
+        # ✅ Debug log so we can see exactly what arrived
+        try:
+            current_app.logger.info(
+                f"ai_analysis_ask: question_len={len(question)} "
+                f"history_len={len(history)} "
+                f"context_keys={list(context.keys()) if isinstance(context, dict) else type(context).__name__}"
+            )
+        except Exception:
+            pass
+
         hist_block = '\n'.join([
             f"{'Q' if m.get('role') == 'user' else 'A'}: {m.get('content', '')}"
             for m in history[-6:]
@@ -152301,27 +152322,61 @@ Answer in 3-6 sentences. Be specific and reference incident details."""
 
         try:
             text, model_info, usage, dur = call_gemini(
-                prompt, json_mode=False,
+                prompt,
+                json_mode=False,
                 temperature=float(ai_opts.get('temperature', 0.5)),
                 max_tokens=1024,
             )
         except Exception as ai_err:
-            log_ai_call('analysis_chat', incident_id=incident_id, success=False,
-                        error_message=str(ai_err), current_user=current_user,
-                        company_id=get_company_id_for_user(current_user))
-            return jsonify({'success': False, 'error': 'AI failed', 'code': 'AI_UNAVAILABLE'}), 503
+            # ✅ Log the FULL traceback for the AI call
+            import traceback
+            current_app.logger.error("=" * 70)
+            current_app.logger.error("❌ ai_analysis_ask: call_gemini FAILED")
+            current_app.logger.error(f"Error type: {type(ai_err).__name__}")
+            current_app.logger.error(f"Error: {ai_err}")
+            current_app.logger.error(traceback.format_exc())
+            current_app.logger.error("=" * 70)
 
-        log_ai_call('analysis_chat', incident_id=incident_id,
-                    model_info=model_info, usage=usage, duration_ms=dur,
-                    current_user=current_user,
-                    company_id=get_company_id_for_user(current_user))
+            log_ai_call(
+                'analysis_chat',
+                incident_id=incident_id,
+                success=False,
+                error_message=str(ai_err),
+                current_user=current_user,
+                company_id=get_company_id_for_user(current_user),
+            )
+            return jsonify({
+                'success': False,
+                'error': 'AI failed',
+                'code': 'AI_UNAVAILABLE'
+            }), 503
+
+        log_ai_call(
+            'analysis_chat',
+            incident_id=incident_id,
+            model_info=model_info,
+            usage=usage,
+            duration_ms=dur,
+            current_user=current_user,
+            company_id=get_company_id_for_user(current_user),
+        )
 
         return jsonify(ai_envelope({'answer': text}, model_info, usage)), 200
 
     except Exception as e:
-        current_app.logger.error(f"ai_analysis_ask error: {e}")
-        return jsonify({'success': False, 'error': 'Server error', 'code': 'INTERNAL_ERROR'}), 500
-
+        # ✅ Full traceback for anything else
+        import traceback
+        current_app.logger.error("=" * 70)
+        current_app.logger.error("❌ ai_analysis_ask: UNHANDLED ERROR")
+        current_app.logger.error(f"Error type: {type(e).__name__}")
+        current_app.logger.error(f"Error: {e}")
+        current_app.logger.error(traceback.format_exc())
+        current_app.logger.error("=" * 70)
+        return jsonify({
+            'success': False,
+            'error': 'Server error',
+            'code': 'INTERNAL_ERROR'
+        }), 500
 
 @app.route('/api/incidents/<int:incident_id>/ai-analysis/save',
            methods=['POST', 'OPTIONS'])
