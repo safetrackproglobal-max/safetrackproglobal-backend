@@ -3696,7 +3696,10 @@ def user_to_dict(user):
         'stage': getattr(user, 'stage', '')
     }
 
-# Reads GEMINI_API_KEY_1 .. GEMINI_API_KEY_15 from environment
+GEMINI_AVAILABLE = True   # flip to False to disable the whole pipeline
+
+
+# ---------- KEY POOL ----------
 class GeminiKeyPool:
     def __init__(self):
         self.keys = []
@@ -3737,12 +3740,10 @@ class GeminiKeyPool:
             idx = (self.current_index + offset) % n
             key = self.keys[idx]
 
-            # Rate-limited?
             reset_at = self.rate_limited.get(key, 0)
             if reset_at > now:
                 continue
 
-            # Daily cap (Gemini free tier ≈ 1500/day; leave buffer)
             self._reset_if_new_day(key)
             if self.daily_usage[key]['count'] >= 1400:
                 continue
@@ -3761,7 +3762,6 @@ class GeminiKeyPool:
 
     def status(self):
         now = time.time()
-        today = self._today()
         avail = 0
         rows = []
         for i, key in enumerate(self.keys):
@@ -3788,6 +3788,50 @@ class GeminiKeyPool:
 key_pool = GeminiKeyPool()
 
 
+# ---------- RESPONSE CACHE ----------
+class _AICache:
+    """Thread-safe LRU cache with TTL for Gemini responses."""
+    def __init__(self, max_size=512, ttl_seconds=3600):
+        self._cache = OrderedDict()
+        self._lock = threading.Lock()
+        self.max_size = max_size
+        self.ttl = ttl_seconds
+
+    def _make_key(self, feature, payload):
+        raw = f"{feature}:{json.dumps(payload, sort_keys=True, default=str)}"
+        return hashlib.sha256(raw.encode('utf-8')).hexdigest()
+
+    def get(self, feature, payload):
+        key = self._make_key(feature, payload)
+        now = time.time()
+        with self._lock:
+            entry = self._cache.get(key)
+            if not entry:
+                return None
+            value, expires_at = entry
+            if expires_at < now:
+                self._cache.pop(key, None)
+                return None
+            self._cache.move_to_end(key)
+            return value
+
+    def set(self, feature, payload, value):
+        key = self._make_key(feature, payload)
+        expires_at = time.time() + self.ttl
+        with self._lock:
+            self._cache[key] = (value, expires_at)
+            self._cache.move_to_end(key)
+            while len(self._cache) > self.max_size:
+                self._cache.popitem(last=False)
+
+    def stats(self):
+        with self._lock:
+            return {'size': len(self._cache), 'max_size': self.max_size, 'ttl': self.ttl}
+
+
+_ai_cache = _AICache(max_size=512, ttl_seconds=3600)
+
+
 # ---------- ENVELOPE ----------
 def ai_envelope(analysis, model_info=None, usage=None, extra=None):
     """Standard response wrapper every AI endpoint returns."""
@@ -3803,7 +3847,7 @@ def ai_envelope(analysis, model_info=None, usage=None, extra=None):
     return payload
 
 
-# ---------- GEMINI CALL ----------
+# ---------- SYSTEM PROMPTS ----------
 RCA_SYSTEM_INSTRUCTION = (
     "You are a world-class Root Cause Analysis specialist with 25+ years of "
     "experience across healthcare, construction, oil & gas, manufacturing, "
@@ -3813,12 +3857,29 @@ RCA_SYSTEM_INSTRUCTION = (
     "Always return valid JSON. Never include markdown code fences."
 )
 
+MEDICAL_SYSTEM_INSTRUCTION = """You are a careful, medically-informed AI assistant.
+
+You support healthcare workers and safety investigators with:
+- Explaining medical concepts in plain language
+- Reasoning about symptoms, conditions, and possible causes
+- Suggesting questions an investigator or clinician should ask
+- Analyzing medical incidents from a safety/system perspective
+
+Rules you must always follow:
+1. NEVER diagnose. You can discuss possibilities, but always recommend a qualified clinician.
+2. If any emergency indicators appear (chest pain, difficulty breathing, stroke, severe bleeding,
+   loss of consciousness, suicidal ideation), tell the user to seek emergency care immediately.
+3. Do not invent drug dosages, lab ranges, or protocols. If unsure, say so.
+4. Be concise but specific. No filler.
+5. Always return valid JSON when the caller asks for JSON. Never wrap it in markdown.
+
+You are not a replacement for professional medical advice."""
+
 
 def _clean_json(text):
     """Strip markdown fences if the model included them."""
-    t = text.strip()
+    t = (text or '').strip()
     if t.startswith('```'):
-        # Remove first line (```json or ```)
         lines = t.split('\n', 1)
         if len(lines) > 1:
             t = lines[1]
@@ -3826,17 +3887,45 @@ def _clean_json(text):
     return t
 
 
+# ---------- GEMINI CALL ----------
 def call_gemini(prompt,
                 system_instruction=None,
                 json_mode=True,
                 temperature=0.7,
                 max_tokens=8192,
-                model_name=None):
-    """Call Gemini with key rotation. Returns (parsed_body, model_info, usage, duration_ms)."""
+                model_name=None,
+                feature='medical_ai',
+                use_cache=True):
+    """
+    Call Gemini with key rotation + optional cache + best-effort logging.
+    Returns (parsed_body, model_info, usage, duration_ms).
+    Raises RuntimeError on failure — no fallback.
+    """
     if not key_pool.available():
         raise RuntimeError('AI service unavailable — no Gemini keys configured')
 
     pref = model_name or 'gemini-flash-latest'
+    sys_instr = system_instruction or RCA_SYSTEM_INSTRUCTION
+
+    cache_payload = {
+        'prompt': prompt,
+        'system': sys_instr,
+        'json_mode': json_mode,
+        'temperature': temperature,
+        'max_tokens': max_tokens,
+        'model': pref,
+    }
+
+    if use_cache:
+        cached = _ai_cache.get(feature, cache_payload)
+        if cached is not None:
+            parsed, model_info, usage, duration = cached
+            model_info = dict(model_info)
+            model_info['cached'] = True
+            usage = dict(usage)
+            usage['cached'] = True
+            return parsed, model_info, usage, 0
+
     start = time.time()
     last_err = None
 
@@ -3846,7 +3935,7 @@ def call_gemini(prompt,
             genai.configure(api_key=key)
             model = genai.GenerativeModel(
                 model_name=pref,
-                system_instruction=system_instruction or RCA_SYSTEM_INSTRUCTION
+                system_instruction=sys_instr,
             )
 
             cfg = {
@@ -3869,16 +3958,28 @@ def call_gemini(prompt,
             }
             duration = int((time.time() - start) * 1000)
 
-            if json_mode:
-                parsed = json.loads(_clean_json(text))
-            else:
-                parsed = text
-
+            parsed = json.loads(_clean_json(text)) if json_mode else text
             model_info = {
                 'name': pref,
                 'provider': 'google',
                 'key_index': key_idx + 1,
             }
+
+            # Best-effort log (never raises)
+            _log_gemini_call(
+                feature=feature,
+                model_name=pref,
+                key_index=key_idx + 1,
+                usage=usage,
+                duration_ms=duration,
+                success=True,
+                error_message=None,
+            )
+
+            if use_cache:
+                _ai_cache.set(feature, cache_payload,
+                              (parsed, dict(model_info), dict(usage), duration))
+
             return parsed, model_info, usage, duration
 
         except google_exceptions.ResourceExhausted:
@@ -3893,14 +3994,56 @@ def call_gemini(prompt,
             if 'quota' in last_err.lower() or 'rate' in last_err.lower():
                 key_pool.mark_rate_limited(key, 60)
                 continue
-            # Other error — retry once then bail
             if attempt >= 1:
                 break
+
+    # Failure log (best-effort)
+    _log_gemini_call(
+        feature=feature,
+        model_name=pref,
+        key_index=None,
+        usage={'prompt_tokens': 0, 'completion_tokens': 0, 'total_tokens': 0},
+        duration_ms=int((time.time() - start) * 1000),
+        success=False,
+        error_message=last_err,
+    )
 
     raise RuntimeError(last_err or 'Gemini call failed')
 
 
-# ---------- LOG HELPER ----------
+# ---------- LOG HELPERS ----------
+def _log_gemini_call(feature, model_name, key_index, usage,
+                     duration_ms, success, error_message):
+    """Minimal best-effort insert into ai_generation_logs. NEVER raises."""
+    try:
+        from models import db, AIGenerationLog
+    except Exception:
+        return
+
+    try:
+        log = AIGenerationLog(
+            user_id=None,
+            incident_id=None,
+            feature=feature,
+            model_used=model_name,
+            key_index=key_index,
+            prompt_tokens=usage.get('prompt_tokens'),
+            completion_tokens=usage.get('completion_tokens'),
+            total_tokens=usage.get('total_tokens'),
+            duration_ms=duration_ms,
+            success=success,
+            error_message=error_message,
+            company_id=None,
+        )
+        db.session.add(log)
+        db.session.commit()
+    except Exception:
+        try:
+            db.session.rollback()
+        except Exception:
+            pass
+
+
 def log_ai_call(feature, incident_id=None, sub_feature=None,
                 model_info=None, usage=None, duration_ms=None,
                 success=True, error_message=None, extra=None,
@@ -3909,16 +4052,9 @@ def log_ai_call(feature, incident_id=None, sub_feature=None,
                 model_preference=None):
     """
     Best-effort insert into ai_generation_logs. NEVER raises.
-
-    - user_id      : required. If missing, the log is skipped (nothing to record).
-    - company_id   : optional. Auto-resolved from incident/user when not given.
-                     If the resolved id doesn't exist in `companies`, it is
-                     silently dropped to NULL. NO fallback id is ever invented.
-    - Never propagates an exception — an AI call must never fail because
-      logging failed.
+    (Original behavior — kept for existing callers.)
     """
     try:
-        # ---- Resolve user_id (required) ----
         user_id = None
         if current_user is not None:
             user_id = getattr(current_user, 'id', None)
@@ -3934,7 +4070,6 @@ def log_ai_call(feature, incident_id=None, sub_feature=None,
                 pass
             return
 
-        # ---- Resolve company_id (optional, NO fallback) ----
         if company_id is None and incident_id:
             try:
                 from models import Incident
@@ -3947,8 +4082,6 @@ def log_ai_call(feature, incident_id=None, sub_feature=None,
         if company_id is None and current_user is not None:
             company_id = getattr(current_user, 'company_id', None)
 
-        # ---- Verify the resolved company_id actually exists ----
-        # Prevents FK failures when a stale id slips through.
         if company_id is not None:
             try:
                 from models import Company
@@ -3960,7 +4093,6 @@ def log_ai_call(feature, incident_id=None, sub_feature=None,
             except Exception:
                 company_id = None
 
-        # ---- Insert ----
         log = AIGenerationLog(
             user_id=user_id,
             incident_id=incident_id,
@@ -3983,13 +4115,12 @@ def log_ai_call(feature, incident_id=None, sub_feature=None,
             error_message=error_message,
             retry_count=0,
             extra=json.dumps(extra or {}),
-            company_id=company_id,          # may legitimately be None
+            company_id=company_id,
         )
         db.session.add(log)
         db.session.commit()
 
     except Exception as e:
-        # Fire-and-forget: never break the AI call because logging failed.
         try:
             db.session.rollback()
         except Exception:
@@ -3998,6 +4129,187 @@ def log_ai_call(feature, incident_id=None, sub_feature=None,
             current_app.logger.warning(f"log_ai_call failed (non-fatal): {e}")
         except Exception:
             pass
+
+
+# =============================================================
+#  High-level Gemini helpers (feature-specific prompts)
+# =============================================================
+
+def gemini_medical_chat(message, context=None, extracted_entities=None):
+    """Conversational medical chat with structured outputs."""
+    ctx = context or {}
+    entities = extracted_entities or {}
+
+    history_block = ''
+    if ctx.get('conversation'):
+        history_block = '\n'.join([
+            f"{'User' if m.get('role') == 'user' else 'Assistant'}: {m.get('content', '')}"
+            for m in ctx['conversation'][-6:]
+        ])
+
+    entity_block = ''
+    if entities:
+        entity_block = f"""
+Detected entities from the user's message (from your NLP layer):
+- Diseases: {[e['text'] for e in entities.get('DISEASE', [])][:5]}
+- Symptoms: {[e['text'] for e in entities.get('SYMPTOM', [])][:5]}
+- Medications: {[e['text'] for e in entities.get('MEDICATION', [])][:5]}
+"""
+
+    prompt = f"""The user sent this medical message:
+
+"{message}"
+
+{entity_block}
+
+{f"Recent conversation:{chr(10)}{history_block}" if history_block else ""}
+
+Return JSON with this exact shape:
+{{
+  "response": "Your reply, 2-5 sentences, empathetic and specific",
+  "query_type": "emergency | symptom_inquiry | disease_inquiry | medication_inquiry | general_medical | general",
+  "urgency": "EMERGENCY | URGENT | SOON | ROUTINE",
+  "requires_professional": true | false,
+  "emergency_detected": true | false,
+  "follow_up_questions": ["...", "...", "...", "..."],
+  "confidence": 0.0-1.0
+}}
+
+If emergency indicators are present, response MUST begin with a clear instruction to call emergency services.
+Do NOT diagnose. Discuss possibilities and recommend professional evaluation when appropriate."""
+
+    return call_gemini(
+        prompt,
+        system_instruction=MEDICAL_SYSTEM_INSTRUCTION,
+        temperature=0.6,
+        max_tokens=2048,
+        feature='medical_chat',
+    )
+
+
+def gemini_disease_prediction(symptoms_text, symptom_entities=None, patient_data=None):
+    """Disease/condition reasoning based on symptoms."""
+    symptom_list = [s['text'] for s in (symptom_entities or []) if isinstance(s, dict)]
+    patient_block = ''
+    if patient_data:
+        patient_block = f"Patient data: {json.dumps(patient_data)}"
+
+    prompt = f"""A user describes these symptoms:
+
+"{symptoms_text}"
+
+{patient_block}
+Extracted symptoms: {symptom_list}
+
+Return JSON:
+{{
+  "predictions": [
+    {{ "disease": "...", "probability": 0-100, "reasoning": "...", "matching_symptoms": [...] }}
+  ],
+  "risk_factors": ["..."],
+  "urgency": "EMERGENCY | URGENT | SOON | ROUTINE",
+  "recommendations": ["..."],
+  "red_flags": ["..."],
+  "confidence": 0.0-1.0
+}}
+
+Rank predictions by likelihood. Include 3-6 possibilities.
+Always include a recommendation for professional evaluation.
+If emergency patterns present, set urgency to EMERGENCY and add red flags."""
+
+    return call_gemini(
+        prompt,
+        system_instruction=MEDICAL_SYSTEM_INSTRUCTION,
+        temperature=0.5,
+        max_tokens=2048,
+        feature='disease_prediction',
+    )
+
+
+def gemini_text_analysis(medical_text, extracted_entities=None):
+    """Long-form medical document summarization + reasoning."""
+    entities = extracted_entities or {}
+    entity_block = json.dumps({
+        'diseases': [e['text'] for e in entities.get('DISEASE', [])][:10],
+        'symptoms': [e['text'] for e in entities.get('SYMPTOM', [])][:10],
+        'medications': [e['text'] for e in entities.get('MEDICATION', [])][:10],
+        'procedures': [e['text'] for e in entities.get('PROCEDURE', [])][:10],
+        'lab_tests': [e['text'] for e in entities.get('LAB_TEST', [])][:10],
+    }, indent=2) if entities else '{}'
+
+    prompt = f"""Analyze this medical document.
+
+DOCUMENT:
+\"\"\"
+{medical_text[:4000]}
+\"\"\"
+
+Entities already extracted by an NLP layer:
+{entity_block}
+
+Return JSON:
+{{
+  "document_type": "DISCHARGE_SUMMARY | ADMISSION_NOTE | PROGRESS_NOTE | CONSULTATION | LAB_REPORT | RADIOLOGY_REPORT | PRESCRIPTION | SURGICAL_REPORT | CLINICAL_NOTE | MEDICAL_DOCUMENT",
+  "summary": "2-4 sentence plain-language summary of the whole document",
+  "key_concepts": [
+    {{ "concept": "...", "type": "DISEASE|SYMPTOM|MEDICATION|...", "importance": "high|medium|low" }}
+  ],
+  "clinical_concerns": ["..."],
+  "follow_up_recommendations": ["..."],
+  "confidence": 0.0-1.0
+}}
+
+Do not invent facts. If the document is unclear or incomplete, say so in the summary."""
+
+    return call_gemini(
+        prompt,
+        system_instruction=MEDICAL_SYSTEM_INSTRUCTION,
+        temperature=0.5,
+        max_tokens=3072,
+        feature='text_analysis',
+    )
+
+
+def gemini_safety_analysis(document, document_type='general', extracted_entities=None):
+    """Safety/compliance reasoning."""
+    entities = extracted_entities or {}
+    prompt = f"""Analyze the following document for safety and compliance issues.
+
+DOCUMENT TYPE: {document_type}
+DOCUMENT:
+\"\"\"
+{document[:4000]}
+\"\"\"
+
+Pre-extracted entities (may be incomplete):
+{json.dumps({k: [e['text'] for e in v][:5] for k, v in entities.items()}, indent=2)}
+
+Return JSON:
+{{
+  "compliance_score": 0-100,
+  "risk_level": "MINIMAL | LOW | MEDIUM | HIGH",
+  "compliance_issues": [
+    {{ "category": "...", "issue": "...", "severity": "LOW | MEDIUM | HIGH" }}
+  ],
+  "safety_risks": [
+    {{ "risk": "...", "severity": "LOW | MEDIUM | HIGH", "evidence": "quote or reason" }}
+  ],
+  "recommendations": ["..."],
+  "missing_documentation": ["..."],
+  "confidence": 0.0-1.0
+}}
+
+Base your analysis only on what is actually in the document. Flag missing standard fields
+(consent, signature, date, provider, HIPAA notice, medication details)."""
+
+    return call_gemini(
+        prompt,
+        system_instruction=MEDICAL_SYSTEM_INSTRUCTION,
+        temperature=0.4,
+        max_tokens=3072,
+        feature='safety_analysis',
+    )
+
 
 
 class MedicalAISystem:
@@ -4460,70 +4772,44 @@ class MedicalAISystem:
     # ==================== MODULE 1: MEDICAL CHAT ====================
     
     def medical_chat(self, message: str, context: Dict = None) -> Dict:
-        """
-        Handle general medical queries conversationally
-        Uses: BioClinicalBERT, HunFlair2 (entity extraction), Flair (sentiment), PubMedBERT (understanding)
-        """
+        """Conversational medical chat. Uses local NER + Gemini for the response."""
         start_time = time.time()
-        
-        try:
-            # 1. Understand the query
-            entities_result = self.comprehensive_entity_extraction(message)
-            entities = entities_result['entities']
-            sentiment = self.analyze_sentiment_flair(message)
-            
-            # 2. Get embedding for semantic understanding
-            embedding = self.get_pubmed_embeddings(message)
-            
-            # 3. Categorize query type
-            query_type = self._categorize_query(message, entities)
-            
-            # 4. Generate response based on query type
-            response_data = self._generate_chat_response(
-                message, entities, sentiment, query_type, context
-            )
-            
-            # 5. Generate follow-up suggestions
-            suggestions = self._generate_chat_suggestions(
-                message, entities, query_type, sentiment
-            )
-            
-            result = {
-                'response': response_data['text'],
-                'query_type': query_type,
-                'entities_detected': {
-                    'count': len(entities),
-                    'diseases': len([e for e in entities if e['type'] == 'DISEASE']),
-                    'symptoms': len([e for e in entities if e['type'] == 'SYMPTOM']),
-                    'medications': len([e for e in entities if e['type'] == 'MEDICATION'])
-                },
-                'sentiment': sentiment,
-                'suggestions': suggestions,
-                'confidence': response_data['confidence'],
-                'requires_professional': response_data.get('requires_professional', False),
-                'emergency_detected': response_data.get('emergency', False),
-                'processing_time': time.time() - start_time,
-                'models_used': entities_result['models_used'] + ['Flair Sentiment', 'PubMedBERT'],
-                'module': 'medical_chat'
-            }
-            
-            return result
-            
-        except Exception as e:
-            logger.error(f"Medical chat failed: {e}")
-            return {
-                'response': "I'm here to help with medical questions. Could you please provide more details?",
-                'query_type': 'general',
-                'entities_detected': {'count': 0},
-                'sentiment': {'sentiment': 'NEUTRAL', 'confidence': 0.5},
-                'suggestions': ['Tell me more about your symptoms', 'When did this start?', 'Have you seen a doctor?'],
-                'confidence': 0.5,
-                'requires_professional': True,
-                'emergency_detected': False,
-                'processing_time': time.time() - start_time,
-                'module': 'medical_chat',
-                'error': True
-            }
+
+        entities_result = self.comprehensive_entity_extraction(message)
+        entities_by_type = {
+            t: entities_result['by_type'].get(t, [])
+            for t in ['DISEASE', 'SYMPTOM', 'MEDICATION', 'PROCEDURE', 'LAB_TEST']
+        }
+        sentiment = self.analyze_sentiment_flair(message)
+
+        gemini_result, model_info, usage, dur = gemini_medical_chat(
+            message=message,
+            context=context,
+            extracted_entities=entities_by_type,
+        )
+
+        return {
+            'response': gemini_result.get('response', ''),
+            'query_type': gemini_result.get('query_type', 'general'),
+            'urgency': gemini_result.get('urgency', 'ROUTINE'),
+            'requires_professional': gemini_result.get('requires_professional', True),
+            'emergency_detected': gemini_result.get('emergency_detected', False),
+            'follow_up_questions': gemini_result.get('follow_up_questions', []),
+            'entities_detected': {
+                'count': entities_result['total_count'],
+                'diseases': len(entities_by_type['DISEASE']),
+                'symptoms': len(entities_by_type['SYMPTOM']),
+                'medications': len(entities_by_type['MEDICATION']),
+            },
+            'sentiment': sentiment,
+            'confidence': gemini_result.get('confidence', 0.7),
+            'model_info': model_info,
+            'usage': usage,
+            'processing_time': time.time() - start_time,
+            'models_used': entities_result['models_used'] + ['gemini-flash-latest'],
+            'module': 'medical_chat',
+        }
+
     
     def _categorize_query(self, message: str, entities: List) -> str:
         """Categorize the type of medical query"""
@@ -4680,72 +4966,41 @@ class MedicalAISystem:
     # ==================== MODULE 2: DISEASE PREDICTION ====================
     
     def disease_prediction(self, symptoms: str, patient_data: Dict = None) -> Dict:
-        """
-        Predict potential diseases based on symptoms
-        Uses: BioClinicalBERT, HunFlair2 (symptom extraction), PubMedBERT (matching)
-        """
+        """Disease prediction: local NER + Gemini for reasoning."""
         start_time = time.time()
-        
-        try:
-            # 1. Extract symptoms from description
-            entities_result = self.comprehensive_entity_extraction(symptoms)
-            symptom_entities = [e for e in entities_result['entities'] if e['type'] == 'SYMPTOM']
-            
-            # If no symptoms found, try to extract from text directly
-            if not symptom_entities:
-                # Simple keyword matching
-                common_symptoms = ['fever', 'cough', 'headache', 'pain', 'nausea', 'fatigue', 
-                                  'dizziness', 'rash', 'swelling', 'shortness of breath']
-                for word in common_symptoms:
-                    if word in symptoms.lower():
-                        symptom_entities.append({
-                            'text': word,
-                            'type': 'SYMPTOM',
-                            'confidence': 0.6,
-                            'model': 'keyword'
-                        })
-            
-            symptom_text = " ".join([s['text'] for s in symptom_entities])
-            
-            # 2. Get embedding of symptoms
-            symptom_embedding = self.get_pubmed_embeddings(symptom_text)
-            
-            # 3. Match against disease database (simplified rules)
-            potential_diseases = self._match_diseases(symptom_entities, patient_data)
-            
-            # 4. Calculate risk factors
-            risk_factors = self._calculate_risk_factors(patient_data, symptom_entities)
-            
-            # 5. Determine urgency
-            urgency = self._determine_urgency(symptom_entities, potential_diseases)
-            
-            result = {
-                'predictions': potential_diseases,
-                'symptoms_detected': [s['text'] for s in symptom_entities],
-                'risk_factors': risk_factors,
-                'urgency': urgency,
-                'recommendations': self._generate_disease_recommendations(urgency, potential_diseases),
-                'confidence': self._calculate_prediction_confidence(symptom_entities, potential_diseases),
-                'processing_time': time.time() - start_time,
-                'models_used': entities_result['models_used'] + ['PubMedBERT'],
-                'module': 'disease_prediction'
-            }
-            
-            return result
-            
-        except Exception as e:
-            logger.error(f"Disease prediction failed: {e}")
-            return {
-                'predictions': [],
-                'symptoms_detected': [],
-                'risk_factors': ['Unable to analyze'],
-                'urgency': 'UNKNOWN',
-                'recommendations': ['Please consult a healthcare provider for proper evaluation'],
-                'confidence': 0.3,
-                'processing_time': time.time() - start_time,
-                'module': 'disease_prediction',
-                'error': True
-            }
+
+        entities_result = self.comprehensive_entity_extraction(symptoms)
+        symptom_entities = entities_result['by_type'].get('SYMPTOM', [])
+
+        # Keyword assist only if NER found nothing (still real input, not fabricated output)
+        if not symptom_entities:
+            common = ['fever', 'cough', 'headache', 'pain', 'nausea', 'fatigue',
+                      'dizziness', 'rash', 'swelling', 'shortness of breath']
+            for w in common:
+                if w in symptoms.lower():
+                    symptom_entities.append({'text': w, 'type': 'SYMPTOM', 'confidence': 0.6})
+
+        gemini_result, model_info, usage, dur = gemini_disease_prediction(
+            symptoms_text=symptoms,
+            symptom_entities=symptom_entities,
+            patient_data=patient_data,
+        )
+
+        return {
+            'predictions': gemini_result.get('predictions', []),
+            'symptoms_detected': [s['text'] for s in symptom_entities],
+            'risk_factors': gemini_result.get('risk_factors', []),
+            'red_flags': gemini_result.get('red_flags', []),
+            'urgency': gemini_result.get('urgency', 'ROUTINE'),
+            'recommendations': gemini_result.get('recommendations', []),
+            'confidence': gemini_result.get('confidence', 0.5),
+            'model_info': model_info,
+            'usage': usage,
+            'processing_time': time.time() - start_time,
+            'models_used': entities_result['models_used'] + ['gemini-flash-latest'],
+            'module': 'disease_prediction',
+        }
+
     
     def _match_diseases(self, symptoms: List, patient_data: Dict = None) -> List:
         """Match symptoms to potential diseases (simplified rules)"""
@@ -5284,81 +5539,41 @@ class MedicalAISystem:
     # ==================== MODULE 5: TEXT ANALYSIS ====================
     
     def text_analysis(self, medical_text: str, analysis_type: str = 'comprehensive') -> Dict:
-        """
-        Analyze medical notes, discharge summaries, clinical texts
-        Uses: BioClinicalBERT, HunFlair2 (NER), PubMedBERT (embeddings), Flair (sentiment)
-        """
+        """Document analysis: local NER + Gemini for the summary/reasoning."""
         start_time = time.time()
-        
-        try:
-            # 1. Extract all entities
-            entities_result = self.comprehensive_entity_extraction(medical_text)
-            entities = entities_result['entities']
-            
-            # 2. Get document embedding for categorization
-            embedding = self.get_pubmed_embeddings(medical_text)
-            
-            # 3. Analyze sentiment
-            sentiment = self.analyze_sentiment_flair(medical_text)
-            
-            # 4. Categorize by entity types
-            entities_by_type = defaultdict(list)
-            for e in entities:
-                entities_by_type[e['type']].append(e)
-            
-            # 5. Generate summary based on entities
-            summary = self._generate_text_summary(entities_by_type, medical_text)
-            
-            # 6. Determine document type
-            doc_type = self._determine_document_type(medical_text, entities)
-            
-            # 7. Extract key medical concepts
-            key_concepts = self._extract_key_concepts(entities)
-            
-            result = {
-                'document_type': doc_type,
-                'summary': summary,
-                'entities': {
-                    'total': len(entities),
-                    'by_type': {
-                        'diseases': len(entities_by_type.get('DISEASE', [])),
-                        'symptoms': len(entities_by_type.get('SYMPTOM', [])),
-                        'medications': len(entities_by_type.get('MEDICATION', [])),
-                        'procedures': len(entities_by_type.get('PROCEDURE', [])),
-                        'lab_tests': len(entities_by_type.get('LAB_TEST', [])),
-                        'anatomy': len(entities_by_type.get('ANATOMY', [])),
-                        'chemicals': len(entities_by_type.get('CHEMICAL', [])),
-                        'genes': len(entities_by_type.get('GENE', []))
-                    },
-                    'detailed': entities[:20]  # Limit detailed entities
-                },
-                'key_concepts': key_concepts,
-                'sentiment': sentiment,
-                'text_stats': {
-                    'length': len(medical_text),
-                    'word_count': len(medical_text.split()),
-                    'sentence_count': len(medical_text.split('.'))
-                },
-                'processing_time': time.time() - start_time,
-                'models_used': entities_result['models_used'] + ['PubMedBERT', 'Flair Sentiment'],
-                'module': 'text_analysis'
-            }
-            
-            return result
-            
-        except Exception as e:
-            logger.error(f"Text analysis failed: {e}")
-            return {
-                'document_type': 'UNKNOWN',
-                'summary': 'Unable to analyze text',
-                'entities': {'total': 0},
-                'key_concepts': [],
-                'sentiment': {'sentiment': 'NEUTRAL'},
-                'text_stats': {'length': 0},
-                'processing_time': time.time() - start_time,
-                'module': 'text_analysis',
-                'error': True
-            }
+
+        entities_result = self.comprehensive_entity_extraction(medical_text)
+        sentiment = self.analyze_sentiment_flair(medical_text)
+
+        gemini_result, model_info, usage, dur = gemini_text_analysis(
+            medical_text=medical_text,
+            extracted_entities=entities_result['by_type'],
+        )
+
+        return {
+            'document_type': gemini_result.get('document_type', 'MEDICAL_DOCUMENT'),
+            'summary': gemini_result.get('summary', ''),
+            'key_concepts': gemini_result.get('key_concepts', []),
+            'clinical_concerns': gemini_result.get('clinical_concerns', []),
+            'follow_up_recommendations': gemini_result.get('follow_up_recommendations', []),
+            'entities': {
+                'total': entities_result['total_count'],
+                'by_type': {k: len(v) for k, v in entities_result['by_type'].items()},
+                'detailed': entities_result['entities'][:20],
+            },
+            'sentiment': sentiment,
+            'text_stats': {
+                'length': len(medical_text),
+                'word_count': len(medical_text.split()),
+            },
+            'confidence': gemini_result.get('confidence', 0.7),
+            'model_info': model_info,
+            'usage': usage,
+            'processing_time': time.time() - start_time,
+            'models_used': entities_result['models_used'] + ['gemini-flash-latest'],
+            'module': 'text_analysis',
+        }
+
     
     def _determine_document_type(self, text: str, entities: List) -> str:
         """Determine the type of medical document"""
@@ -5454,66 +5669,40 @@ class MedicalAISystem:
     # ==================== MODULE 6: SAFETY ANALYSIS ====================
     
     def safety_analysis(self, document: str, document_type: str = 'general') -> Dict:
-        """
-        Analyze safety protocols, compliance documents, incident reports
-        Uses: PubMedBERT (understanding), Flair (sentiment), Entity extraction
-        """
+        """Safety/compliance analysis: local NER + Gemini for reasoning."""
         start_time = time.time()
-        
-        try:
-            # 1. Extract safety-related entities
-            entities_result = self.comprehensive_entity_extraction(document)
-            entities = entities_result['entities']
-            
-            # Filter safety-relevant entities
-            safety_entities = [e for e in entities if e['type'] in ['PROCEDURE', 'CHEMICAL', 'EQUIPMENT']]
-            
-            # 2. Analyze sentiment for concerning tone
-            sentiment = self.analyze_sentiment_flair(document)
-            
-            # 3. Get document embedding
-            embedding = self.get_pubmed_embeddings(document)
-            
-            # 4. Check compliance issues (simplified rules)
-            compliance_issues = self._check_compliance(document, document_type)
-            
-            # 5. Identify safety risks
-            safety_risks = self._identify_safety_risks(document, entities)
-            
-            # 6. Calculate compliance score
-            compliance_score = self._calculate_compliance_score(document, compliance_issues)
-            
-            # 7. Determine risk level
-            risk_level = self._determine_safety_risk_level(compliance_issues, safety_risks)
-            
-            result = {
-                'document_type': document_type,
-                'compliance_score': compliance_score,
-                'risk_level': risk_level,
-                'compliance_issues': compliance_issues,
-                'safety_risks': safety_risks,
-                'sentiment': sentiment,
-                'safety_entities': safety_entities[:10],
-                'recommendations': self._generate_safety_recommendations(compliance_issues, risk_level),
-                'processing_time': time.time() - start_time,
-                'models_used': entities_result['models_used'] + ['PubMedBERT', 'Flair Sentiment'],
-                'module': 'safety_analysis'
-            }
-            
-            return result
-            
-        except Exception as e:
-            logger.error(f"Safety analysis failed: {e}")
-            return {
-                'compliance_score': 0,
-                'risk_level': 'UNKNOWN',
-                'compliance_issues': ['Unable to analyze'],
-                'safety_risks': [],
-                'recommendations': ['Manual safety review required'],
-                'processing_time': time.time() - start_time,
-                'module': 'safety_analysis',
-                'error': True
-            }
+
+        entities_result = self.comprehensive_entity_extraction(document)
+        sentiment = self.analyze_sentiment_flair(document)
+
+        gemini_result, model_info, usage, dur = gemini_safety_analysis(
+            document=document,
+            document_type=document_type,
+            extracted_entities=entities_result['by_type'],
+        )
+
+        return {
+            'document_type': document_type,
+            'compliance_score': gemini_result.get('compliance_score', 0),
+            'risk_level': gemini_result.get('risk_level', 'UNKNOWN'),
+            'compliance_issues': gemini_result.get('compliance_issues', []),
+            'safety_risks': gemini_result.get('safety_risks', []),
+            'missing_documentation': gemini_result.get('missing_documentation', []),
+            'recommendations': gemini_result.get('recommendations', []),
+            'sentiment': sentiment,
+            'confidence': gemini_result.get('confidence', 0.7),
+            'model_info': model_info,
+            'usage': usage,
+            'processing_time': time.time() - start_time,
+            'models_used': entities_result['models_used'] + ['gemini-flash-latest'],
+            'module': 'safety_analysis',
+        }
+
+    # ==================== CACHE STATUS ====================
+
+    def cache_stats(self):
+        """Return cache stats for monitoring."""
+        return _ai_cache.stats()
     
     def _check_compliance(self, document: str, doc_type: str) -> List:
         """Check for compliance issues in document"""
@@ -134488,6 +134677,22 @@ def get_ghana_manual_payment_methods():
         logger.error(f"Error getting Ghana manual payment methods: {e}")
         return jsonify({'error': str(e)}), 500
 
+
+@app.route('/api/medical-ai/status', methods=['GET', 'OPTIONS'])
+@jwt_required
+def medical_ai_status():
+    if request.method == 'OPTIONS':
+        return jsonify({'status': 'ok'}), 200
+    try:
+        from services.medical_ai import medical_ai
+        from services.gemini_service import medical_key_pool
+        return jsonify({
+            'success': True,
+            'gemini': medical_key_pool.status(),
+            'local_models': medical_ai.get_status() if medical_ai else None,
+        }), 200
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 @app.route('/api/payment/manual/initialize', methods=['POST'])
 @jwt_required
