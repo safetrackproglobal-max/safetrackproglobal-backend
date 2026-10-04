@@ -23898,7 +23898,7 @@ def create_powerbi_project():
         print(f"\n{'='*60}")
         print(f"📝 CREATE POWERBI PROJECT - START")
         print(f"{'='*60}")
-        
+
         user = getattr(request, 'user', None)
         if not user:
             return jsonify({
@@ -23906,48 +23906,64 @@ def create_powerbi_project():
                 'error': 'User authentication failed',
                 'code': 'AUTHENTICATION_ERROR'
             }), 401
-        
+
         data = request.get_json()
         print(f"📊 Received data: {data}")
-        
+
         if not data:
             return jsonify({
                 'success': False,
                 'error': 'No JSON data provided',
                 'code': 'VALIDATION_ERROR'
             }), 400
-        
-        company_id = user.company_id or 1
+
+        # ==================== COMPANY RESOLUTION ====================
+        # ✅ FIX: no fallback `or 1`. Resolve from user, then company
+        #    relationship. If neither exists, reject the request.
+        #    Accepting None is also valid if you make the column nullable.
+        company_id = getattr(user, 'company_id', None)
+
+        if not company_id and hasattr(user, 'company') and user.company:
+            company_id = getattr(user.company, 'id', None)
+
         print(f"👤 User: ID={user.id}, Email={user.email}")
         print(f"🏢 Company ID: {company_id}")
-        
+
+        if not company_id:
+            return jsonify({
+                'success': False,
+                'error': 'Your account is not associated with a company. '
+                         'A company is required to create a project.',
+                'code': 'COMPANY_REQUIRED'
+            }), 400
+
         from models import Project
         import random
-        
+
         # Generate project number
         project_number = f"PRJ-{datetime.utcnow().strftime('%Y%m%d')}-{random.randint(1000, 9999)}"
-        
+
         # Parse dates
         start_date = None
         if data.get('start_date'):
             try:
                 start_date = datetime.strptime(data['start_date'], '%Y-%m-%d')
-            except:
+            except Exception:
                 try:
                     start_date = datetime.strptime(data['start_date'], '%Y-%m-%dT%H:%M:%S.%f')
-                except:
+                except Exception:
                     start_date = datetime.utcnow()
-        
+
         end_date = None
         if data.get('end_date'):
             try:
                 end_date = datetime.strptime(data['end_date'], '%Y-%m-%d')
-            except:
+            except Exception:
                 try:
                     end_date = datetime.strptime(data['end_date'], '%Y-%m-%dT%H:%M:%S.%f')
-                except:
+                except Exception:
                     pass
-        
+
         # Create project
         project = Project(
             project_number=project_number,
@@ -23961,13 +23977,13 @@ def create_powerbi_project():
             department=data.get('department'),
             user_id=user.id,
             created_by=user.id,
-            company_id=company_id,
-            industry=data.get('industry')
+            company_id=company_id,        # ✅ real id only — never `1`
+            industry=data.get('industry'),
         )
-        
+
         db.session.add(project)
         db.session.commit()
-        
+
         print(f"✅ Created project:")
         print(f"   ID: {project.id}")
         print(f"   Number: {project.project_number}")
@@ -23975,7 +23991,7 @@ def create_powerbi_project():
         print(f"   Created By: {project.created_by}")
         print(f"   Company ID: {project.company_id}")
         print(f"{'='*60}\n")
-        
+
         return jsonify({
             'success': True,
             'message': 'Project created successfully',
@@ -23987,10 +24003,10 @@ def create_powerbi_project():
                 'name': project.name,
                 'status': project.status,
                 'created_by': project.created_by,
-                'company_id': project.company_id
+                'company_id': project.company_id,
             }
         }), 201
-        
+
     except Exception as e:
         print(f"❌ ERROR in create_powerbi_project: {e}")
         import traceback
