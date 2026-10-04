@@ -73,7 +73,9 @@ from sklearn.cluster import KMeans
 from sklearn.feature_extraction.text import TfidfVectorizer
 import joblib
 import pickle
-
+from collections import OrderedDict, defaultdict
+import hashlib
+import threading
 
 import pytesseract
 import pdf2image
