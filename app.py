@@ -24084,7 +24084,15 @@ def create_department():
 @app.route('/api/powerbi/projects', methods=['POST'], endpoint='create_powerbi_project')
 @jwt_required
 def create_powerbi_project():
-    """Create a new project for PowerBI"""
+    """Create a new project for PowerBI.
+
+    Company resolution:
+      - Uses the user's company_id when present.
+      - Falls back to the user's `company` relationship.
+      - If neither exists (super admin, platform owner), the project
+        is created without a company (company_id = NULL) and is scoped
+        to the creating user only.
+    """
     try:
         print(f"\n{'='*60}")
         print(f"📝 CREATE POWERBI PROJECT - START")
@@ -24108,10 +24116,17 @@ def create_powerbi_project():
                 'code': 'VALIDATION_ERROR'
             }), 400
 
+        if not (data.get('name') or '').strip():
+            return jsonify({
+                'success': False,
+                'error': 'Project name is required',
+                'code': 'MISSING_NAME'
+            }), 400
+
         # ==================== COMPANY RESOLUTION ====================
-        # ✅ FIX: no fallback `or 1`. Resolve from user, then company
-        #    relationship. If neither exists, reject the request.
-        #    Accepting None is also valid if you make the column nullable.
+        # ✅ No `or 1` fallback. Use the user's company if available.
+        #    If the user has no company, allow NULL — the project will
+        #    still be created and scoped to the user.
         company_id = getattr(user, 'company_id', None)
 
         if not company_id and hasattr(user, 'company') and user.company:
@@ -24120,18 +24135,12 @@ def create_powerbi_project():
         print(f"👤 User: ID={user.id}, Email={user.email}")
         print(f"🏢 Company ID: {company_id}")
 
-        if not company_id:
-            return jsonify({
-                'success': False,
-                'error': 'Your account is not associated with a company. '
-                         'A company is required to create a project.',
-                'code': 'COMPANY_REQUIRED'
-            }), 400
+        # NOTE: no `COMPANY_REQUIRED` rejection anymore.
+        #       company_id may legitimately be None.
 
         from models import Project
         import random
 
-        # Generate project number
         project_number = f"PRJ-{datetime.utcnow().strftime('%Y%m%d')}-{random.randint(1000, 9999)}"
 
         # Parse dates
@@ -24155,10 +24164,9 @@ def create_powerbi_project():
                 except Exception:
                     pass
 
-        # Create project
         project = Project(
             project_number=project_number,
-            name=data['name'],
+            name=data['name'].strip(),
             description=data.get('description', ''),
             status=data.get('status', 'planning'),
             priority=data.get('priority', 'medium'),
@@ -24168,7 +24176,7 @@ def create_powerbi_project():
             department=data.get('department'),
             user_id=user.id,
             created_by=user.id,
-            company_id=company_id,        # ✅ real id only — never `1`
+            company_id=company_id,      # may be None — that's fine now
             industry=data.get('industry'),
         )
 
@@ -24195,6 +24203,7 @@ def create_powerbi_project():
                 'status': project.status,
                 'created_by': project.created_by,
                 'company_id': project.company_id,
+                'user_id': project.user_id,
             }
         }), 201
 
@@ -24212,12 +24221,18 @@ def create_powerbi_project():
 @app.route('/api/powerbi/projects', methods=['GET'], endpoint='get_powerbi_projects')
 @jwt_required
 def get_powerbi_projects():
-    """Get projects for PowerBI analytics - Filtered by company_id AND user_id"""
+    """Get projects for PowerBI analytics.
+
+    Filtering rules (priority order):
+      1. System team / platform owner → ALL projects (system-wide)
+      2. User has a company_id        → ALL projects for that company
+      3. User has NO company_id       → ONLY projects created by this user
+    """
     try:
         print(f"\n{'='*60}")
         print(f"📊 GET POWERBI PROJECTS - START")
         print(f"{'='*60}")
-        
+
         user = getattr(request, 'user', None)
         if not user:
             return jsonify({
@@ -24225,19 +24240,37 @@ def get_powerbi_projects():
                 'error': 'User authentication failed',
                 'code': 'AUTHENTICATION_ERROR'
             }), 401
-        
-        company_id = user.company_id or 1
+
+        from models import Project
+        from sqlalchemy import or_
+
+        company_id = getattr(user, 'company_id', None)
+        is_system_team = (
+            getattr(user, 'is_super_admin', False)
+            or getattr(user, 'is_system_team', False)
+            or getattr(user, 'is_platform_owner', False)
+        )
+
         print(f"👤 User: ID={user.id}, Email={user.email}")
         print(f"🏢 Company ID: {company_id}")
-        
-        from models import Project
-        
-        # ✅ Filter by company_id AND user_id
-        projects = Project.query.filter(
-            Project.company_id == company_id,
-            Project.user_id == user.id
-        ).order_by(Project.created_at.desc()).all()
-        
+        print(f"⭐ System team: {is_system_team}")
+
+        query = Project.query
+
+        if is_system_team:
+            # System-wide visibility
+            print(f"👑 System team — showing ALL projects")
+        elif company_id:
+            # Show all projects in this company
+            query = query.filter(Project.company_id == company_id)
+            print(f"🏢 Filtering by company_id={company_id}")
+        else:
+            # No company — show only the user's own projects
+            query = query.filter(Project.user_id == user.id)
+            print(f"👤 No company — filtering by user_id={user.id}")
+
+        projects = query.order_by(Project.created_at.desc()).all()
+
         data = [{
             'id': p.id,
             'project_number': p.project_number,
@@ -24261,18 +24294,18 @@ def get_powerbi_projects():
             'uploaded_at': p.uploaded_at.isoformat() if p.uploaded_at else None,
             'completed_at': p.completed_at.isoformat() if p.completed_at else None,
             'created_at': p.created_at.isoformat() if p.created_at else None,
-            'updated_at': p.updated_at.isoformat() if p.updated_at else None
+            'updated_at': p.updated_at.isoformat() if p.updated_at else None,
         } for p in projects]
-        
-        print(f"✅ Returning {len(data)} projects for user {user.id}")
+
+        print(f"✅ Returning {len(data)} projects")
         print(f"{'='*60}\n")
-        
+
         return jsonify({
             'success': True,
             'data': data,
-            'total': len(data)
+            'total': len(data),
         }), 200
-        
+
     except Exception as e:
         print(f"❌ ERROR in get_powerbi_projects: {e}")
         import traceback
