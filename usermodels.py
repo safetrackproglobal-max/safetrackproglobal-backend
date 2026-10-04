@@ -2021,7 +2021,7 @@ class Project(db.Model):
     created_by = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
     project_manager_id = db.Column(db.Integer, db.ForeignKey('users.id'))
     user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False, index=True)
-    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), nullable=False, index=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), nullable=True, index=True)
     
     file_path = db.Column(db.String(256))
     file_size = db.Column(db.Integer)
