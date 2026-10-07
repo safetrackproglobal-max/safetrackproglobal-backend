@@ -3730,19 +3730,47 @@ class GeminiKeyPool:
         if key not in self.daily_usage or self.daily_usage[key]['date'] != today:
             self.daily_usage[key] = {'date': today, 'count': 0}
 
-    def get_key(self):
-    logger.warning(f"[get_key] ENTER pool_id={id(self)} keys={len(self.keys)} "
-                   f"rate_limited={self.rate_limited} daily_usage={self.daily_usage}")
-    ...
-    for offset in range(n):
-        ...
-        logger.warning(f"[get_key] offset={offset} idx={idx} reset_at={reset_at} "
-                       f"now={now} count={self.daily_usage[key]['count']}")
-    logger.warning(f"[get_key] FALLING THROUGH — all keys rejected")
-    raise RuntimeError('All Gemini API keys exhausted or rate-limited')
-    def record_use(self, key):
-        self._reset_if_new_day(key)
-        self.daily_usage[key]['count'] += 1
+        def get_key(self):
+        """Return (key, index) of next usable key, or raise."""
+        logger.warning(
+            f"[get_key] ENTER pool_id={id(self)} keys={len(self.keys)} "
+            f"rate_limited={self.rate_limited} daily_usage={self.daily_usage}"
+        )
+
+        if not self.keys:
+            raise RuntimeError('No Gemini API keys configured')
+
+        now = time.time()
+        n = len(self.keys)
+
+        for offset in range(n):
+            idx = (self.current_index + offset) % n
+            key = self.keys[idx]
+
+            reset_at = self.rate_limited.get(key, 0)
+            logger.warning(
+                f"[get_key] offset={offset} idx={idx} key={key[:8]} "
+                f"reset_at={reset_at} now={now} "
+                f"is_rate_limited={reset_at > now}"
+            )
+            if reset_at > now:
+                logger.warning(f"[get_key] SKIP idx={idx} — rate limited for "
+                               f"{reset_at - now:.1f}s")
+                continue
+
+            self._reset_if_new_day(key)
+            count = self.daily_usage[key]['count']
+            logger.warning(f"[get_key] idx={idx} daily_count={count}")
+            if count >= 1400:
+                logger.warning(f"[get_key] SKIP idx={idx} — daily cap")
+                continue
+
+            self.current_index = idx
+            logger.warning(f"[get_key] RETURN idx={idx}")
+            return key, idx
+
+        logger.warning(f"[get_key] FALLING THROUGH — all keys rejected")
+        raise RuntimeError('All Gemini API keys exhausted or rate-limited')
 
     def mark_rate_limited(self, key, seconds=60):
         self.rate_limited[key] = time.time() + seconds
