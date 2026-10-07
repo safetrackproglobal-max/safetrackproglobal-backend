@@ -3731,30 +3731,15 @@ class GeminiKeyPool:
             self.daily_usage[key] = {'date': today, 'count': 0}
 
     def get_key(self):
-        """Return (key, index) of next usable key, or raise."""
-        if not self.keys:
-            raise RuntimeError('No Gemini API keys configured')
-
-        now = time.time()
-        n = len(self.keys)
-
-        for offset in range(n):
-            idx = (self.current_index + offset) % n
-            key = self.keys[idx]
-
-            reset_at = self.rate_limited.get(key, 0)
-            if reset_at > now:
-                continue
-
-            self._reset_if_new_day(key)
-            if self.daily_usage[key]['count'] >= 1400:
-                continue
-
-            self.current_index = idx
-            return key, idx
-
-        raise RuntimeError('All Gemini API keys exhausted or rate-limited')
-
+    logger.warning(f"[get_key] ENTER pool_id={id(self)} keys={len(self.keys)} "
+                   f"rate_limited={self.rate_limited} daily_usage={self.daily_usage}")
+    ...
+    for offset in range(n):
+        ...
+        logger.warning(f"[get_key] offset={offset} idx={idx} reset_at={reset_at} "
+                       f"now={now} count={self.daily_usage[key]['count']}")
+    logger.warning(f"[get_key] FALLING THROUGH — all keys rejected")
+    raise RuntimeError('All Gemini API keys exhausted or rate-limited')
     def record_use(self, key):
         self._reset_if_new_day(key)
         self.daily_usage[key]['count'] += 1
@@ -151844,6 +151829,37 @@ def ai_status():
     if request.method == 'OPTIONS':
         return jsonify({'status': 'ok'}), 200
     return jsonify(key_pool.status()), 200
+
+@app.route('/api/ai/debug_pool', methods=['GET'])
+def debug_pool():
+    import time as _t
+    now = _t.time()
+    keys_info = []
+    for i, k in enumerate(key_pool.keys):
+        rl = key_pool.rate_limited.get(k, 0)
+        du = key_pool.daily_usage.get(k, {})
+        keys_info.append({
+            'idx': i,
+            'preview': f"{k[:8]}...{k[-4:]}",
+            'rl_raw': rl,
+            'rl_active': rl > now,
+            'rl_seconds_left': max(0, rl - now),
+            'du_raw': du,
+            'du_count': du.get('count', 0),
+            'is_today': du.get('date') == key_pool._today(),
+        })
+    try:
+        k, idx = key_pool.get_key()
+        get_key_result = f"OK idx={idx} prefix={k[:8]}"
+    except Exception as e:
+        get_key_result = f"FAIL {type(e).__name__}: {e}"
+    return jsonify({
+        'keys': keys_info,
+        'get_key_result': get_key_result,
+        'pool_id': id(key_pool),
+        'now': now,
+        'today': key_pool._today(),
+    })
 
 # =============================================================================
 # FISHBONE AI
