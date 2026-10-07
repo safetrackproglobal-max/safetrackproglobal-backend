@@ -7084,7 +7084,7 @@ class PredictiveAnalyticsRun(db.Model):
     anomalies = db.Column(db.Text, default='[]')
     ai_metadata = db.Column(db.Text)
 
-    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), nullable=False, index=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), nullable=True, index=True)
     created_by = db.Column(db.Integer, db.ForeignKey('users.id'), index=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
 
