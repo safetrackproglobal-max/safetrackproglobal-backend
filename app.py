@@ -3725,12 +3725,12 @@ class GeminiKeyPool:
     def _today(self):
         return datetime.utcnow().strftime('%Y-%m-%d')
 
-    def _reset_if_new_day(self, key):
+        def _reset_if_new_day(self, key):
         today = self._today()
         if key not in self.daily_usage or self.daily_usage[key]['date'] != today:
             self.daily_usage[key] = {'date': today, 'count': 0}
 
-        def get_key(self):
+    def get_key(self):
         """Return (key, index) of next usable key, or raise."""
         logger.warning(
             f"[get_key] ENTER pool_id={id(self)} keys={len(self.keys)} "
@@ -3772,6 +3772,10 @@ class GeminiKeyPool:
         logger.warning(f"[get_key] FALLING THROUGH — all keys rejected")
         raise RuntimeError('All Gemini API keys exhausted or rate-limited')
 
+    def record_use(self, key):
+        self._reset_if_new_day(key)
+        self.daily_usage[key]['count'] += 1
+
     def mark_rate_limited(self, key, seconds=60):
         self.rate_limited[key] = time.time() + seconds
 
@@ -3798,8 +3802,6 @@ class GeminiKeyPool:
             'keys': rows,
             'models': ['gemini-1.5-flash', 'gemini-1.5-pro']
         }
-
-
 key_pool = GeminiKeyPool()
 
 
