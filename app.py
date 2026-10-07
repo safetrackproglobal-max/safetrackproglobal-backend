@@ -3702,108 +3702,200 @@ GEMINI_AVAILABLE = True   # flip to False to disable the whole pipeline
 
 
 # ---------- KEY POOL ----------
+# ---------- KEY POOL ----------
 class GeminiKeyPool:
+    """
+    Rotates through up to 15 GEMINI_API_KEY_N env vars (falling back to a
+    single GEMINI_API_KEY). Tracks per-key rate-limit cooldowns and daily
+    usage. Thread-safe via a lock.
+    """
+
+    # ---- Tunables ----
+    DAILY_CAP = 20            # Gemini free tier for gemini-3.8-flash is 20/day
+    DEFAULT_COOLDOWN = 60     # seconds to lock a key after a 429 (if we can't parse retry-after)
+
     def __init__(self):
         self.keys = []
         for i in range(1, 16):
             k = os.environ.get(f'GEMINI_API_KEY_{i}')
             if k and k.strip():
                 self.keys.append(k.strip())
+                logger.info(f"[key_pool] loaded GEMINI_API_KEY_{i} ({k[:8]}...{k[-4:]})")
+
         # Fallback single key
         if not self.keys:
             k = os.environ.get('GEMINI_API_KEY')
             if k and k.strip():
                 self.keys.append(k.strip())
+                logger.info(f"[key_pool] loaded GEMINI_API_KEY ({k[:8]}...{k[-4:]})")
+
+        if not self.keys:
+            logger.error("[key_pool] NO API KEYS FOUND — AI endpoints will be unavailable")
 
         self.current_index = 0
-        self.rate_limited = {}       # key -> reset_timestamp
+        self.rate_limited = {}       # key -> reset_timestamp (float, epoch seconds)
         self.daily_usage = {}        # key -> {'date': 'YYYY-MM-DD', 'count': N}
+        self._lock = threading.Lock()
+
+        logger.info(f"[key_pool] initialized with {len(self.keys)} key(s)")
+
+    # ==================== INTERNAL HELPERS ====================
 
     def available(self):
+        """True if there's at least one key configured and AI is enabled."""
         return GEMINI_AVAILABLE and len(self.keys) > 0
 
     def _today(self):
         return datetime.utcnow().strftime('%Y-%m-%d')
 
-        def _reset_if_new_day(self, key):
+    def _reset_if_new_day(self, key):
+        """Reset the daily counter if the stored date is not today."""
         today = self._today()
         if key not in self.daily_usage or self.daily_usage[key]['date'] != today:
             self.daily_usage[key] = {'date': today, 'count': 0}
 
+    def _is_rate_limited(self, key, now=None):
+        """Return remaining cooldown in seconds (0 if not limited)."""
+        if now is None:
+            now = time.time()
+        reset_at = self.rate_limited.get(key, 0)
+        remaining = reset_at - now
+        return remaining if remaining > 0 else 0
+
+    # ==================== KEY SELECTION ====================
+
     def get_key(self):
-        """Return (key, index) of next usable key, or raise."""
-        logger.warning(
-            f"[get_key] ENTER pool_id={id(self)} keys={len(self.keys)} "
-            f"rate_limited={self.rate_limited} daily_usage={self.daily_usage}"
-        )
+        """
+        Return (key, index) of the next usable key, or raise RuntimeError.
 
-        if not self.keys:
-            raise RuntimeError('No Gemini API keys configured')
+        A key is usable if:
+          - it is not currently rate-limited, and
+          - its daily count is below DAILY_CAP.
+        """
+        with self._lock:
+            if not self.keys:
+                logger.error("[get_key] FAIL — no keys configured")
+                raise RuntimeError('No Gemini API keys configured')
 
-        now = time.time()
-        n = len(self.keys)
+            now = time.time()
+            n = len(self.keys)
 
-        for offset in range(n):
-            idx = (self.current_index + offset) % n
-            key = self.keys[idx]
-
-            reset_at = self.rate_limited.get(key, 0)
-            logger.warning(
-                f"[get_key] offset={offset} idx={idx} key={key[:8]} "
-                f"reset_at={reset_at} now={now} "
-                f"is_rate_limited={reset_at > now}"
+            logger.info(
+                f"[get_key] ENTER pool_id={id(self)} n={n} "
+                f"current_index={self.current_index} "
+                f"rate_limited={self.rate_limited} "
+                f"daily_usage={self.daily_usage}"
             )
-            if reset_at > now:
-                logger.warning(f"[get_key] SKIP idx={idx} — rate limited for "
-                               f"{reset_at - now:.1f}s")
-                continue
 
-            self._reset_if_new_day(key)
-            count = self.daily_usage[key]['count']
-            logger.warning(f"[get_key] idx={idx} daily_count={count}")
-            if count >= 1400:
-                logger.warning(f"[get_key] SKIP idx={idx} — daily cap")
-                continue
+            for offset in range(n):
+                idx = (self.current_index + offset) % n
+                key = self.keys[idx]
+                preview = f"{key[:8]}...{key[-4:]}"
 
-            self.current_index = idx
-            logger.warning(f"[get_key] RETURN idx={idx}")
-            return key, idx
+                cooldown = self._is_rate_limited(key, now)
+                if cooldown > 0:
+                    logger.info(
+                        f"[get_key] SKIP idx={idx} {preview} — "
+                        f"rate limited for {cooldown:.0f}s more"
+                    )
+                    continue
 
-        logger.warning(f"[get_key] FALLING THROUGH — all keys rejected")
-        raise RuntimeError('All Gemini API keys exhausted or rate-limited')
+                # Clean up any stale (expired) cooldown entry
+                if self.rate_limited.get(key, 0) and self.rate_limited[key] <= now:
+                    self.rate_limited.pop(key, None)
+
+                self._reset_if_new_day(key)
+                count = self.daily_usage[key]['count']
+
+                if count >= self.DAILY_CAP:
+                    logger.info(
+                        f"[get_key] SKIP idx={idx} {preview} — "
+                        f"daily cap reached ({count}/{self.DAILY_CAP})"
+                    )
+                    continue
+
+                self.current_index = idx
+                logger.info(
+                    f"[get_key] RETURN idx={idx} {preview} "
+                    f"(used today: {count}/{self.DAILY_CAP})"
+                )
+                return key, idx
+
+            logger.error(
+                f"[get_key] FAIL — all {n} key(s) exhausted or rate-limited. "
+                f"rate_limited={self.rate_limited} "
+                f"daily_usage={self.daily_usage}"
+            )
+            raise RuntimeError('All Gemini API keys exhausted or rate-limited')
+
+    # ==================== USAGE TRACKING ====================
 
     def record_use(self, key):
-        self._reset_if_new_day(key)
-        self.daily_usage[key]['count'] += 1
+        """Increment the successful-use counter for a key."""
+        with self._lock:
+            self._reset_if_new_day(key)
+            self.daily_usage[key]['count'] += 1
+            logger.info(
+                f"[record_use] {key[:8]}...{key[-4:]} -> "
+                f"{self.daily_usage[key]['count']}/{self.DAILY_CAP}"
+            )
 
-    def mark_rate_limited(self, key, seconds=60):
-        self.rate_limited[key] = time.time() + seconds
+    def mark_rate_limited(self, key, seconds=None):
+        """
+        Mark a key as rate-limited for `seconds`. If None, uses DEFAULT_COOLDOWN.
+        Automatically clamps to a sane max to avoid a stale lock poisoning the pool.
+        """
+        if seconds is None:
+            seconds = self.DEFAULT_COOLDOWN
+
+        # Clamp: never lock a key for more than 6 hours from a single 429
+        seconds = max(1, min(int(seconds), 6 * 3600))
+
+        with self._lock:
+            unlock_at = time.time() + seconds
+            self.rate_limited[key] = unlock_at
+            logger.warning(
+                f"[mark_rate_limited] {key[:8]}...{key[-4:]} locked for "
+                f"{seconds}s (until {datetime.utcfromtimestamp(unlock_at).isoformat()}Z)"
+            )
+
+    # ==================== STATUS ====================
 
     def status(self):
-        now = time.time()
-        avail = 0
-        rows = []
-        for i, key in enumerate(self.keys):
-            rl = self.rate_limited.get(key, 0) > now
-            self._reset_if_new_day(key)
-            used = self.daily_usage[key]['count']
-            if not rl and used < 1400:
-                avail += 1
-            rows.append({
-                'index': i + 1,
-                'preview': f"{key[:8]}...{key[-4:]}",
-                'rate_limited': rl,
-                'used_today': used,
-            })
-        return {
-            'available': GEMINI_AVAILABLE and len(self.keys) > 0 and avail > 0,
-            'totalKeys': len(self.keys),
-            'availableKeys': avail,
-            'keys': rows,
-            'models': ['gemini-1.5-flash', 'gemini-1.5-pro']
-        }
-key_pool = GeminiKeyPool()
+        """Snapshot of pool state for /api/ai/status."""
+        with self._lock:
+            now = time.time()
+            avail = 0
+            rows = []
 
+            for i, key in enumerate(self.keys):
+                self._reset_if_new_day(key)
+                used = self.daily_usage[key]['count']
+                cooldown = self._is_rate_limited(key, now)
+                is_rl = cooldown > 0
+
+                if not is_rl and used < self.DAILY_CAP:
+                    avail += 1
+
+                rows.append({
+                    'index': i + 1,
+                    'preview': f"{key[:8]}...{key[-4:]}",
+                    'rate_limited': is_rl,
+                    'cooldown_seconds': int(cooldown),
+                    'used_today': used,
+                    'daily_cap': self.DAILY_CAP,
+                })
+
+            return {
+                'available': GEMINI_AVAILABLE and len(self.keys) > 0 and avail > 0,
+                'totalKeys': len(self.keys),
+                'availableKeys': avail,
+                'keys': rows,
+                'models': ['gemini-flash-latest'],
+            }
+
+
+key_pool = GeminiKeyPool()
 
 # ---------- RESPONSE CACHE ----------
 class _AICache:
