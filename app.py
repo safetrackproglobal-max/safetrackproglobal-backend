@@ -6945,6 +6945,78 @@ def check_feature_access(feature_name, required_plan='basic'):
         return decorated_function
     return decorator
 
+
+# ============================================================
+# TENANT SCOPING HELPERS
+# ============================================================
+# Rules for every PowerBI endpoint:
+#   Super admin / system team / platform owner → see all rows
+#   Company user (has company_id)              → see their company's rows
+#   No-company user (company_id is None)       → see only their own rows
+#
+# Never fall back to company_id=1. Never invent a value.
+# ============================================================
+
+
+def _is_bypass_user(user):
+    """True for users who see data across tenants."""
+    return (
+        getattr(user, 'is_super_admin', False) or
+        getattr(user, 'is_system_team', False) or
+        getattr(user, 'is_platform_owner', False)
+    )
+
+
+def apply_tenant_scope(query, model, user, user_field='created_by'):
+    """
+    Filter `query` for `model` based on the user's tenant scope.
+
+      - bypass user      → no filter
+      - has company_id   → filter by model.company_id == user.company_id
+      - no company_id    → filter by model.<user_field> == user.id
+
+    If the model lacks the expected columns, the query is returned
+    unfiltered only when the user is a bypass user; otherwise an
+    impossible filter is applied so the response is empty (safer
+    than leaking data).
+    """
+    if user is None:
+        return query.filter(db.false())
+
+    if _is_bypass_user(user):
+        return query
+
+    company_id = getattr(user, 'company_id', None)
+
+    if company_id is not None:
+        if hasattr(model, 'company_id'):
+            return query.filter(model.company_id == company_id)
+        # No way to scope by company — return empty rather than leak
+        return query.filter(db.false())
+
+    if hasattr(model, user_field):
+        return query.filter(getattr(model, user_field) == user.id)
+
+    # Nothing to scope on
+    return query.filter(db.false())
+
+
+def resolve_write_company_id(user):
+    """
+    Company id to store when creating a row.
+
+      - bypass user    → None (platform-level row)
+      - has company_id → their company_id
+      - no company     → None
+
+    Never returns a made-up id.
+    """
+    if user is None:
+        return None
+    if _is_bypass_user(user):
+        return None
+    return getattr(user, 'company_id', None)
+
 # ==================== ENHANCED CHECK USAGE LIMIT ====================
 
 def check_usage_limit(limit_type, amount=1):
@@ -22544,110 +22616,62 @@ def notify_incident_update(incident, updated_by, changes):
 @app.route('/api/powerbi/manpower', methods=['GET'], endpoint='get_manpower')
 @jwt_required
 def get_manpower():
-    """Get manpower data with filters - Filtered by user_id, company_id, and project_id"""
+    """Get manpower data. Super admin: all. Company user: company. No company: own."""
     try:
-        print(f"\n{'='*60}")
-        print(f"📊 GET MANPOWER - START")
-        print(f"{'='*60}")
-        
         user = getattr(request, 'user', None)
         if not user:
-            print(f"❌ ERROR: No user in request context")
             return jsonify({'success': False, 'error': 'User authentication failed'}), 401
-        
-        print(f"👤 User: ID={user.id}, Email={user.email}")
-        print(f"🏢 Company ID from user: {user.company_id}")
-        
-        company_id = user.company_id
-        if not company_id:
-            print(f"⚠️ WARNING: No company_id for user {user.id}, using default 1")
-            company_id = 1
-        
-        print(f"🔍 Using company_id: {company_id} for query")
-        
-        # Get query parameters
-        start_date = request.args.get('start_date')
-        end_date = request.args.get('end_date')
-        section = request.args.get('section')
+
+        query = apply_tenant_scope(Manpower.query, Manpower, user, user_field='created_by')
+
         project_id = request.args.get('project_id')
-        
-        print(f"📅 Date range: {start_date} to {end_date}")
-        print(f"📌 Section filter: {section}")
-        print(f"📌 Project ID: {project_id if project_id else 'All Projects'}")
-        
-        # ✅ FILTER BY BOTH company_id AND created_by (user) AND project_id
-        query = Manpower.query.filter(
-            Manpower.company_id == company_id,
-            Manpower.created_by == user.id
-        )
-        
-        # ✅ Apply project filter
         if project_id:
             try:
                 query = query.filter(Manpower.project_id == int(project_id))
-                print(f"  ✅ Applied project filter: {project_id}")
-            except ValueError:
-                print(f"  ⚠️ Invalid project_id format: {project_id}")
-        
-        # Apply date filters
+            except (ValueError, TypeError):
+                pass
+
+        start_date = request.args.get('start_date')
         if start_date:
             try:
-                start = datetime.strptime(start_date, '%Y-%m-%d')
-                query = query.filter(Manpower.date >= start)
-                print(f"  ✅ Applied start date filter: {start}")
-            except Exception as e:
-                print(f"  ⚠️ Invalid start_date format: {e}")
-        
+                query = query.filter(Manpower.date >= datetime.strptime(start_date, '%Y-%m-%d'))
+            except Exception:
+                pass
+
+        end_date = request.args.get('end_date')
         if end_date:
             try:
-                end = datetime.strptime(end_date, '%Y-%m-%d')
-                query = query.filter(Manpower.date <= end)
-                print(f"  ✅ Applied end date filter: {end}")
-            except Exception as e:
-                print(f"  ⚠️ Invalid end_date format: {e}")
-        
+                query = query.filter(Manpower.date <= datetime.strptime(end_date, '%Y-%m-%d'))
+            except Exception:
+                pass
+
+        section = request.args.get('section')
         if section:
             query = query.filter(Manpower.section == section)
-            print(f"  ✅ Applied section filter: {section}")
-        
+
         total = query.count()
-        print(f"📊 Total records found for user {user.id}: {total}")
-        
         results = query.order_by(Manpower.date.desc()).all()
-        
-        data = []
-        for m in results:
-            data.append({
-                'id': m.id,
-                'section': m.section,
-                'count': m.count,
-                'date': m.date.isoformat() if m.date else None,
-                'department_id': m.department_id,
-                'department_name': m.department_name,
-                'notes': m.notes,
-                'project_id': m.project_id,
-                'created_at': m.created_at.isoformat() if m.created_at else None,
-                'created_by': m.created_by
-            })
-        
-        print(f"✅ Returning {len(data)} manpower records for user {user.id}")
-        print(f"{'='*60}\n")
-        
-        return jsonify({
-            'success': True,
-            'data': data,
-            'total': total
-        }), 200
-        
+
+        data = [{
+            'id': m.id,
+            'section': m.section,
+            'count': m.count,
+            'date': m.date.isoformat() if m.date else None,
+            'department_id': m.department_id,
+            'department_name': m.department_name,
+            'notes': m.notes,
+            'project_id': m.project_id,
+            'created_at': m.created_at.isoformat() if m.created_at else None,
+            'created_by': m.created_by,
+            'company_id': m.company_id,
+        } for m in results]
+
+        return jsonify({'success': True, 'data': data, 'total': total}), 200
+
     except Exception as e:
-        print(f"❌ ERROR in get_manpower: {str(e)}")
         import traceback
         traceback.print_exc()
-        return jsonify({
-            'success': False,
-            'error': str(e),
-            'code': 'INTERNAL_SERVER_ERROR'
-        }), 500
+        return jsonify({'success': False, 'error': str(e), 'code': 'INTERNAL_SERVER_ERROR'}), 500
 
 @app.route('/api/powerbi/manpower', methods=['POST'], endpoint='create_manpower')
 @jwt_required
@@ -22898,76 +22922,45 @@ def create_training():
 @app.route('/api/powerbi/lti', methods=['GET'], endpoint='get_lti')
 @jwt_required
 def get_lti():
-    """Get Lost Time Injury data - Filtered by user_id, company_id, and project_id"""
     try:
-        print(f"\n{'='*60}")
-        print(f"📊 GET LTI - START")
-        print(f"{'='*60}")
-        
         user = getattr(request, 'user', None)
         if not user:
-            print(f"❌ ERROR: No user in request context")
             return jsonify({'success': False, 'error': 'User authentication failed'}), 401
-        
-        print(f"👤 User: ID={user.id}, Email={user.email}")
-        
-        company_id = user.company_id
-        if not company_id:
-            print(f"⚠️ WARNING: No company_id for user {user.id}, using default 1")
-            company_id = 1
-        
-        print(f"🏢 Company ID: {company_id}")
-        
-        start_year = request.args.get('start_year')
-        end_year = request.args.get('end_year')
-        department = request.args.get('department')
+
+        query = apply_tenant_scope(LTI.query, LTI, user, user_field='created_by')
+
         project_id = request.args.get('project_id')
-        
-        print(f"📅 Year range: {start_year} to {end_year}")
-        print(f"📌 Department filter: {department}")
-        print(f"📌 Project ID: {project_id if project_id else 'All Projects'}")
-        
-        # ✅ FILTER BY BOTH company_id AND created_by (user) AND project_id
-        query = LTI.query.filter(
-            LTI.company_id == company_id,
-            LTI.created_by == user.id
-        )
-        
-        # ✅ Apply project filter
         if project_id:
             try:
                 query = query.filter(LTI.project_id == int(project_id))
-                print(f"  ✅ Applied project filter: {project_id}")
-            except ValueError:
-                print(f"  ⚠️ Invalid project_id format: {project_id}")
-        
+            except (ValueError, TypeError):
+                pass
+
+        start_year = request.args.get('start_year')
         if start_year:
             try:
                 query = query.filter(LTI.year >= int(start_year))
-                print(f"  ✅ Applied start year filter: {start_year}")
-            except Exception as e:
-                print(f"  ⚠️ Invalid start_year format: {e}")
-        
+            except Exception:
+                pass
+
+        end_year = request.args.get('end_year')
         if end_year:
             try:
                 query = query.filter(LTI.year <= int(end_year))
-                print(f"  ✅ Applied end year filter: {end_year}")
-            except Exception as e:
-                print(f"  ⚠️ Invalid end_year format: {e}")
-        
+            except Exception:
+                pass
+
+        department = request.args.get('department')
         if department and department != 'all':
             if hasattr(LTI, 'department_id'):
                 try:
                     query = query.filter(LTI.department_id == int(department))
-                    print(f"  ✅ Applied department filter: {department}")
-                except:
+                except Exception:
                     pass
-        
+
         total = query.count()
-        print(f"📊 Total LTI records found for user {user.id}: {total}")
-        
         results = query.order_by(LTI.year).all()
-        
+
         data = [{
             'id': l.id,
             'year': l.year,
@@ -22977,16 +22970,13 @@ def get_lti():
             'incident_count': l.incident_count,
             'description': l.description,
             'project_id': l.project_id,
-            'created_by': l.created_by
+            'created_by': l.created_by,
+            'company_id': l.company_id,
         } for l in results]
-        
-        print(f"✅ Returning {len(data)} LTI records for user {user.id}")
-        print(f"{'='*60}\n")
-        
-        return jsonify({'success': True, 'data': data}), 200
-        
+
+        return jsonify({'success': True, 'data': data, 'total': total}), 200
+
     except Exception as e:
-        print(f"❌ ERROR in get_lti: {str(e)}")
         import traceback
         traceback.print_exc()
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -22995,36 +22985,27 @@ def get_lti():
 @jwt_required
 def create_lti():
     try:
-        print(f"\n📝 CREATE LTI:")
-        
         user = getattr(request, 'user', None)
         if not user:
             return jsonify({'success': False, 'error': 'User authentication failed'}), 401
-        
-        data = request.get_json()
-        
-        company_id = user.company_id or 1
+
+        data = request.get_json() or {}
+        company_id = resolve_write_company_id(user)
         project_id = data.get('project_id')
-        
-        print(f"  User ID: {user.id}")
-        print(f"  Company ID: {company_id}")
-        print(f"  Project ID: {project_id if project_id else 'None'}")
-        
+
         lti = LTI(
             year=data['year'],
             value=data['value'],
             incident_count=data.get('incident_count', 0),
             description=data.get('description'),
-            company_id=company_id,
+            company_id=company_id,      # may be None
             project_id=project_id,
-            created_by=user.id
+            created_by=user.id,
         )
-        
         db.session.add(lti)
         db.session.commit()
-        
         return jsonify({'success': True, 'id': lti.id, 'project_id': lti.project_id}), 201
-        
+
     except Exception as e:
         db.session.rollback()
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -23033,198 +23014,124 @@ def create_lti():
 @app.route('/api/powerbi/man-hours', methods=['GET'], endpoint='get_man_hours')
 @jwt_required
 def get_man_hours():
-    """Get man-hours data - Filtered by user_id, company_id, and project_id"""
     try:
-        print(f"\n{'='*60}")
-        print(f"📊 GET MAN-HOURS - START")
-        print(f"{'='*60}")
-        
         user = getattr(request, 'user', None)
         if not user:
-            print(f"❌ ERROR: No user in request context")
             return jsonify({'success': False, 'error': 'User authentication failed'}), 401
-        
-        print(f"👤 User: ID={user.id}, Email={user.email}")
-        
-        company_id = user.company_id
-        if not company_id:
-            print(f"⚠️ WARNING: No company_id for user {user.id}, using default 1")
-            company_id = 1
-        
-        print(f"🏢 Company ID: {company_id}")
-        
-        start_date = request.args.get('start_date')
-        end_date = request.args.get('end_date')
-        section = request.args.get('section')
-        department = request.args.get('department')
+
+        query = apply_tenant_scope(ManHours.query, ManHours, user, user_field='created_by')
+
         project_id = request.args.get('project_id')
-        
-        print(f"📅 Date range: {start_date} to {end_date}")
-        print(f"📌 Filters - section: {section}, department: {department}")
-        print(f"📌 Project ID: {project_id if project_id else 'All Projects'}")
-        
-        # ✅ FILTER BY BOTH company_id AND created_by (user) AND project_id
-        query = ManHours.query.filter(
-            ManHours.company_id == company_id,
-            ManHours.created_by == user.id
-        )
-        
-        # ✅ Apply project filter
         if project_id:
             try:
                 query = query.filter(ManHours.project_id == int(project_id))
-                print(f"  ✅ Applied project filter: {project_id}")
-            except ValueError:
-                print(f"  ⚠️ Invalid project_id format: {project_id}")
-        
+            except (ValueError, TypeError):
+                pass
+
+        start_date = request.args.get('start_date')
         if start_date:
             try:
-                start = datetime.strptime(start_date, '%Y-%m-%d')
-                query = query.filter(ManHours.date >= start)
-                print(f"  ✅ Applied start date filter: {start}")
-            except Exception as e:
-                print(f"  ⚠️ Invalid start_date format: {e}")
-        
+                query = query.filter(ManHours.date >= datetime.strptime(start_date, '%Y-%m-%d'))
+            except Exception:
+                pass
+
+        end_date = request.args.get('end_date')
         if end_date:
             try:
-                end = datetime.strptime(end_date, '%Y-%m-%d')
-                query = query.filter(ManHours.date <= end)
-                print(f"  ✅ Applied end date filter: {end}")
-            except Exception as e:
-                print(f"  ⚠️ Invalid end_date format: {e}")
-        
+                query = query.filter(ManHours.date <= datetime.strptime(end_date, '%Y-%m-%d'))
+            except Exception:
+                pass
+
+        section = request.args.get('section')
         if section:
             query = query.filter(ManHours.section == section)
-            print(f"  ✅ Applied section filter: {section}")
-        
-        if department and department != 'all':
-            if hasattr(ManHours, 'department_id'):
-                try:
-                    query = query.filter(ManHours.department_id == int(department))
-                    print(f"  ✅ Applied department filter: {department}")
-                except:
-                    pass
-        
+
+        department = request.args.get('department')
+        if department and department != 'all' and hasattr(ManHours, 'department_id'):
+            try:
+                query = query.filter(ManHours.department_id == int(department))
+            except Exception:
+                pass
+
         total = query.count()
-        print(f"📊 Total man-hours records found for user {user.id}: {total}")
-        
         results = query.order_by(ManHours.date.desc()).all()
-        
+
         data = [{
             'id': m.id,
             'section': m.section,
-            'hours': float(m.hours),
+            'hours': float(m.hours) if m.hours is not None else 0,
             'date': m.date.isoformat() if m.date else None,
             'department_id': m.department_id,
             'department_name': m.department_name,
-            'project': m.project,
             'activity': m.activity,
             'project_id': m.project_id,
-            'created_by': m.created_by
+            'created_by': m.created_by,
+            'company_id': m.company_id,
         } for m in results]
-        
-        print(f"✅ Returning {len(data)} man-hours records for user {user.id}")
-        print(f"{'='*60}\n")
-        
-        return jsonify({'success': True, 'data': data}), 200
-        
+
+        return jsonify({'success': True, 'data': data, 'total': total}), 200
+
     except Exception as e:
-        print(f"❌ ERROR in get_man_hours: {str(e)}")
         import traceback
         traceback.print_exc()
         return jsonify({'success': False, 'error': str(e)}), 500
+
 
 @app.route('/api/powerbi/man-hours', methods=['POST'], endpoint='create_man_hours')
 @jwt_required
 def create_man_hours():
     try:
-        print(f"\n📝 CREATE MAN-HOURS:")
-        
         user = getattr(request, 'user', None)
         if not user:
             return jsonify({'success': False, 'error': 'User authentication failed'}), 401
-        
-        data = request.get_json()
-        
-        company_id = user.company_id or 1
+
+        data = request.get_json() or {}
+        company_id = resolve_write_company_id(user)
         project_id = data.get('project_id')
-        
-        print(f"  User ID: {user.id}")
-        print(f"  Company ID: {company_id}")
-        print(f"  Project ID: {project_id if project_id else 'None'}")
-        
+
         man_hours = ManHours(
             section=data['section'],
             hours=data['hours'],
             date=datetime.strptime(data['date'], '%Y-%m-%d'),
-            project=data.get('project'),
             activity=data.get('activity'),
             company_id=company_id,
             project_id=project_id,
-            created_by=user.id
+            created_by=user.id,
         )
-        
         db.session.add(man_hours)
         db.session.commit()
-        
         return jsonify({'success': True, 'id': man_hours.id, 'project_id': man_hours.project_id}), 201
-        
+
     except Exception as e:
         db.session.rollback()
         return jsonify({'success': False, 'error': str(e)}), 500
-
 # ==================== OBSERVATIONS ENDPOINTS ====================
 @app.route('/api/powerbi/observations', methods=['POST'], endpoint='create_observation')
 @jwt_required
 def create_observation():
-    """Create new observation record with project_id"""
     try:
-        print(f"\n{'='*60}")
-        print(f"📝 CREATE OBSERVATION - START")
-        print(f"{'='*60}")
-        
         user = getattr(request, 'user', None)
         if not user:
-            return jsonify({
-                'success': False,
-                'error': 'User authentication failed',
-                'code': 'AUTHENTICATION_ERROR'
-            }), 401
-        
+            return jsonify({'success': False, 'error': 'User authentication failed', 'code': 'AUTHENTICATION_ERROR'}), 401
+
         data = request.get_json()
-        print(f"📊 Received data: {data}")
-        
         if not data:
-            return jsonify({
-                'success': False,
-                'error': 'No JSON data provided',
-                'code': 'VALIDATION_ERROR'
-            }), 400
-        
-        company_id = user.company_id or 1
-        project_id = data.get('project_id')
-        print(f"👤 User: ID={user.id}, Email={user.email}")
-        print(f"🏢 Company ID: {company_id}")
-        print(f"📌 Project ID: {project_id if project_id else 'None'}")
-        
+            return jsonify({'success': False, 'error': 'No JSON data provided', 'code': 'VALIDATION_ERROR'}), 400
+
         from models import SafetyObservation
-        
-        # Parse date
+        import random
+
         date_observed = datetime.utcnow()
         if data.get('date'):
-            try:
-                date_observed = datetime.strptime(data['date'], '%Y-%m-%d')
-            except:
+            for fmt in ('%Y-%m-%d', '%Y-%m-%dT%H:%M:%S.%f', '%Y-%m-%dT%H:%M:%S'):
                 try:
-                    date_observed = datetime.strptime(data['date'], '%Y-%m-%dT%H:%M:%S.%f')
-                except:
-                    date_observed = datetime.utcnow()
-        
-        # Generate observation number
-        import random
+                    date_observed = datetime.strptime(data['date'], fmt)
+                    break
+                except Exception:
+                    continue
+
         observation_number = f"OBS-{datetime.utcnow().strftime('%Y%m%d')}-{random.randint(1000, 9999)}"
-        
-        # Create observation with correct field names
+
         observation = SafetyObservation(
             user_id=user.id,
             observation_number=observation_number,
@@ -23241,103 +23148,66 @@ def create_observation():
             immediate_action=data.get('immediate_action', ''),
             recommendation=data.get('recommendation', ''),
             status='open',
-            project_id=project_id
+            company_id=resolve_write_company_id(user),   # may be None
+            project_id=data.get('project_id'),
         )
-        
         db.session.add(observation)
         db.session.commit()
-        
-        print(f"✅ Created observation ID: {observation.id}")
-        print(f"   Observation Number: {observation.observation_number}")
-        print(f"   Date Observed: {observation.date_observed}")
-        print(f"{'='*60}\n")
-        
+
         return jsonify({
             'success': True,
             'message': 'Observation created successfully',
             'id': observation.id,
             'observation_number': observation.observation_number,
-            'project_id': observation.project_id
+            'project_id': observation.project_id,
         }), 201
-        
+
     except Exception as e:
-        print(f"❌ ERROR in create_observation: {e}")
         import traceback
         traceback.print_exc()
         db.session.rollback()
-        return jsonify({
-            'success': False,
-            'error': str(e),
-            'code': 'INTERNAL_SERVER_ERROR'
-        }), 500
+        return jsonify({'success': False, 'error': str(e), 'code': 'INTERNAL_SERVER_ERROR'}), 500
 
 @app.route('/api/powerbi/observations', methods=['GET'], endpoint='get_observations')
 @jwt_required
 def get_observations():
-    """Get safety observations - Filtered by user_id and project_id"""
     try:
-        print(f"\n{'='*60}")
-        print(f"📊 GET OBSERVATIONS - START")
-        print(f"{'='*60}")
-        
         user = getattr(request, 'user', None)
         if not user:
-            print(f"❌ ERROR: No user in request context")
             return jsonify({'success': False, 'error': 'User authentication failed'}), 401
-        
-        print(f"👤 User: ID={user.id}, Email={user.email}")
-        
+
         from models import SafetyObservation
-        
-        start_date = request.args.get('start_date')
-        end_date = request.args.get('end_date')
-        obs_type = request.args.get('type')
+
+        query = apply_tenant_scope(SafetyObservation.query, SafetyObservation, user, user_field='user_id')
+
         project_id = request.args.get('project_id')
-        
-        print(f"📅 Date range: {start_date} to {end_date}")
-        print(f"📌 Type filter: {obs_type}")
-        print(f"📌 Project ID: {project_id if project_id else 'All Projects'}")
-        
-        # ✅ FILTER BY user_id AND project_id
-        query = SafetyObservation.query.filter(
-            SafetyObservation.user_id == user.id
-        )
-        
-        # ✅ Apply project filter
         if project_id:
             try:
                 query = query.filter(SafetyObservation.project_id == int(project_id))
-                print(f"  ✅ Applied project filter: {project_id}")
-            except ValueError:
-                print(f"  ⚠️ Invalid project_id format: {project_id}")
-        
-        # ✅ Apply date filters using date_observed
+            except (ValueError, TypeError):
+                pass
+
+        start_date = request.args.get('start_date')
         if start_date:
             try:
-                start = datetime.strptime(start_date, '%Y-%m-%d')
-                query = query.filter(SafetyObservation.date_observed >= start)
-                print(f"  ✅ Applied start date filter: {start}")
-            except Exception as e:
-                print(f"  ⚠️ Invalid start_date format: {e}")
-        
+                query = query.filter(SafetyObservation.date_observed >= datetime.strptime(start_date, '%Y-%m-%d'))
+            except Exception:
+                pass
+
+        end_date = request.args.get('end_date')
         if end_date:
             try:
-                end = datetime.strptime(end_date, '%Y-%m-%d')
-                query = query.filter(SafetyObservation.date_observed <= end)
-                print(f"  ✅ Applied end date filter: {end}")
-            except Exception as e:
-                print(f"  ⚠️ Invalid end_date format: {e}")
-        
-        # Apply type filter
+                query = query.filter(SafetyObservation.date_observed <= datetime.strptime(end_date, '%Y-%m-%d'))
+            except Exception:
+                pass
+
+        obs_type = request.args.get('type')
         if obs_type:
             query = query.filter(SafetyObservation.type == obs_type)
-            print(f"  ✅ Applied type filter: {obs_type}")
-        
+
         total = query.count()
-        print(f"📊 Total observations found for user {user.id}: {total}")
-        
         results = query.order_by(SafetyObservation.date_observed.desc()).all()
-        
+
         data = [{
             'id': o.id,
             'type': o.type,
@@ -23351,16 +23221,12 @@ def get_observations():
             'risk_level': o.risk_level,
             'status': o.status,
             'observation_number': o.observation_number,
-            'project_id': o.project_id
+            'project_id': o.project_id,
         } for o in results]
-        
-        print(f"✅ Returning {len(data)} observation records for user {user.id}")
-        print(f"{'='*60}\n")
-        
-        return jsonify({'success': True, 'data': data}), 200
-        
+
+        return jsonify({'success': True, 'data': data, 'total': total}), 200
+
     except Exception as e:
-        print(f"❌ ERROR in get_observations: {str(e)}")
         import traceback
         traceback.print_exc()
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -23369,59 +23235,37 @@ def get_observations():
 @app.route('/api/powerbi/accidents', methods=['GET'], endpoint='get_accidents')
 @jwt_required
 def get_accidents():
-    """Get accident data - Filtered by user_id, company_id, and project_id"""
     try:
-        print(f"\n{'='*60}")
-        print(f"📊 GET ACCIDENTS - START")
-        print(f"{'='*60}")
-        
         user = getattr(request, 'user', None)
         if not user:
             return jsonify({'success': False, 'error': 'User authentication failed'}), 401
-        
-        print(f"👤 User: ID={user.id}, Email={user.email}")
-        
-        company_id = user.company_id or 1
-        print(f"🏢 Company ID: {company_id}")
-        
-        start_year = request.args.get('start_year')
-        end_year = request.args.get('end_year')
-        
-        # ✅ Capture both 'project' and 'project_id' from query parameters
+
+        query = apply_tenant_scope(Accident.query, Accident, user, user_field='created_by')
+
         project_id = request.args.get('project_id') or request.args.get('project')
-        print(f"📌 Project ID: {project_id if project_id else 'All Projects'}")
-        
-        # ✅ FILTER BY BOTH company_id AND created_by (user) AND project_id
-        query = Accident.query.filter(
-            Accident.company_id == company_id,
-            Accident.created_by == user.id
-        )
-        
-        # ✅ Apply project filter
         if project_id:
             try:
                 query = query.filter(Accident.project_id == int(project_id))
-                print(f"  ✅ Applied project filter: {project_id}")
             except (ValueError, TypeError):
-                print(f"  ⚠️ Invalid project_id format: {project_id}")
-        
+                pass
+
+        start_year = request.args.get('start_year')
         if start_year:
             try:
                 query = query.filter(Accident.year >= int(start_year))
-            except:
+            except Exception:
                 pass
-        
+
+        end_year = request.args.get('end_year')
         if end_year:
             try:
                 query = query.filter(Accident.year <= int(end_year))
-            except:
+            except Exception:
                 pass
-        
+
         total = query.count()
-        print(f"📊 Total accident records found for user {user.id}: {total}")
-        
         results = query.order_by(Accident.year.desc()).all()
-        
+
         data = [{
             'id': a.id,
             'year': a.year,
@@ -23430,16 +23274,13 @@ def get_accidents():
             'severity': a.severity,
             'description': a.description,
             'project_id': a.project_id,
-            'created_by': a.created_by
+            'created_by': a.created_by,
+            'company_id': a.company_id,
         } for a in results]
-        
-        print(f"✅ Returning {len(data)} accident records for user {user.id}")
-        print(f"{'='*60}\n")
-        
-        return jsonify({'success': True, 'data': data}), 200
-        
+
+        return jsonify({'success': True, 'data': data, 'total': total}), 200
+
     except Exception as e:
-        print(f"❌ ERROR in get_accidents: {str(e)}")
         import traceback
         traceback.print_exc()
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -23447,39 +23288,17 @@ def get_accidents():
 @app.route('/api/powerbi/accidents', methods=['POST'], endpoint='create_accident')
 @jwt_required
 def create_accident():
-    """Create new accident record with project_id"""
     try:
-        print(f"\n📝 CREATE ACCIDENT:")
-        
         user = getattr(request, 'user', None)
         if not user:
-            return jsonify({
-                'success': False,
-                'error': 'User authentication failed',
-                'code': 'AUTHENTICATION_ERROR'
-            }), 401
-        
+            return jsonify({'success': False, 'error': 'User authentication failed', 'code': 'AUTHENTICATION_ERROR'}), 401
+
         data = request.get_json()
         if not data:
-            return jsonify({
-                'success': False,
-                'error': 'No JSON data provided',
-                'code': 'VALIDATION_ERROR'
-            }), 400
-        
-        company_id = user.company_id
-        if not company_id:
-            if hasattr(user, 'company') and user.company:
-                company_id = user.company.id
-            else:
-                company_id = 1
-                print(f"  ⚠️ No company_id found for user {user.id}, using default 1")
-        
-        project_id = data.get('project_id')
-        print(f"  User ID: {user.id}")
-        print(f"  Company ID: {company_id}")
-        print(f"  Project ID: {project_id if project_id else 'None'}")
-        
+            return jsonify({'success': False, 'error': 'No JSON data provided', 'code': 'VALIDATION_ERROR'}), 400
+
+        company_id = resolve_write_company_id(user)
+
         accident = Accident(
             year=data['year'],
             rate=data['rate'],
@@ -23487,94 +23306,59 @@ def create_accident():
             severity=data.get('severity'),
             description=data.get('description'),
             company_id=company_id,
-            project_id=project_id,
-            created_by=user.id
+            project_id=data.get('project_id'),
+            created_by=user.id,
         )
-        
         db.session.add(accident)
         db.session.commit()
-        
-        print(f"  ✅ Created accident record ID: {accident.id}")
-        
-        return jsonify({
-            'success': True,
-            'message': 'Accident record created',
-            'id': accident.id,
-            'project_id': accident.project_id
-        }), 201
-        
+        return jsonify({'success': True, 'message': 'Accident record created',
+                        'id': accident.id, 'project_id': accident.project_id}), 201
+
     except Exception as e:
-        print(f"❌ ERROR in create_accident: {e}")
+        import traceback
         traceback.print_exc()
         db.session.rollback()
-        return jsonify({
-            'success': False,
-            'error': str(e),
-            'code': 'INTERNAL_SERVER_ERROR'
-        }), 500
+        return jsonify({'success': False, 'error': str(e), 'code': 'INTERNAL_SERVER_ERROR'}), 500
 
 # ==================== SEVERITY ENDPOINTS ====================
 @app.route('/api/powerbi/severity', methods=['GET'], endpoint='get_severity')
 @jwt_required
 def get_severity():
-    """Get injury severity data - Filtered by user_id, company_id, and project_id"""
     try:
-        print(f"\n{'='*60}")
-        print(f"📊 GET SEVERITY - START")
-        print(f"{'='*60}")
-        
         user = getattr(request, 'user', None)
         if not user:
             return jsonify({'success': False, 'error': 'User authentication failed'}), 401
-        
-        print(f"👤 User: ID={user.id}, Email={user.email}")
-        
-        company_id = user.company_id or 1
-        print(f"🏢 Company ID: {company_id}")
-        
-        start_year = request.args.get('start_year')
-        end_year = request.args.get('end_year')
-        
-        # ✅ Capture both 'project' and 'project_id' from query parameters
-        project_id = request.args.get('project_id') or request.args.get('project')
-        print(f"📌 Project ID: {project_id if project_id else 'All Projects'}")
-        
-        # ✅ USE THE CORRECT MODEL: ObservationSeverity
+
         from models import ObservationSeverity
-        
-        query = ObservationSeverity.query.filter(
-            ObservationSeverity.company_id == company_id,
-            ObservationSeverity.created_by == user.id,
-            ObservationSeverity.is_active == True
-        )
-        
-        # ✅ Apply project filter
+
+        query = apply_tenant_scope(ObservationSeverity.query, ObservationSeverity, user, user_field='created_by')
+        # keep your existing active filter
+        query = query.filter(ObservationSeverity.is_active == True)
+
+        project_id = request.args.get('project_id') or request.args.get('project')
         if project_id:
             try:
                 query = query.filter(ObservationSeverity.project_id == int(project_id))
-                print(f"  ✅ Applied project filter: {project_id}")
             except (ValueError, TypeError):
-                print(f"  ⚠️ Invalid project_id format: {project_id}")
-        
+                pass
+
+        start_year = request.args.get('start_year')
         if start_year:
             try:
-                start_date = datetime(int(start_year), 1, 1)
-                query = query.filter(ObservationSeverity.created_at >= start_date)
-            except:
+                query = query.filter(ObservationSeverity.created_at >= datetime(int(start_year), 1, 1))
+            except Exception:
                 pass
-        
+
+        end_year = request.args.get('end_year')
         if end_year:
             try:
-                end_date = datetime(int(end_year), 12, 31)
-                query = query.filter(ObservationSeverity.created_at <= end_date)
-            except:
+                query = query.filter(ObservationSeverity.created_at <= datetime(int(end_year), 12, 31))
+            except Exception:
                 pass
-        
+
         total = query.count()
-        print(f"📊 Total severity records found for user {user.id}: {total}")
-        
         results = query.order_by(ObservationSeverity.created_at.desc()).all()
-        
+
         data = [{
             'id': s.id,
             'year': s.created_at.year if s.created_at else datetime.utcnow().year,
@@ -23582,16 +23366,13 @@ def get_severity():
             'type': s.name,
             'description': s.description,
             'project_id': s.project_id,
-            'created_by': s.created_by
+            'created_by': s.created_by,
+            'company_id': s.company_id,
         } for s in results]
-        
-        print(f"✅ Returning {len(data)} severity records for user {user.id}")
-        print(f"{'='*60}\n")
-        
-        return jsonify({'success': True, 'data': data}), 200
-        
+
+        return jsonify({'success': True, 'data': data, 'total': total}), 200
+
     except Exception as e:
-        print(f"❌ ERROR in get_severity: {str(e)}")
         import traceback
         traceback.print_exc()
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -23599,72 +23380,33 @@ def get_severity():
 @app.route('/api/powerbi/severity', methods=['POST'], endpoint='create_severity')
 @jwt_required
 def create_severity():
-    """Create new severity record with project_id"""
     try:
-        print(f"\n{'='*60}")
-        print(f"📝 CREATE SEVERITY - START")
-        print(f"{'='*60}")
-        
         user = getattr(request, 'user', None)
         if not user:
-            return jsonify({
-                'success': False,
-                'error': 'User authentication failed',
-                'code': 'AUTHENTICATION_ERROR'
-            }), 401
-        
+            return jsonify({'success': False, 'error': 'User authentication failed', 'code': 'AUTHENTICATION_ERROR'}), 401
+
         data = request.get_json()
-        print(f"📊 Received data: {data}")
-        
         if not data:
-            print(f"⚠️ No data provided, returning error")
-            return jsonify({
-                'success': False,
-                'error': 'No JSON data provided',
-                'code': 'VALIDATION_ERROR'
-            }), 400
-        
-        company_id = user.company_id or 1
-        project_id = data.get('project_id')
-        print(f"👤 User: ID={user.id}, Email={user.email}")
-        print(f"🏢 Company ID: {company_id}")
-        print(f"📌 Project ID: {project_id if project_id else 'None'}")
-        
-        # ✅ USE THE CORRECT MODEL: ObservationSeverity
+            return jsonify({'success': False, 'error': 'No JSON data provided', 'code': 'VALIDATION_ERROR'}), 400
+
+        company_id = resolve_write_company_id(user)
         from models import ObservationSeverity
-        
-        # Check if severity with this name already exists for this company
+
         existing = ObservationSeverity.query.filter(
             ObservationSeverity.name == data.get('type', f"Severity {data.get('year', datetime.utcnow().year)}"),
-            ObservationSeverity.company_id == company_id
+            ObservationSeverity.company_id == company_id,
         ).first()
-        
+
         if existing:
-            print(f"⚠️ Severity already exists: {existing.name}")
-            return jsonify({
-                'success': True,
-                'message': 'Severity already exists',
-                'id': existing.id,
-                'existing': True
-            }), 200
-        
-        # Convert value to level (1-5 scale)
+            return jsonify({'success': True, 'message': 'Severity already exists',
+                            'id': existing.id, 'existing': True}), 200
+
         severity_value = data.get('value', 3)
-        if severity_value > 5:
-            level = int(severity_value / 2)
-        else:
-            level = int(severity_value)
+        level = int(severity_value / 2) if severity_value > 5 else int(severity_value)
         level = max(1, min(5, level))
-        
-        # Map level to severity name if type not provided
-        severity_names = {
-            5: 'Critical',
-            4: 'High',
-            3: 'Medium',
-            2: 'Low',
-            1: 'Negligible'
-        }
-        
+
+        severity_names = {5: 'Critical', 4: 'High', 3: 'Medium', 2: 'Low', 1: 'Negligible'}
+
         severity = ObservationSeverity(
             name=data.get('type', severity_names.get(level, 'Medium')),
             level=level,
@@ -23675,16 +23417,12 @@ def create_severity():
             response_time_hours=24 if level <= 3 else 4 if level == 4 else 1,
             is_active=True,
             company_id=company_id,
-            project_id=project_id,
-            created_by=user.id
+            project_id=data.get('project_id'),
+            created_by=user.id,
         )
-        
         db.session.add(severity)
         db.session.commit()
-        
-        print(f"✅ Created severity record ID: {severity.id}")
-        print(f"{'='*60}\n")
-        
+
         return jsonify({
             'success': True,
             'message': 'Severity record created successfully',
@@ -23695,78 +23433,51 @@ def create_severity():
                 'name': severity.name,
                 'level': severity.level,
                 'company_id': severity.company_id,
-                'created_by': severity.created_by
-            }
+                'created_by': severity.created_by,
+            },
         }), 201
-        
+
     except Exception as e:
-        print(f"❌ ERROR in create_severity: {e}")
         import traceback
         traceback.print_exc()
         db.session.rollback()
-        return jsonify({
-            'success': False,
-            'error': str(e),
-            'code': 'INTERNAL_SERVER_ERROR'
-        }), 500
+        return jsonify({'success': False, 'error': str(e), 'code': 'INTERNAL_SERVER_ERROR'}), 500
 
 # ==================== INJURIES ENDPOINTS ====================
 @app.route('/api/powerbi/injuries', methods=['GET'], endpoint='get_injuries')
 @jwt_required
 def get_injuries():
-    """Get injuries by body part - Filtered by user_id, company_id, and project_id"""
     try:
-        print(f"\n{'='*60}")
-        print(f"📊 GET INJURIES - START")
-        print(f"{'='*60}")
-        
         user = getattr(request, 'user', None)
         if not user:
             return jsonify({'success': False, 'error': 'User authentication failed'}), 401
-        
-        print(f"👤 User: ID={user.id}, Email={user.email}")
-        
-        company_id = user.company_id or 1
-        print(f"🏢 Company ID: {company_id}")
-        
-        start_year = request.args.get('start_year')
-        end_year = request.args.get('end_year')
+
+        query = apply_tenant_scope(Injury.query, Injury, user, user_field='created_by')
+
         project_id = request.args.get('project_id')
-        
-        print(f"📅 Year range: {start_year} to {end_year}")
-        print(f"📌 Project ID: {project_id if project_id else 'All Projects'}")
-        
-        # ✅ FILTER BY BOTH company_id AND created_by (user) AND project_id
-        query = Injury.query.filter(
-            Injury.company_id == company_id,
-            Injury.created_by == user.id
-        )
-        
-        # ✅ Apply project filter
         if project_id:
             try:
                 query = query.filter(Injury.project_id == int(project_id))
-                print(f"  ✅ Applied project filter: {project_id}")
-            except ValueError:
-                print(f"  ⚠️ Invalid project_id format: {project_id}")
-        
+            except (ValueError, TypeError):
+                pass
+
+        start_year = request.args.get('start_year')
         if start_year:
             try:
                 query = query.filter(Injury.year >= int(start_year))
-            except:
+            except Exception:
                 pass
-        
+
+        end_year = request.args.get('end_year')
         if end_year:
             try:
                 query = query.filter(Injury.year <= int(end_year))
-            except:
+            except Exception:
                 pass
-        
+
         total = query.count()
-        print(f"📊 Total injury records found for user {user.id}: {total}")
-        
         results = query.order_by(Injury.count.desc()).all()
-        
+
         data = [{
             'id': i.id,
             'body_part': i.body_part,
@@ -23775,16 +23486,13 @@ def get_injuries():
             'injury_type': i.injury_type,
             'severity': i.severity,
             'project_id': i.project_id,
-            'created_by': i.created_by
+            'created_by': i.created_by,
+            'company_id': i.company_id,
         } for i in results]
-        
-        print(f"✅ Returning {len(data)} injury records for user {user.id}")
-        print(f"{'='*60}\n")
-        
-        return jsonify({'success': True, 'data': data}), 200
-        
+
+        return jsonify({'success': True, 'data': data, 'total': total}), 200
+
     except Exception as e:
-        print(f"❌ ERROR in get_injuries: {str(e)}")
         import traceback
         traceback.print_exc()
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -23792,39 +23500,17 @@ def get_injuries():
 @app.route('/api/powerbi/injuries', methods=['POST'], endpoint='create_injury')
 @jwt_required
 def create_injury():
-    """Create new injury record with project_id"""
     try:
-        print(f"\n📝 CREATE INJURY:")
-        
         user = getattr(request, 'user', None)
         if not user:
-            return jsonify({
-                'success': False,
-                'error': 'User authentication failed',
-                'code': 'AUTHENTICATION_ERROR'
-            }), 401
-        
+            return jsonify({'success': False, 'error': 'User authentication failed', 'code': 'AUTHENTICATION_ERROR'}), 401
+
         data = request.get_json()
         if not data:
-            return jsonify({
-                'success': False,
-                'error': 'No JSON data provided',
-                'code': 'VALIDATION_ERROR'
-            }), 400
-        
-        company_id = user.company_id
-        if not company_id:
-            if hasattr(user, 'company') and user.company:
-                company_id = user.company.id
-            else:
-                company_id = 1
-                print(f"  ⚠️ No company_id found for user {user.id}, using default 1")
-        
-        project_id = data.get('project_id')
-        print(f"  User ID: {user.id}")
-        print(f"  Company ID: {company_id}")
-        print(f"  Project ID: {project_id if project_id else 'None'}")
-        
+            return jsonify({'success': False, 'error': 'No JSON data provided', 'code': 'VALIDATION_ERROR'}), 400
+
+        company_id = resolve_write_company_id(user)
+
         injury = Injury(
             body_part=data['body_part'],
             count=data['count'],
@@ -23832,98 +23518,59 @@ def create_injury():
             injury_type=data.get('injury_type'),
             severity=data.get('severity'),
             company_id=company_id,
-            project_id=project_id,
-            created_by=user.id
+            project_id=data.get('project_id'),
+            created_by=user.id,
         )
-        
         db.session.add(injury)
         db.session.commit()
-        
-        print(f"  ✅ Created injury record ID: {injury.id}")
-        
-        return jsonify({
-            'success': True,
-            'message': 'Injury record created',
-            'id': injury.id,
-            'project_id': injury.project_id
-        }), 201
-        
+        return jsonify({'success': True, 'message': 'Injury record created',
+                        'id': injury.id, 'project_id': injury.project_id}), 201
+
     except Exception as e:
-        print(f"❌ ERROR in create_injury: {e}")
+        import traceback
         traceback.print_exc()
         db.session.rollback()
-        return jsonify({
-            'success': False,
-            'error': str(e),
-            'code': 'INTERNAL_SERVER_ERROR'
-        }), 500
+        return jsonify({'success': False, 'error': str(e), 'code': 'INTERNAL_SERVER_ERROR'}), 500
 
 # ==================== OVERDUE REPORTS ENDPOINTS ====================
 @app.route('/api/powerbi/overdue-reports', methods=['GET'], endpoint='get_overdue_reports')
 @jwt_required
 def get_overdue_reports():
-    """Get overdue reports - Filtered by user_id, company_id, and project_id"""
     try:
-        print(f"\n{'='*60}")
-        print(f"📊 GET OVERDUE REPORTS - START")
-        print(f"{'='*60}")
-        
         user = getattr(request, 'user', None)
         if not user:
             return jsonify({'success': False, 'error': 'User authentication failed'}), 401
-        
-        print(f"👤 User: ID={user.id}, Email={user.email}")
-        
-        company_id = user.company_id or 1
-        print(f"🏢 Company ID: {company_id}")
-        
-        start_date = request.args.get('start_date')
-        end_date = request.args.get('end_date')
-        project_id = request.args.get('project_id')
-        
-        print(f"📅 Date range: {start_date} to {end_date}")
-        print(f"📌 Project ID: {project_id if project_id else 'All Projects'}")
-        
+
         from models import OverdueReport
-        
-        # ✅ FILTER BY BOTH company_id AND created_by AND project_id
-        query = OverdueReport.query.filter(
-            OverdueReport.company_id == company_id,
-            OverdueReport.created_by == user.id
-        )
-        
-        # ✅ Apply project filter
+
+        query = apply_tenant_scope(OverdueReport.query, OverdueReport, user, user_field='created_by')
+
+        project_id = request.args.get('project_id')
         if project_id:
             try:
                 query = query.filter(OverdueReport.project_id == int(project_id))
-                print(f"  ✅ Applied project filter: {project_id}")
-            except ValueError:
-                print(f"  ⚠️ Invalid project_id format: {project_id}")
-        
-        # ✅ Apply date filters using month field
+            except (ValueError, TypeError):
+                pass
+
+        start_date = request.args.get('start_date')
         if start_date:
             try:
-                start = datetime.strptime(start_date, '%Y-%m-%d')
-                month_str = start.strftime('%b-%Y')
+                month_str = datetime.strptime(start_date, '%Y-%m-%d').strftime('%b-%Y')
                 query = query.filter(OverdueReport.month >= month_str)
-                print(f"  ✅ Applied start month filter: {month_str}")
-            except Exception as e:
-                print(f"  ⚠️ Invalid start_date format: {e}")
-        
+            except Exception:
+                pass
+
+        end_date = request.args.get('end_date')
         if end_date:
             try:
-                end = datetime.strptime(end_date, '%Y-%m-%d')
-                month_str = end.strftime('%b-%Y')
+                month_str = datetime.strptime(end_date, '%Y-%m-%d').strftime('%b-%Y')
                 query = query.filter(OverdueReport.month <= month_str)
-                print(f"  ✅ Applied end month filter: {month_str}")
-            except Exception as e:
-                print(f"  ⚠️ Invalid end_date format: {e}")
-        
+            except Exception:
+                pass
+
         total = query.count()
-        print(f"📊 Total overdue report records found for user {user.id}: {total}")
-        
         results = query.order_by(OverdueReport.month.desc()).all()
-        
+
         data = [{
             'id': r.id,
             'month': r.month,
@@ -23935,74 +23582,77 @@ def get_overdue_reports():
             'responsible_person': r.responsible_person,
             'project_id': r.project_id,
             'created_by': r.created_by,
-            'created_at': r.created_at.isoformat() if r.created_at else None
+            'created_at': r.created_at.isoformat() if r.created_at else None,
         } for r in results]
-        
-        print(f"✅ Returning {len(data)} overdue report records for user {user.id}")
-        print(f"{'='*60}\n")
-        
-        return jsonify({
-            'success': True,
-            'data': data,
-            'total': len(data)
-        }), 200
-        
+
+        return jsonify({'success': True, 'data': data, 'total': total}), 200
+
     except Exception as e:
-        print(f"❌ ERROR in get_overdue_reports: {str(e)}")
         import traceback
         traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e), 'code': 'INTERNAL_SERVER_ERROR'}), 500
+
+@app.route('/api/powerbi/departments', methods=['POST'], endpoint='create_department')
+@jwt_required
+def create_department():
+    try:
+        user = getattr(request, 'user', None)
+        if not user:
+            return jsonify({'success': False, 'error': 'User authentication failed', 'code': 'AUTHENTICATION_ERROR'}), 401
+
+        data = request.get_json()
+        if not data:
+            return jsonify({'success': False, 'error': 'No JSON data provided', 'code': 'VALIDATION_ERROR'}), 400
+
+        company_id = resolve_write_company_id(user)
+
+        department = Department(
+            name=data['name'],
+            description=data.get('description'),
+            head_of_department=data.get('head_of_department'),
+            location=data.get('location'),
+            risk_level=data.get('risk_level', 'Low'),
+            staff_count=data.get('staff_count', 0),
+            status=data.get('status', 'active'),
+            hospital_id=data.get('hospital_id'),
+            company_id=company_id,
+        )
+        db.session.add(department)
+        db.session.commit()
+
         return jsonify({
-            'success': False,
-            'error': str(e),
-            'code': 'INTERNAL_SERVER_ERROR'
-        }), 500
+            'success': True,
+            'message': 'Department created successfully',
+            'id': department.id,
+            'data': {'id': department.id, 'name': department.name, 'company_id': department.company_id},
+        }), 201
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        db.session.rollback()
+        return jsonify({'success': False, 'error': str(e), 'code': 'INTERNAL_SERVER_ERROR'}), 500
+
 
 @app.route('/api/powerbi/overdue-reports', methods=['POST'], endpoint='create_overdue_report')
 @jwt_required
 def create_overdue_report():
-    """Create new overdue report record with project_id"""
     try:
-        print(f"\n{'='*60}")
-        print(f"📝 CREATE OVERDUE REPORT - START")
-        print(f"{'='*60}")
-        
         user = getattr(request, 'user', None)
         if not user:
-            return jsonify({
-                'success': False,
-                'error': 'User authentication failed',
-                'code': 'AUTHENTICATION_ERROR'
-            }), 401
-        
+            return jsonify({'success': False, 'error': 'User authentication failed', 'code': 'AUTHENTICATION_ERROR'}), 401
+
         data = request.get_json()
-        print(f"📊 Received data: {data}")
-        
         if not data:
-            return jsonify({
-                'success': False,
-                'error': 'No JSON data provided',
-                'code': 'VALIDATION_ERROR'
-            }), 400
-        
-        # ✅ Validate required fields
-        required = ['month', 'on_time', 'late']
-        for field in required:
+            return jsonify({'success': False, 'error': 'No JSON data provided', 'code': 'VALIDATION_ERROR'}), 400
+
+        for field in ('month', 'on_time', 'late'):
             if field not in data:
-                return jsonify({
-                    'success': False,
-                    'error': f'Missing required field: {field}',
-                    'code': 'VALIDATION_ERROR'
-                }), 400
-        
-        company_id = user.company_id or 1
-        project_id = data.get('project_id')
-        print(f"👤 User: ID={user.id}, Email={user.email}")
-        print(f"🏢 Company ID: {company_id}")
-        print(f"📌 Project ID: {project_id if project_id else 'None'}")
-        
+                return jsonify({'success': False, 'error': f'Missing required field: {field}', 'code': 'VALIDATION_ERROR'}), 400
+
         from models import OverdueReport
-        
-        # ✅ Create the record
+        company_id = resolve_write_company_id(user)
+
         overdue = OverdueReport(
             month=data['month'],
             on_time=int(data['on_time']),
@@ -24012,77 +23662,39 @@ def create_overdue_report():
             department_name=data.get('department_name', ''),
             responsible_person=data.get('responsible_person', ''),
             company_id=company_id,
-            project_id=project_id,
-            created_by=user.id
+            project_id=data.get('project_id'),
+            created_by=user.id,
         )
-        
         db.session.add(overdue)
         db.session.commit()
-        
-        print(f"✅ Created overdue report ID: {overdue.id}")
-        print(f"   Month: {overdue.month}")
-        print(f"   On Time: {overdue.on_time}")
-        print(f"   Late: {overdue.late}")
-        print(f"   Created By: {overdue.created_by}")
-        print(f"{'='*60}\n")
-        
-        return jsonify({
-            'success': True,
-            'message': 'Overdue report created successfully',
-            'id': overdue.id,
-            'project_id': overdue.project_id,
-            'data': {
-                'id': overdue.id,
-                'month': overdue.month,
-                'on_time': overdue.on_time,
-                'late': overdue.late,
-                'created_by': overdue.created_by
-            }
-        }), 201
-        
+        return jsonify({'success': True, 'message': 'Overdue report created successfully',
+                        'id': overdue.id, 'project_id': overdue.project_id}), 201
+
     except Exception as e:
-        print(f"❌ ERROR in create_overdue_report: {e}")
         import traceback
         traceback.print_exc()
         db.session.rollback()
-        return jsonify({
-            'success': False,
-            'error': str(e),
-            'code': 'INTERNAL_SERVER_ERROR'
-        }), 500
+        return jsonify({'success': False, 'error': str(e), 'code': 'INTERNAL_SERVER_ERROR'}), 500
 
 # ==================== DEPARTMENTS ENDPOINTS ====================
 @app.route('/api/powerbi/departments', methods=['GET'], endpoint='get_departments')
 @jwt_required
 def get_departments():
-    """Get all departments for the user's company"""
     try:
-        print(f"\n{'='*60}")
-        print(f"📊 GET DEPARTMENTS - START")
-        print(f"{'='*60}")
-        
         user = getattr(request, 'user', None)
         if not user:
-            return jsonify({
-                'success': False,
-                'error': 'User authentication failed',
-                'code': 'AUTHENTICATION_ERROR'
-            }), 401
-        
-        # ✅ Use company_id from user
-        company_id = user.company_id
-        if not company_id:
-            print(f"⚠️ No company_id for user {user.id}, using default 1")
-            company_id = 1
-        
-        print(f"👤 User: ID={user.id}, Email={user.email}")
-        print(f"🏢 Company ID: {company_id}")
-        
-        # ✅ Query departments with company_id filter
-        departments = Department.query.filter(
-            Department.company_id == company_id
-        ).all()
-        
+            return jsonify({'success': False, 'error': 'User authentication failed', 'code': 'AUTHENTICATION_ERROR'}), 401
+
+        if _is_bypass_user(user):
+            departments = Department.query.all()
+        else:
+            company_id = getattr(user, 'company_id', None)
+            if company_id:
+                departments = Department.query.filter(Department.company_id == company_id).all()
+            else:
+                # No company & no created_by on the model → return nothing
+                departments = []
+
         data = [{
             'id': d.id,
             'name': d.name,
@@ -24094,98 +23706,15 @@ def get_departments():
             'status': d.status,
             'company_id': d.company_id,
             'created_at': d.created_at.isoformat() if d.created_at else None,
-            'updated_at': d.updated_at.isoformat() if d.updated_at else None
+            'updated_at': d.updated_at.isoformat() if d.updated_at else None,
         } for d in departments]
-        
-        print(f"✅ Returning {len(data)} departments for company {company_id}")
-        print(f"{'='*60}\n")
-        
-        return jsonify({
-            'success': True,
-            'data': data,
-            'total': len(data)
-        }), 200
-        
-    except Exception as e:
-        print(f"❌ ERROR in get_departments: {e}")
-        import traceback
-        traceback.print_exc()
-        return jsonify({
-            'success': False,
-            'error': str(e),
-            'code': 'INTERNAL_SERVER_ERROR'
-        }), 500
 
-@app.route('/api/powerbi/departments', methods=['POST'], endpoint='create_department')
-@jwt_required
-def create_department():
-    """Create new department"""
-    try:
-        print(f"\n{'='*60}")
-        print(f"📝 CREATE DEPARTMENT - START")
-        print(f"{'='*60}")
-        
-        user = getattr(request, 'user', None)
-        if not user:
-            return jsonify({
-                'success': False,
-                'error': 'User authentication failed',
-                'code': 'AUTHENTICATION_ERROR'
-            }), 401
-        
-        data = request.get_json()
-        if not data:
-            return jsonify({
-                'success': False,
-                'error': 'No JSON data provided',
-                'code': 'VALIDATION_ERROR'
-            }), 400
-        
-        company_id = user.company_id or 1
-        print(f"👤 User: ID={user.id}, Email={user.email}")
-        print(f"🏢 Company ID: {company_id}")
-        print(f"📊 Department name: {data.get('name')}")
-        
-        department = Department(
-            name=data['name'],
-            description=data.get('description'),
-            head_of_department=data.get('head_of_department'),
-            location=data.get('location'),
-            risk_level=data.get('risk_level', 'Low'),
-            staff_count=data.get('staff_count', 0),
-            status=data.get('status', 'active'),
-            hospital_id=data.get('hospital_id'),
-            company_id=company_id,
-            created_by=user.id
-        )
-        
-        db.session.add(department)
-        db.session.commit()
-        
-        print(f"✅ Created department ID: {department.id}")
-        print(f"{'='*60}\n")
-        
-        return jsonify({
-            'success': True,
-            'message': 'Department created successfully',
-            'id': department.id,
-            'data': {
-                'id': department.id,
-                'name': department.name,
-                'company_id': department.company_id
-            }
-        }), 201
-        
+        return jsonify({'success': True, 'data': data, 'total': len(data)}), 200
+
     except Exception as e:
-        print(f"❌ ERROR in create_department: {e}")
         import traceback
         traceback.print_exc()
-        db.session.rollback()
-        return jsonify({
-            'success': False,
-            'error': str(e),
-            'code': 'INTERNAL_SERVER_ERROR'
-        }), 500
+        return jsonify({'success': False, 'error': str(e), 'code': 'INTERNAL_SERVER_ERROR'}), 500
 
 # ==================== PROJECTS ENDPOINTS ====================
 @app.route('/api/powerbi/projects', methods=['POST'], endpoint='create_powerbi_project')
