@@ -153071,15 +153071,29 @@ Return JSON:
   "model_recommendation": {{ "reasoning":"...","recommended_model":"...","confidence":"low|medium|high" }}
 }}"""
 
+        # ✅ FIXED: pass current_user + company_id, use feature tag, surface real error
         try:
             result, model_info, usage, dur = call_gemini(
-                prompt, temperature=float(ai_opts.get('temperature', 0.6)),
+                prompt,
+                temperature=float(ai_opts.get('temperature', 0.6)),
                 max_tokens=6144,
+                feature='predictive_full',
+                current_user=current_user,
+                company_id=company_id,
             )
         except Exception as ai_err:
-            log_ai_call('predictive_full', success=False, error_message=str(ai_err),
-                        current_user=current_user, company_id=company_id)
-            return jsonify({'success': False, 'error': 'AI failed', 'code': 'AI_UNAVAILABLE'}), 503
+            current_app.logger.error(
+                f"predictive_ai: call_gemini failed: {ai_err}", exc_info=True
+            )
+            log_ai_call(
+                'predictive_full', success=False, error_message=str(ai_err),
+                current_user=current_user, company_id=company_id,
+            )
+            return jsonify({
+                'success': False,
+                'error': str(ai_err)[:200],
+                'code': 'AI_UNAVAILABLE',
+            }), 503
 
         # Persist
         try:
@@ -153119,9 +153133,13 @@ Return JSON:
         return jsonify(ai_envelope(result, model_info, usage)), 200
 
     except Exception as e:
-        current_app.logger.error(f"predictive_ai error: {e}")
-        return jsonify({'success': False, 'error': 'Server error', 'code': 'INTERNAL_ERROR'}), 500
-
+        # ✅ FIXED: include traceback for genuine server errors
+        current_app.logger.error(f"predictive_ai error: {e}", exc_info=True)
+        return jsonify({
+            'success': False,
+            'error': str(e)[:200],
+            'code': 'INTERNAL_ERROR',
+        }), 500
 
 @app.route('/api/analytics/predictive/scenario', methods=['POST', 'OPTIONS'])
 @jwt_required
