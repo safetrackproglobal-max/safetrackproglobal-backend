@@ -3269,7 +3269,7 @@ class SystemSettings(db.Model):
     
 class SystemLog(db.Model):
     __tablename__ = 'system_logs'
-    
+
     id = db.Column(db.Integer, primary_key=True)
     timestamp = db.Column(db.DateTime, default=datetime.utcnow, nullable=False, index=True)
     level = db.Column(db.String(20), nullable=False, default='info')
@@ -3277,7 +3277,12 @@ class SystemLog(db.Model):
     user_id = db.Column(db.Integer, db.ForeignKey('users.id'), index=True)
     action = db.Column(db.String(200), nullable=False)
     resource_type = db.Column(db.String(100))
-    resource_id = db.Column(db.Integer)
+
+    # ✅ CHANGED: Integer -> String(255) to match DB schema
+    # Reason: resource_id stores non-numeric identifiers such as
+    # "device_session_20261009_141715_2" alongside numeric IDs.
+    resource_id = db.Column(db.String(255), nullable=True, index=True)
+
     description = db.Column(db.Text, nullable=False)
     ip_address = db.Column(db.String(45))
     user_agent = db.Column(db.Text)
@@ -3288,15 +3293,15 @@ class SystemLog(db.Model):
     error_message = db.Column(db.Text)
     stack_trace = db.Column(db.Text)
     additional_data = db.Column(db.Text)
-    
+
     # Relationships
     user = db.relationship('User', backref=db.backref('system_logs', lazy=True))
-    
+
     @staticmethod
     def create_log(level, module, action, description, user_id=None, **kwargs):
         """
         Create a new system log entry
-        
+
         Args:
             level (str): debug, info, warning, error, critical
             module (str): Module name (e.g., 'camera', 'video_analysis', 'ai_analysis')
@@ -3305,7 +3310,9 @@ class SystemLog(db.Model):
             user_id (int): User ID (if available)
             **kwargs: Additional fields:
                 - resource_type (str): Type of resource
-                - resource_id (int): ID of the resource
+                - resource_id (str|int): ID of the resource.
+                  Accepts numeric IDs (e.g., incident id) OR string identifiers
+                  (e.g., 'device_session_20261009_141715_2'). Will be cast to str.
                 - ip_address (str): Client IP
                 - user_agent (str): Browser/device info
                 - request_method (str): HTTP method
@@ -3321,7 +3328,13 @@ class SystemLog(db.Model):
             additional_data = kwargs.get('additional_data')
             if isinstance(additional_data, dict):
                 additional_data = json.dumps(additional_data)
-            
+
+            # ✅ Defensive: coerce resource_id to string so callers can pass either
+            # an int (incident id) or a string (device_session_...). Both fit VARCHAR.
+            resource_id = kwargs.get('resource_id')
+            if resource_id is not None and not isinstance(resource_id, str):
+                resource_id = str(resource_id)
+
             log = SystemLog(
                 level=level,
                 module=module,
@@ -3329,7 +3342,7 @@ class SystemLog(db.Model):
                 description=description,
                 user_id=user_id,
                 resource_type=kwargs.get('resource_type'),
-                resource_id=kwargs.get('resource_id'),
+                resource_id=resource_id,
                 ip_address=kwargs.get('ip_address'),
                 user_agent=kwargs.get('user_agent'),
                 request_method=kwargs.get('request_method'),
@@ -3340,20 +3353,20 @@ class SystemLog(db.Model):
                 stack_trace=kwargs.get('stack_trace'),
                 additional_data=additional_data
             )
-            
+
             db.session.add(log)
             db.session.commit()
             return log
-            
+
         except Exception as e:
             print(f"❌ Failed to create system log: {str(e)}")
             db.session.rollback()
             return None
-    
+
     def to_dict(self):
         return {
             'id': self.id,
-            'timestamp': self.timestamp.isoformat(),
+            'timestamp': self.timestamp.isoformat() if self.timestamp else None,
             'level': self.level,
             'module': self.module,
             'user_id': self.user_id,
