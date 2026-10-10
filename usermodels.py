@@ -1015,21 +1015,51 @@ class Payment(db.Model):
 
 class AdminAuditLog(db.Model):
     __tablename__ = 'admin_audit_logs'
-    
+
     id = db.Column(db.Integer, primary_key=True)
-    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False, index=True)
+    user_id = db.Column(
+        db.Integer,
+        db.ForeignKey('users.id'),
+        nullable=False,
+        index=True
+    )
     action = db.Column(db.String(256), nullable=False)
     resource_type = db.Column(db.String(64))
-    resource_id = db.Column(db.Integer)
-    details = db.Column(db.Text)  # Add this field for JSON details
+
+    # ✅ CHANGED: Integer -> String(255) to match DB schema.
+    # Accepts numeric IDs (e.g. incident id) AND string identifiers
+    # (e.g. 'device_session_20261009_141715_2', UUIDs, slugs).
+    resource_id = db.Column(db.String(255), nullable=True, index=True)
+
+    details = db.Column(db.Text)  # JSON-encoded details
     ip_address = db.Column(db.String(64))
     user_agent = db.Column(db.Text)
     timestamp = db.Column(db.DateTime, default=datetime.utcnow, index=True)
 
-    user = db.relationship('User', backref=db.backref('admin_audit_logs', lazy=True))
+    user = db.relationship(
+        'User',
+        backref=db.backref('admin_audit_logs', lazy=True)
+    )
 
+    def to_dict(self):
+        """Serialize to a dict — safe for JSON responses."""
+        import json  # if not already imported at module level
+        return {
+            'id': self.id,
+            'user_id': self.user_id,
+            'user_name': self.user.name if self.user else None,
+            'action': self.action,
+            'resource_type': self.resource_type,
+            'resource_id': self.resource_id,
+            'details': json.loads(self.details) if self.details else None,
+            'ip_address': self.ip_address,
+            'user_agent': self.user_agent,
+            'timestamp': self.timestamp.isoformat() if self.timestamp else None,
+        }
 
-
+    def __repr__(self):
+        return f'<AdminAuditLog {self.id} {self.action} by user={self.user_id}>'
+        
 class EditableDocument(db.Model):
     __tablename__ = 'editable_documents'
     
