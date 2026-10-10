@@ -7375,6 +7375,55 @@ class AIAssistantMessage(db.Model):
             'created_at': self.created_at.isoformat() if self.created_at else None,
         }
 
+class EnvironmentalSite(db.Model):
+    __tablename__ = 'environmental_sites'
+
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(100), nullable=False)
+    company_id = db.Column(
+        db.Integer,
+        db.ForeignKey('companies.id', ondelete='CASCADE'),
+        nullable=True,
+        index=True
+    )
+    location = db.Column(db.String(255))
+    latitude = db.Column(db.Float)
+    longitude = db.Column(db.Float)
+    description = db.Column(db.Text)
+    is_active = db.Column(db.Boolean, default=True, nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = db.Column(
+        db.DateTime,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow
+    )
+
+    # Relationships
+    company = db.relationship('Company', backref='environmental_sites')
+    alerts = db.relationship(
+        'EnvironmentalAlert',
+        backref='site',
+        lazy='dynamic',
+        cascade='all, delete-orphan'
+    )
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'name': self.name,
+            'company_id': self.company_id,
+            'location': self.location,
+            'latitude': self.latitude,
+            'longitude': self.longitude,
+            'description': self.description,
+            'is_active': self.is_active,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+    def __repr__(self):
+        return f'<EnvironmentalSite {self.id} {self.name}>'
+
 
 __all__ = [
     # Core models
@@ -7726,7 +7775,7 @@ __all__ = [
     'WitnessStatement', 'InvestigationTeamMember', 'IncidentAuditLog',
      'LessonLearned', 'LessonReaction',
     'EscalationRule', 'EscalationHistory', 'IncidentCost', 'RegulatoryFiling', 'FishboneVersion', 'FishboneFiveWhys', 'AIAssistantSession', 'AIAssistantMessage', 
-    'SimilarIncidentMatch', 'IncidentComparison', 'IncidentClusterAnalysis', 'PredictiveAnalyticsRun', 'PredictiveScenario', 'AIGenerationLog', 
+    'SimilarIncidentMatch', 'IncidentComparison', 'IncidentClusterAnalysis', 'PredictiveAnalyticsRun', 'PredictiveScenario', 'AIGenerationLog', 'EnvironmentalSite', 
     
 ]
 
