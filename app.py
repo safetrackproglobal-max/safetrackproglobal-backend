@@ -11506,6 +11506,277 @@ def user_to_dict(user):
         'last_login': user.last_login.isoformat() if user.last_login else None
     }
 
+_contact_lock = threading.Lock()
+_contact_history = {}                 # ip -> [timestamps]
+CONTACT_MIN_GAP_SECONDS = 60          # minimum gap between two submissions
+CONTACT_MAX_PER_HOUR = 5              # hard cap per IP
+
+
+def _contact_client_ip():
+    fwd = request.headers.get('X-Forwarded-For', '')
+    if fwd:
+        return fwd.split(',')[0].strip()
+    return request.remote_addr or 'unknown'
+
+
+def _contact_rate_ok(ip):
+    now = time.time()
+    hour_ago = now - 3600
+    with _contact_lock:
+        history = [t for t in _contact_history.get(ip, []) if t > hour_ago]
+
+        if len(history) >= CONTACT_MAX_PER_HOUR:
+            return False, 'Too many messages from this address. Please try again later.'
+
+        if history and (now - history[-1]) < CONTACT_MIN_GAP_SECONDS:
+            wait = int(CONTACT_MIN_GAP_SECONDS - (now - history[-1]))
+            return False, f'Please wait {wait}s before sending another message.'
+
+        history.append(now)
+        _contact_history[ip] = history
+    return True, None
+
+
+def _contact_valid_email(email):
+    return bool(re.match(r'^[^@\s]+@[^@\s]+\.[^@\s]+$', email or ''))
+
+
+def _contact_clean_header(value, max_len):
+    if not value:
+        return ''
+    return value.replace('\r', ' ').replace('\n', ' ').strip()[:max_len]
+
+
+def _contact_escape_html(text):
+    return (
+        (text or '')
+        .replace('&', '&amp;')
+        .replace('<', '&lt;')
+        .replace('>', '&gt;')
+    )
+
+
+@app.route('/api/contact', methods=['POST'])
+def submit_contact():
+    """Public contact form. Global CORS handles preflight.
+
+    Accepts optional enterprise fields:
+      - company_name, phone, industry, company_size, inquiry_type, consent
+    """
+    try:
+        ip = _contact_client_ip()
+        ok, reason = _contact_rate_ok(ip)
+        if not ok:
+            return jsonify({
+                'success': False,
+                'error': reason,
+                'code': 'RATE_LIMITED',
+            }), 429
+
+        data = request.get_json(silent=True) or {}
+
+        # ---- Honeypot ----
+        if (data.get('website') or '').strip():
+            current_app.logger.info(f"Contact honeypot tripped from {ip}")
+            return jsonify({'success': True, 'message': 'Your message has been sent.'}), 200
+
+        # ---- Required fields ----
+        name    = (data.get('name') or data.get('fullName') or '').strip()
+        email   = (data.get('email') or '').strip().lower()
+        subject = (data.get('subject') or data.get('inquiryType') or '').strip()
+        body    = (data.get('message') or '').strip()
+
+        # ---- Optional enterprise fields ----
+        company_name = (data.get('companyName') or data.get('company_name') or '').strip()
+        phone        = (data.get('phone') or '').strip()
+        industry     = (data.get('industry') or '').strip()
+        company_size = (data.get('companySize') or data.get('company_size') or '').strip()
+        inquiry_type = (data.get('inquiryType') or data.get('inquiry_type') or '').strip()
+        consent      = bool(data.get('consent', False))
+
+        # ---- Validate required ----
+        errors = {}
+        if len(name) < 2:
+            errors['name'] = 'Name must be at least 2 characters.'
+        elif len(name) > 100:
+            errors['name'] = 'Name must be under 100 characters.'
+
+        if not _contact_valid_email(email):
+            errors['email'] = 'Please enter a valid email address.'
+        elif len(email) > 254:
+            errors['email'] = 'Email is too long.'
+
+        if not subject:
+            errors['subject'] = 'Please select or enter a subject.'
+
+        if len(body) < 10:
+            errors['message'] = 'Message must be at least 10 characters.'
+        elif len(body) > 2000:
+            errors['message'] = 'Message must be under 2,000 characters.'
+
+        # Optional field caps (only if present)
+        if company_name and len(company_name) > 200:
+            errors['companyName'] = 'Company name is too long.'
+        if phone and len(phone) > 30:
+            errors['phone'] = 'Phone number is too long.'
+        if phone and not re.match(r'^[+\d\s()\-]{7,30}$', phone):
+            errors['phone'] = 'Please enter a valid phone number.'
+
+        if errors:
+            return jsonify({
+                'success': False,
+                'error': 'Validation failed.',
+                'code': 'VALIDATION_ERROR',
+                'fields': errors,
+            }), 400
+
+        # ---- Sanitize header fields ----
+        safe_name        = _contact_clean_header(name, 100)
+        safe_subject     = _contact_clean_header(subject, 150)
+        safe_email       = _contact_clean_header(email, 254)
+        safe_company     = _contact_clean_header(company_name, 200)
+        safe_phone       = _contact_clean_header(phone, 30)
+        safe_industry    = _contact_clean_header(industry, 60)
+        safe_size        = _contact_clean_header(company_size, 40)
+        safe_inquiry     = _contact_clean_header(inquiry_type, 60)
+
+        # ---- HTML-escaped versions for templates ----
+        def esc(x):
+            return _contact_escape_html(x or '')
+
+        recipient = current_app.config.get('CONTACT_RECIPIENT', 'info@safetrackproglobal.com')
+
+        # ---- Build team email ----
+        team_msg = Message(
+            subject=f"[Contact Form] {safe_subject}" + (f" — {safe_company}" if safe_company else ""),
+            recipients=[recipient],
+            reply_to=safe_email,
+        )
+
+        # Plain text
+        lines = [
+            "New contact form submission",
+            "=" * 40,
+            "",
+            f"Name:         {safe_name}",
+            f"Email:        {email}",
+        ]
+        if safe_company:  lines.append(f"Company:      {safe_company}")
+        if safe_phone:    lines.append(f"Phone:        {safe_phone}")
+        if safe_industry: lines.append(f"Industry:     {safe_industry}")
+        if safe_size:     lines.append(f"Company size: {safe_size}")
+        if safe_inquiry:  lines.append(f"Inquiry type: {safe_inquiry}")
+        lines += [
+            f"Subject:      {safe_subject}",
+            "",
+            "Message:",
+            "-" * 40,
+            body,
+            "-" * 40,
+            "",
+            f"Reply directly to this email to respond to {safe_name}.",
+        ]
+        team_msg.body = "\n".join(lines)
+
+        # HTML
+        def row(label, value):
+            if not value:
+                return ''
+            return f'<tr><td style="padding:8px 0;color:#8c8c8c;width:120px;vertical-align:top;">{label}</td><td style="padding:8px 0;">{esc(value)}</td></tr>'
+
+        team_msg.html = f"""
+<!DOCTYPE html>
+<html><body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;background:#f5f7fa;padding:24px;">
+  <div style="max-width:640px;margin:0 auto;background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 4px 16px rgba(0,0,0,0.06);">
+    <div style="background:linear-gradient(135deg,#1890ff,#096dd9);padding:24px 32px;color:#fff;">
+      <h1 style="margin:0;font-size:20px;">New Contact Form Submission</h1>
+    </div>
+    <div style="padding:32px;">
+      <table style="width:100%;border-collapse:collapse;font-size:14px;">
+        {row('Name', safe_name)}
+        <tr><td style="padding:8px 0;color:#8c8c8c;">Email</td><td style="padding:8px 0;"><a href="mailto:{safe_email}" style="color:#1890ff;">{safe_email}</a></td></tr>
+        {row('Company', safe_company)}
+        {row('Phone', safe_phone)}
+        {row('Industry', safe_industry)}
+        {row('Company size', safe_size)}
+        {row('Inquiry type', safe_inquiry)}
+        {row('Subject', safe_subject)}
+      </table>
+      <hr style="border:none;border-top:1px solid #f0f0f0;margin:24px 0;">
+      <div style="font-size:15px;line-height:1.6;white-space:pre-wrap;">{esc(body)}</div>
+      <hr style="border:none;border-top:1px solid #f0f0f0;margin:24px 0;">
+      <p style="color:#8c8c8c;font-size:12px;margin:0;">Reply directly to this email to respond to {esc(safe_name)}.</p>
+    </div>
+  </div>
+</body></html>
+"""
+        mail.send(team_msg)
+
+        # ---- Auto-reply (best-effort) ----
+        try:
+            ack = Message(
+                subject="We received your message — SafeTrack Pro Global",
+                recipients=[safe_email],
+                sender=current_app.config.get('MAIL_DEFAULT_SENDER'),
+            )
+            ack.body = (
+                f"Hi {safe_name},\n\n"
+                "Thank you for contacting SafeTrack Pro Global.\n"
+                "Our enterprise team will get back to you within 24 hours.\n\n"
+                "Your message:\n"
+                "----------------------------------------\n"
+                f"{body}\n"
+                "----------------------------------------\n\n"
+                "For urgent matters:\n"
+                "  Email:    info@safetrackproglobal.com\n"
+                "  Phone:    +974 3325 1705\n"
+                "  WhatsApp: https://wa.me/97433251705\n\n"
+                "— The SafeTrack Pro Global Team\n"
+            )
+            ack.html = f"""
+<!DOCTYPE html>
+<html><body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;background:#f5f7fa;padding:24px;">
+  <div style="max-width:600px;margin:0 auto;background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 4px 16px rgba(0,0,0,0.06);">
+    <div style="background:linear-gradient(135deg,#1890ff,#096dd9);padding:32px;color:#fff;text-align:center;">
+      <h1 style="margin:0;font-size:22px;">Thank you, {esc(safe_name)}!</h1>
+      <p style="margin:8px 0 0;opacity:0.9;">We received your message.</p>
+    </div>
+    <div style="padding:32px;font-size:15px;line-height:1.6;">
+      <p>Hi {esc(safe_name)},</p>
+      <p>Thank you for contacting <strong>SafeTrack Pro Global</strong>. Our enterprise team will get back to you within 24 hours.</p>
+      <p style="color:#8c8c8c;font-size:13px;margin-top:24px;"><strong>Your message:</strong></p>
+      <blockquote style="border-left:3px solid #1890ff;padding:8px 16px;margin:0;color:#595959;white-space:pre-wrap;background:#f5f7fa;border-radius:4px;">{esc(body)}</blockquote>
+      <hr style="border:none;border-top:1px solid #f0f0f0;margin:24px 0;">
+      <p style="margin:0 0 8px;"><strong>Need to reach us urgently?</strong></p>
+      <ul style="margin:0;padding-left:20px;color:#595959;">
+        <li>Email: <a href="mailto:info@safetrackproglobal.com" style="color:#1890ff;">info@safetrackproglobal.com</a></li>
+        <li>Phone: <a href="tel:+97433251705" style="color:#1890ff;">+974 3325 1705</a></li>
+        <li>WhatsApp: <a href="https://wa.me/97433251705" style="color:#1890ff;">Chat with us</a></li>
+      </ul>
+    </div>
+    <div style="background:#fafafa;padding:16px 32px;text-align:center;color:#8c8c8c;font-size:12px;">
+      © SafeTrack Pro Global · Doha, Qatar
+    </div>
+  </div>
+</body></html>
+"""
+            mail.send(ack)
+        except Exception as e:
+            current_app.logger.warning(f"Contact auto-reply failed: {e}")
+
+        return jsonify({
+            'success': True,
+            'message': 'Your message has been sent. We will get back to you within 24 hours.'
+        }), 200
+
+    except Exception as e:
+        current_app.logger.error(f"Contact form error: {e}", exc_info=True)
+        return jsonify({
+            'success': False,
+            'error': 'Failed to send message. Please try again or email us directly.',
+            'code': 'SEND_FAILED',
+        }), 500
+
 # Update profile endpoint
 @app.route('/api/auth/profile/update', methods=['PUT', 'OPTIONS'])
 @jwt_required
