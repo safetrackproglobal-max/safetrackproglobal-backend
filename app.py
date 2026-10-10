@@ -4004,18 +4004,42 @@ def call_gemini(prompt,
                 max_tokens=8192,
                 model_name=None,
                 feature='medical_ai',
-                use_cache=True):
+                use_cache=True,
+                # ✅ REQUIRED: every AI call must be attributable to a real user
+                current_user,
+                # ✅ OPTIONAL: falls back to current_user.company_id if not passed
+                company_id=None,
+                incident_id=None,
+                sub_feature=None):
     """
     Call Gemini with key rotation + optional cache + best-effort logging.
     Returns (parsed_body, model_info, usage, duration_ms).
     Raises RuntimeError on failure — no fallback.
+
+    REQUIRES current_user (with a valid id). company_id is optional; if not
+    supplied, it is taken from current_user.company_id. This guarantees every
+    row in ai_generation_logs has a real user_id (DB enforces NOT NULL).
     """
+    # --- Enforce user context BEFORE spending a Gemini key ---
+    user_id = getattr(current_user, 'id', None) if current_user is not None else None
+    if not user_id:
+        raise RuntimeError(
+            "call_gemini: current_user with a valid id is required. "
+            "AI calls must be attributable to a real user."
+        )
+
+    # If caller didn't pass company_id, fall back to the user's own company
+    # (may still be None if the user has no company — that's legal per schema).
+    if company_id is None:
+        company_id = getattr(current_user, 'company_id', None)
+
     if not key_pool.available():
         raise RuntimeError('AI service unavailable — no Gemini keys configured')
 
     pref = model_name or 'gemini-flash-latest'
     sys_instr = system_instruction or RCA_SYSTEM_INSTRUCTION
 
+    # Cache key includes user_id and company_id to prevent cross-tenant leakage.
     cache_payload = {
         'prompt': prompt,
         'system': sys_instr,
@@ -4023,6 +4047,8 @@ def call_gemini(prompt,
         'temperature': temperature,
         'max_tokens': max_tokens,
         'model': pref,
+        'user_id': user_id,
+        'company_id': company_id,
     }
 
     if use_cache:
@@ -4033,6 +4059,21 @@ def call_gemini(prompt,
             model_info['cached'] = True
             usage = dict(usage)
             usage['cached'] = True
+
+            # ✅ Cache hits also produce a log row for audit + billing.
+            _log_gemini_call(
+                feature=feature,
+                model_name=model_info.get('name') or pref,
+                key_index=model_info.get('key_index'),
+                usage=usage,
+                duration_ms=0,
+                success=True,
+                error_message=None,
+                user_id=user_id,
+                company_id=company_id,
+                incident_id=incident_id,
+                sub_feature=sub_feature,
+            )
             return parsed, model_info, usage, 0
 
     start = time.time()
@@ -4083,6 +4124,10 @@ def call_gemini(prompt,
                 duration_ms=duration,
                 success=True,
                 error_message=None,
+                user_id=user_id,           # ✅ real user
+                company_id=company_id,     # ✅ real company or None
+                incident_id=incident_id,
+                sub_feature=sub_feature,
             )
 
             if use_cache:
@@ -4115,6 +4160,10 @@ def call_gemini(prompt,
         duration_ms=int((time.time() - start) * 1000),
         success=False,
         error_message=last_err,
+        user_id=user_id,                   # ✅ real user
+        company_id=company_id,             # ✅ real company or None
+        incident_id=incident_id,
+        sub_feature=sub_feature,
     )
 
     raise RuntimeError(last_err or 'Gemini call failed')
@@ -4122,18 +4171,37 @@ def call_gemini(prompt,
 
 # ---------- LOG HELPERS ----------
 def _log_gemini_call(feature, model_name, key_index, usage,
-                     duration_ms, success, error_message):
-    """Minimal best-effort insert into ai_generation_logs. NEVER raises."""
+                     duration_ms, success, error_message,
+                     user_id, company_id=None,
+                     incident_id=None, sub_feature=None):
+    """
+    Best-effort insert into ai_generation_logs. NEVER raises.
+    user_id is REQUIRED (guaranteed by call_gemini's guard).
+    company_id is optional (None if the user has no company).
+    """
     try:
         from models import db, AIGenerationLog
     except Exception:
         return
 
     try:
+        if not user_id:
+            # Should be unreachable — call_gemini guards this.
+            try:
+                from flask import current_app
+                current_app.logger.error(
+                    f"_log_gemini_call reached without user_id "
+                    f"(feature={feature}) — bug in caller"
+                )
+            except Exception:
+                pass
+            return
+
         log = AIGenerationLog(
-            user_id=None,
-            incident_id=None,
+            user_id=user_id,
+            incident_id=incident_id,
             feature=feature,
+            sub_feature=sub_feature,
             model_used=model_name,
             key_index=key_index,
             prompt_tokens=usage.get('prompt_tokens'),
@@ -4142,13 +4210,21 @@ def _log_gemini_call(feature, model_name, key_index, usage,
             duration_ms=duration_ms,
             success=success,
             error_message=error_message,
-            company_id=None,
+            company_id=company_id,
         )
         db.session.add(log)
         db.session.commit()
-    except Exception:
+
+    except Exception as e:
         try:
             db.session.rollback()
+        except Exception:
+            pass
+        try:
+            from flask import current_app
+            current_app.logger.warning(
+                f"_log_gemini_call failed (non-fatal): {e}"
+            )
         except Exception:
             pass
 
@@ -4161,28 +4237,36 @@ def log_ai_call(feature, incident_id=None, sub_feature=None,
                 model_preference=None):
     """
     Best-effort insert into ai_generation_logs. NEVER raises.
-    (Original behavior — kept for existing callers.)
+
+    Requires a real user — resolves user_id from current_user only.
+    company_id falls back to incident.company_id or current_user.company_id.
     """
     try:
+        from models import db, AIGenerationLog, Incident, Company
+    except Exception:
+        return
+
+    try:
+        # --- Resolve user_id from trusted source ONLY ---
         user_id = None
         if current_user is not None:
             user_id = getattr(current_user, 'id', None)
-        elif extra and extra.get('user_id'):
-            user_id = extra.get('user_id')
 
         if not user_id:
             try:
+                from flask import current_app
                 current_app.logger.warning(
-                    f"log_ai_call skipped — no user_id (feature={feature})"
+                    f"log_ai_call skipped — no current_user "
+                    f"(feature={feature}, incident_id={incident_id})"
                 )
             except Exception:
                 pass
             return
 
+        # --- Resolve company_id ---
         if company_id is None and incident_id:
             try:
-                from models import Incident
-                inc = Incident.query.get(incident_id)
+                inc = db.session.get(Incident, incident_id)
                 if inc is not None:
                     company_id = getattr(inc, 'company_id', None)
             except Exception:
@@ -4191,9 +4275,9 @@ def log_ai_call(feature, incident_id=None, sub_feature=None,
         if company_id is None and current_user is not None:
             company_id = getattr(current_user, 'company_id', None)
 
+        # --- Validate company exists (skip if invalid) ---
         if company_id is not None:
             try:
-                from models import Company
                 exists = db.session.query(
                     Company.query.filter_by(id=company_id).exists()
                 ).scalar()
@@ -4202,6 +4286,7 @@ def log_ai_call(feature, incident_id=None, sub_feature=None,
             except Exception:
                 company_id = None
 
+        # --- Build + insert ---
         log = AIGenerationLog(
             user_id=user_id,
             incident_id=incident_id,
@@ -4223,11 +4308,12 @@ def log_ai_call(feature, incident_id=None, sub_feature=None,
             success=success,
             error_message=error_message,
             retry_count=0,
-            extra=json.dumps(extra or {}),
+            extra=json.dumps(extra or {}, default=str),
             company_id=company_id,
         )
         db.session.add(log)
         db.session.commit()
+        return log
 
     except Exception as e:
         try:
@@ -4235,17 +4321,27 @@ def log_ai_call(feature, incident_id=None, sub_feature=None,
         except Exception:
             pass
         try:
-            current_app.logger.warning(f"log_ai_call failed (non-fatal): {e}")
+            from flask import current_app
+            current_app.logger.warning(
+                f"log_ai_call failed (non-fatal): {e} "
+                f"feature={feature} incident_id={incident_id}",
+                exc_info=True,
+            )
         except Exception:
             pass
-
 
 # =============================================================
 #  High-level Gemini helpers (feature-specific prompts)
 # =============================================================
 
-def gemini_medical_chat(message, context=None, extracted_entities=None):
+def gemini_medical_chat(message, current_user,
+                        company_id=None,
+                        context=None, extracted_entities=None,
+                        incident_id=None):
     """Conversational medical chat with structured outputs."""
+    if not getattr(current_user, 'id', None):
+        raise RuntimeError("gemini_medical_chat: current_user is required")
+
     ctx = context or {}
     entities = extracted_entities or {}
 
@@ -4293,11 +4389,20 @@ Do NOT diagnose. Discuss possibilities and recommend professional evaluation whe
         temperature=0.6,
         max_tokens=2048,
         feature='medical_chat',
+        current_user=current_user,       # ✅
+        company_id=company_id,           # ✅
+        incident_id=incident_id,
     )
 
-
-def gemini_disease_prediction(symptoms_text, symptom_entities=None, patient_data=None):
+def gemini_disease_prediction(symptoms_text, current_user,
+                              company_id=None,
+                              symptom_entities=None,
+                              patient_data=None,
+                              incident_id=None):
     """Disease/condition reasoning based on symptoms."""
+    if not getattr(current_user, 'id', None):
+        raise RuntimeError("gemini_disease_prediction: current_user is required")
+
     symptom_list = [s['text'] for s in (symptom_entities or []) if isinstance(s, dict)]
     patient_block = ''
     if patient_data:
@@ -4332,11 +4437,20 @@ If emergency patterns present, set urgency to EMERGENCY and add red flags."""
         temperature=0.5,
         max_tokens=2048,
         feature='disease_prediction',
+        current_user=current_user,      # ✅ REQUIRED
+        company_id=company_id,          # ✅ optional
+        incident_id=incident_id,        # ✅ optional
     )
 
 
-def gemini_text_analysis(medical_text, extracted_entities=None):
+def gemini_text_analysis(medical_text, current_user,
+                         company_id=None,
+                         extracted_entities=None,
+                         incident_id=None):
     """Long-form medical document summarization + reasoning."""
+    if not getattr(current_user, 'id', None):
+        raise RuntimeError("gemini_text_analysis: current_user is required")
+
     entities = extracted_entities or {}
     entity_block = json.dumps({
         'diseases': [e['text'] for e in entities.get('DISEASE', [])][:10],
@@ -4376,11 +4490,21 @@ Do not invent facts. If the document is unclear or incomplete, say so in the sum
         temperature=0.5,
         max_tokens=3072,
         feature='text_analysis',
+        current_user=current_user,      # ✅
+        company_id=company_id,
+        incident_id=incident_id,
     )
 
 
-def gemini_safety_analysis(document, document_type='general', extracted_entities=None):
+def gemini_safety_analysis(document, current_user,
+                           company_id=None,
+                           document_type='general',
+                           extracted_entities=None,
+                           incident_id=None):
     """Safety/compliance reasoning."""
+    if not getattr(current_user, 'id', None):
+        raise RuntimeError("gemini_safety_analysis: current_user is required")
+
     entities = extracted_entities or {}
     prompt = f"""Analyze the following document for safety and compliance issues.
 
@@ -4417,8 +4541,10 @@ Base your analysis only on what is actually in the document. Flag missing standa
         temperature=0.4,
         max_tokens=3072,
         feature='safety_analysis',
+        current_user=current_user,      # ✅
+        company_id=company_id,
+        incident_id=incident_id,
     )
-
 
 
 class MedicalAISystem:
@@ -8174,24 +8300,45 @@ def generate_verification_code():
 
 
 
-def log_admin_action(user_id, action, resource_type=None, resource_id=None, ip_address=None, user_agent=None):
-    """Enhanced admin action logging"""
-    # Get request context if available
-    if not ip_address and request:
-        ip_address = request.remote_addr
-    if not user_agent and request:
-        user_agent = request.headers.get('User-Agent')
-    
-    log = AdminAuditLog(
-        user_id=user_id,
-        action=action,
-        resource_type=resource_type,
-        resource_id=resource_id,
-        ip_address=ip_address,
-        user_agent=user_agent
-    )
-    db.session.add(log)
-    db.session.commit()
+def log_admin_action(user_id, action, resource_type=None, resource_id=None,
+                     ip_address=None, user_agent=None, details=None):
+    """
+    Enhanced admin action logging — never breaks the caller.
+    Accepts numeric OR string resource_id (both stored as VARCHAR).
+    """
+    try:
+        # ✅ has_request_context() — safe outside request contexts
+        if not ip_address and has_request_context():
+            ip_address = request.remote_addr
+        if not user_agent and has_request_context():
+            user_agent = request.headers.get('User-Agent')
+
+        # ✅ Normalize resource_id to string so ints and strings both fit
+        if resource_id is not None and not isinstance(resource_id, str):
+            resource_id = str(resource_id)
+
+        # ✅ Serialize details dict -> JSON text (matches Text column)
+        if isinstance(details, dict):
+            details = json.dumps(details)
+
+        log = AdminAuditLog(
+            user_id=user_id,
+            action=action,
+            resource_type=resource_type,
+            resource_id=resource_id,
+            details=details,
+            ip_address=ip_address,
+            user_agent=user_agent
+        )
+        db.session.add(log)
+        db.session.commit()
+        return log
+
+    except Exception as e:
+        # ✅ Audit logging must never break the actual operation
+        logger.error(f"Failed to write admin audit log: {e}")
+        db.session.rollback()
+        return None
 
 def get_effective_plan(user):
     """Returns the plan the user should have access to RIGHT NOW, considering trials."""
