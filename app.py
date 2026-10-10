@@ -151663,6 +151663,7 @@ def debug_pool():
 # FISHBONE AI
 # =============================================================================
 
+
 @app.route('/api/incidents/<int:incident_id>/fishbone/ai-generate',
            methods=['POST', 'OPTIONS'])
 @jwt_required
@@ -151676,6 +151677,8 @@ def fishbone_ai_generate(incident_id):
         incident, error, code = check_incident_access(incident_id, current_user)
         if error:
             return jsonify(error), code
+
+        company_id = get_company_id_for_user(current_user)
 
         data = request.get_json() or {}
         ai_opts = data.get('ai_options') or {}
@@ -151747,15 +151750,23 @@ Return ONLY this JSON (no markdown):
                 prompt,
                 temperature=temperature,
                 max_tokens=8192 if depth == 'comprehensive' else 4096,
+                feature='fishbone_full',                # ✅
+                current_user=current_user,              # ✅ FIX
+                company_id=company_id,                  # ✅ FIX
+                incident_id=incident_id,                # ✅
             )
         except Exception as ai_err:
+            current_app.logger.error(
+                f"fishbone_ai_generate: call_gemini failed: {ai_err}",
+                exc_info=True,                          # ✅ traceback
+            )
             log_ai_call('fishbone_full', incident_id=incident_id,
                         success=False, error_message=str(ai_err),
                         current_user=current_user,
-                        company_id=get_company_id_for_user(current_user))
+                        company_id=company_id)
             return jsonify({
                 'success': False,
-                'error': 'AI generation failed',
+                'error': str(ai_err)[:200],             # ✅ real reason
                 'details': str(ai_err) if current_app.debug else None,
                 'code': 'AI_UNAVAILABLE'
             }), 503
@@ -151763,15 +151774,15 @@ Return ONLY this JSON (no markdown):
         log_ai_call('fishbone_full', incident_id=incident_id,
                     model_info=model_info, usage=usage, duration_ms=dur,
                     current_user=current_user,
-                    company_id=get_company_id_for_user(current_user),
+                    company_id=company_id,
                     temperature=temperature, depth=depth, language=language,
                     extra={'industry': industry, 'focusAreas': focus_areas})
 
         return jsonify(ai_envelope(result, model_info, usage)), 200
 
     except Exception as e:
-        current_app.logger.error(f"fishbone_ai_generate error: {e}")
-        return jsonify({'success': False, 'error': 'Server error', 'code': 'INTERNAL_ERROR'}), 500
+        current_app.logger.error(f"fishbone_ai_generate error: {e}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e)[:200], 'code': 'INTERNAL_ERROR'}), 500
 
 
 @app.route('/api/incidents/<int:incident_id>/fishbone/ai-expand-category',
@@ -151787,6 +151798,8 @@ def fishbone_ai_expand_category(incident_id):
         incident, error, code = check_incident_access(incident_id, current_user)
         if error:
             return jsonify(error), code
+
+        company_id = get_company_id_for_user(current_user)
 
         data = request.get_json() or {}
         cat = data.get('category') or {}
@@ -151818,14 +151831,25 @@ Return JSON:
                 prompt,
                 temperature=float(ai_opts.get('temperature', 0.7)),
                 max_tokens=4096,
+                feature='fishbone_expand',              # ✅
+                current_user=current_user,              # ✅ FIX
+                company_id=company_id,                  # ✅ FIX
+                incident_id=incident_id,
             )
         except Exception as ai_err:
+            current_app.logger.error(
+                f"fishbone_ai_expand_category: call_gemini failed: {ai_err}",
+                exc_info=True,
+            )
             log_ai_call('fishbone_expand', incident_id=incident_id, success=False,
                         error_message=str(ai_err), current_user=current_user,
-                        company_id=get_company_id_for_user(current_user))
-            return jsonify({'success': False, 'error': 'AI failed', 'code': 'AI_UNAVAILABLE'}), 503
+                        company_id=company_id)
+            return jsonify({
+                'success': False,
+                'error': str(ai_err)[:200],
+                'code': 'AI_UNAVAILABLE'
+            }), 503
 
-        # Normalize: give each cause an id
         causes = result.get('causes') or []
         for i, c in enumerate(causes):
             c.setdefault('id', f"c_{int(time.time()*1000)}_{i}")
@@ -151833,14 +151857,14 @@ Return JSON:
         log_ai_call('fishbone_expand', incident_id=incident_id,
                     model_info=model_info, usage=usage, duration_ms=dur,
                     current_user=current_user,
-                    company_id=get_company_id_for_user(current_user),
+                    company_id=company_id,
                     extra={'category': cat.get('name')})
 
         return jsonify(ai_envelope({'causes': causes}, model_info, usage)), 200
 
     except Exception as e:
-        current_app.logger.error(f"fishbone_ai_expand_category error: {e}")
-        return jsonify({'success': False, 'error': 'Server error', 'code': 'INTERNAL_ERROR'}), 500
+        current_app.logger.error(f"fishbone_ai_expand_category error: {e}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e)[:200], 'code': 'INTERNAL_ERROR'}), 500
 
 
 @app.route('/api/incidents/<int:incident_id>/fishbone/ai-suggest-actions',
@@ -151856,6 +151880,8 @@ def fishbone_ai_suggest_actions(incident_id):
         incident, error, code = check_incident_access(incident_id, current_user)
         if error:
             return jsonify(error), code
+
+        company_id = get_company_id_for_user(current_user)
 
         data = request.get_json() or {}
         cat = data.get('category') or {}
@@ -151880,26 +151906,39 @@ Return JSON:
 
         try:
             result, model_info, usage, dur = call_gemini(
-                prompt, temperature=float(ai_opts.get('temperature', 0.7)),
+                prompt,
+                temperature=float(ai_opts.get('temperature', 0.7)),
                 max_tokens=2048,
+                feature='fishbone_actions',             # ✅
+                current_user=current_user,              # ✅ FIX
+                company_id=company_id,                  # ✅ FIX
+                incident_id=incident_id,
             )
         except Exception as ai_err:
+            current_app.logger.error(
+                f"fishbone_ai_suggest_actions: call_gemini failed: {ai_err}",
+                exc_info=True,
+            )
             log_ai_call('fishbone_actions', incident_id=incident_id, success=False,
                         error_message=str(ai_err), current_user=current_user,
-                        company_id=get_company_id_for_user(current_user))
-            return jsonify({'success': False, 'error': 'AI failed', 'code': 'AI_UNAVAILABLE'}), 503
+                        company_id=company_id)
+            return jsonify({
+                'success': False,
+                'error': str(ai_err)[:200],
+                'code': 'AI_UNAVAILABLE'
+            }), 503
 
         log_ai_call('fishbone_actions', incident_id=incident_id,
                     model_info=model_info, usage=usage, duration_ms=dur,
                     current_user=current_user,
-                    company_id=get_company_id_for_user(current_user),
+                    company_id=company_id,
                     extra={'cause_id': cause.get('id')})
 
         return jsonify(ai_envelope(result, model_info, usage)), 200
 
     except Exception as e:
-        current_app.logger.error(f"fishbone_ai_suggest_actions error: {e}")
-        return jsonify({'success': False, 'error': 'Server error', 'code': 'INTERNAL_ERROR'}), 500
+        current_app.logger.error(f"fishbone_ai_suggest_actions error: {e}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e)[:200], 'code': 'INTERNAL_ERROR'}), 500
 
 
 @app.route('/api/incidents/<int:incident_id>/fishbone/ai-five-whys',
@@ -151915,6 +151954,8 @@ def fishbone_ai_five_whys(incident_id):
         incident, error, code = check_incident_access(incident_id, current_user)
         if error:
             return jsonify(error), code
+
+        company_id = get_company_id_for_user(current_user)
 
         data = request.get_json() or {}
         cause = data.get('cause') or {}
@@ -151941,26 +151982,39 @@ Return JSON:
 
         try:
             result, model_info, usage, dur = call_gemini(
-                prompt, temperature=float(ai_opts.get('temperature', 0.7)),
+                prompt,
+                temperature=float(ai_opts.get('temperature', 0.7)),
                 max_tokens=2048,
+                feature='fishbone_five_whys',           # ✅
+                current_user=current_user,              # ✅ FIX
+                company_id=company_id,                  # ✅ FIX
+                incident_id=incident_id,
             )
         except Exception as ai_err:
+            current_app.logger.error(
+                f"fishbone_ai_five_whys: call_gemini failed: {ai_err}",
+                exc_info=True,
+            )
             log_ai_call('fishbone_five_whys', incident_id=incident_id, success=False,
                         error_message=str(ai_err), current_user=current_user,
-                        company_id=get_company_id_for_user(current_user))
-            return jsonify({'success': False, 'error': 'AI failed', 'code': 'AI_UNAVAILABLE'}), 503
+                        company_id=company_id)
+            return jsonify({
+                'success': False,
+                'error': str(ai_err)[:200],
+                'code': 'AI_UNAVAILABLE'
+            }), 503
 
         log_ai_call('fishbone_five_whys', incident_id=incident_id,
                     model_info=model_info, usage=usage, duration_ms=dur,
                     current_user=current_user,
-                    company_id=get_company_id_for_user(current_user),
+                    company_id=company_id,
                     extra={'cause_id': cause.get('id')})
 
         return jsonify(ai_envelope(result, model_info, usage)), 200
 
     except Exception as e:
-        current_app.logger.error(f"fishbone_ai_five_whys error: {e}")
-        return jsonify({'success': False, 'error': 'Server error', 'code': 'INTERNAL_ERROR'}), 500
+        current_app.logger.error(f"fishbone_ai_five_whys error: {e}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e)[:200], 'code': 'INTERNAL_ERROR'}), 500
 
 
 @app.route('/api/incidents/<int:incident_id>/fishbone/ai-chat',
@@ -151977,6 +152031,8 @@ def fishbone_ai_chat(incident_id):
         if error:
             return jsonify(error), code
 
+        company_id = get_company_id_for_user(current_user)
+
         data = request.get_json() or {}
         question = (data.get('question') or '').strip()
         ctx = data.get('fishboneContext') or {}
@@ -151986,7 +152042,6 @@ def fishbone_ai_chat(incident_id):
         if not question:
             return jsonify({'success': False, 'error': 'question required', 'code': 'MISSING_QUESTION'}), 400
 
-        # Build context string
         cat_lines = []
         for c in ctx.get('categories', []):
             causes = '; '.join([x.get('description', '') for x in c.get('causes', [])])
@@ -152019,23 +152074,35 @@ Answer in 2-4 sentences. If the answer isn't determinable from the data, say so 
                 json_mode=False,
                 temperature=float(ai_opts.get('temperature', 0.5)),
                 max_tokens=1024,
+                feature='fishbone_chat',                # ✅
+                current_user=current_user,              # ✅ FIX
+                company_id=company_id,                  # ✅ FIX
+                incident_id=incident_id,
             )
         except Exception as ai_err:
+            current_app.logger.error(
+                f"fishbone_ai_chat: call_gemini failed: {ai_err}",
+                exc_info=True,
+            )
             log_ai_call('fishbone_chat', incident_id=incident_id, success=False,
                         error_message=str(ai_err), current_user=current_user,
-                        company_id=get_company_id_for_user(current_user))
-            return jsonify({'success': False, 'error': 'AI failed', 'code': 'AI_UNAVAILABLE'}), 503
+                        company_id=company_id)
+            return jsonify({
+                'success': False,
+                'error': str(ai_err)[:200],
+                'code': 'AI_UNAVAILABLE'
+            }), 503
 
         log_ai_call('fishbone_chat', incident_id=incident_id,
                     model_info=model_info, usage=usage, duration_ms=dur,
                     current_user=current_user,
-                    company_id=get_company_id_for_user(current_user))
+                    company_id=company_id)
 
         return jsonify(ai_envelope({'answer': text}, model_info, usage)), 200
 
     except Exception as e:
-        current_app.logger.error(f"fishbone_ai_chat error: {e}")
-        return jsonify({'success': False, 'error': 'Server error', 'code': 'INTERNAL_ERROR'}), 500
+        current_app.logger.error(f"fishbone_ai_chat error: {e}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e)[:200], 'code': 'INTERNAL_ERROR'}), 500
 
 
 @app.route('/api/incidents/<int:incident_id>/fishbone/causes/<cause_id>/five-whys',
@@ -152280,9 +152347,10 @@ def ai_analysis_generate(incident_id):
         if error:
             return jsonify(error), code
 
+        company_id = get_company_id_for_user(current_user)
+
         data = request.get_json() or {}
         ai_opts = data.get('ai_options') or {}
-        industry = getattr(incident, 'company', None) and 'general' or 'general'
 
         prompt = f"""Analyze this incident deeply and return a structured JSON.
 
@@ -152311,25 +152379,38 @@ Return JSON:
 
         try:
             result, model_info, usage, dur = call_gemini(
-                prompt, temperature=float(ai_opts.get('temperature', 0.7)),
+                prompt,
+                temperature=float(ai_opts.get('temperature', 0.7)),
                 max_tokens=6144,
+                feature='analysis_full',                # ✅
+                current_user=current_user,              # ✅ FIX
+                company_id=company_id,                  # ✅ FIX
+                incident_id=incident_id,
             )
         except Exception as ai_err:
+            current_app.logger.error(
+                f"ai_analysis_generate: call_gemini failed: {ai_err}",
+                exc_info=True,
+            )
             log_ai_call('analysis_full', incident_id=incident_id, success=False,
                         error_message=str(ai_err), current_user=current_user,
-                        company_id=get_company_id_for_user(current_user))
-            return jsonify({'success': False, 'error': 'AI failed', 'code': 'AI_UNAVAILABLE'}), 503
+                        company_id=company_id)
+            return jsonify({
+                'success': False,
+                'error': str(ai_err)[:200],
+                'code': 'AI_UNAVAILABLE'
+            }), 503
 
         log_ai_call('analysis_full', incident_id=incident_id,
                     model_info=model_info, usage=usage, duration_ms=dur,
                     current_user=current_user,
-                    company_id=get_company_id_for_user(current_user))
+                    company_id=company_id)
 
         return jsonify(ai_envelope(result, model_info, usage)), 200
 
     except Exception as e:
-        current_app.logger.error(f"ai_analysis_generate error: {e}")
-        return jsonify({'success': False, 'error': 'Server error', 'code': 'INTERNAL_ERROR'}), 500
+        current_app.logger.error(f"ai_analysis_generate error: {e}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e)[:200], 'code': 'INTERNAL_ERROR'}), 500
 
 
 @app.route('/api/incidents/<int:incident_id>/ai-analysis/ask',
@@ -152346,14 +152427,13 @@ def ai_analysis_ask(incident_id):
         if error:
             return jsonify(error), code
 
+        company_id = get_company_id_for_user(current_user)
+
         data = request.get_json() or {}
         question = (data.get('question') or '').strip()
         context = data.get('context') or {}
         ai_opts = data.get('ai_options') or {}
 
-        # ✅ Defensive: the frontend historically double-wrapped the payload
-        #    as { context: { context: { conversation: [...] } } }.
-        #    Unwrap if we detect that shape.
         if isinstance(context, dict) and 'context' in context and 'conversation' not in context:
             context = context.get('context') or {}
 
@@ -152365,16 +152445,6 @@ def ai_analysis_ask(incident_id):
             }), 400
 
         history = context.get('conversation') or []
-
-        # ✅ Debug log so we can see exactly what arrived
-        try:
-            current_app.logger.info(
-                f"ai_analysis_ask: question_len={len(question)} "
-                f"history_len={len(history)} "
-                f"context_keys={list(context.keys()) if isinstance(context, dict) else type(context).__name__}"
-            )
-        except Exception:
-            pass
 
         hist_block = '\n'.join([
             f"{'Q' if m.get('role') == 'user' else 'A'}: {m.get('content', '')}"
@@ -152396,28 +152466,27 @@ Answer in 3-6 sentences. Be specific and reference incident details."""
                 json_mode=False,
                 temperature=float(ai_opts.get('temperature', 0.5)),
                 max_tokens=1024,
+                feature='analysis_chat',                # ✅
+                current_user=current_user,              # ✅ FIX
+                company_id=company_id,                  # ✅ FIX
+                incident_id=incident_id,
             )
         except Exception as ai_err:
-            # ✅ Log the FULL traceback for the AI call
-            import traceback
-            current_app.logger.error("=" * 70)
-            current_app.logger.error("❌ ai_analysis_ask: call_gemini FAILED")
-            current_app.logger.error(f"Error type: {type(ai_err).__name__}")
-            current_app.logger.error(f"Error: {ai_err}")
-            current_app.logger.error(traceback.format_exc())
-            current_app.logger.error("=" * 70)
-
+            current_app.logger.error(
+                f"ai_analysis_ask: call_gemini failed: {ai_err}",
+                exc_info=True,
+            )
             log_ai_call(
                 'analysis_chat',
                 incident_id=incident_id,
                 success=False,
                 error_message=str(ai_err),
                 current_user=current_user,
-                company_id=get_company_id_for_user(current_user),
+                company_id=company_id,
             )
             return jsonify({
                 'success': False,
-                'error': 'AI failed',
+                'error': str(ai_err)[:200],
                 'code': 'AI_UNAVAILABLE'
             }), 503
 
@@ -152428,23 +152497,16 @@ Answer in 3-6 sentences. Be specific and reference incident details."""
             usage=usage,
             duration_ms=dur,
             current_user=current_user,
-            company_id=get_company_id_for_user(current_user),
+            company_id=company_id,
         )
 
         return jsonify(ai_envelope({'answer': text}, model_info, usage)), 200
 
     except Exception as e:
-        # ✅ Full traceback for anything else
-        import traceback
-        current_app.logger.error("=" * 70)
-        current_app.logger.error("❌ ai_analysis_ask: UNHANDLED ERROR")
-        current_app.logger.error(f"Error type: {type(e).__name__}")
-        current_app.logger.error(f"Error: {e}")
-        current_app.logger.error(traceback.format_exc())
-        current_app.logger.error("=" * 70)
+        current_app.logger.error(f"ai_analysis_ask: unhandled error: {e}", exc_info=True)
         return jsonify({
             'success': False,
-            'error': 'Server error',
+            'error': str(e)[:200],
             'code': 'INTERNAL_ERROR'
         }), 500
 
@@ -152574,6 +152636,8 @@ def ai_analysis_generate_report(incident_id):
         if error:
             return jsonify(error), code
 
+        company_id = get_company_id_for_user(current_user)
+
         data = request.get_json() or {}
         report_type = data.get('reportType', 'full')
         ai_opts = data.get('ai_options') or {}
@@ -152598,29 +152662,39 @@ Return JSON:
 
         try:
             result, model_info, usage, dur = call_gemini(
-                prompt, temperature=float(ai_opts.get('temperature', 0.6)),
+                prompt,
+                temperature=float(ai_opts.get('temperature', 0.6)),
                 max_tokens=6144,
+                feature='analysis_report',              # ✅
+                current_user=current_user,              # ✅ FIX
+                company_id=company_id,                  # ✅ FIX
+                incident_id=incident_id,
             )
         except Exception as ai_err:
+            current_app.logger.error(
+                f"ai_analysis_generate_report: call_gemini failed: {ai_err}",
+                exc_info=True,
+            )
             log_ai_call('analysis_report', incident_id=incident_id, success=False,
                         error_message=str(ai_err), current_user=current_user,
-                        company_id=get_company_id_for_user(current_user))
-            return jsonify({'success': False, 'error': 'AI failed', 'code': 'AI_UNAVAILABLE'}), 503
+                        company_id=company_id)
+            return jsonify({
+                'success': False,
+                'error': str(ai_err)[:200],
+                'code': 'AI_UNAVAILABLE'
+            }), 503
 
         log_ai_call('analysis_report', incident_id=incident_id,
                     model_info=model_info, usage=usage, duration_ms=dur,
                     current_user=current_user,
-                    company_id=get_company_id_for_user(current_user))
+                    company_id=company_id)
 
         return jsonify(ai_envelope(result, model_info, usage)), 200
 
     except Exception as e:
-        current_app.logger.error(f"ai_analysis_generate_report error: {e}")
-        return jsonify({'success': False, 'error': 'Server error', 'code': 'INTERNAL_ERROR'}), 500
+        current_app.logger.error(f"ai_analysis_generate_report error: {e}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e)[:200], 'code': 'INTERNAL_ERROR'}), 500
 
-# =============================================================================
-# SIMILAR INCIDENTS AI
-# =============================================================================
 
 @app.route('/api/incidents/<int:incident_id>/similar/ai',
            methods=['POST', 'OPTIONS'])
@@ -152636,15 +152710,14 @@ def similar_ai_search(incident_id):
         if error:
             return jsonify(error), code
 
+        company_id = get_company_id_for_user(current_user)
+
         data = request.get_json() or {}
         ai_opts = data.get('ai_options') or {}
         threshold = int(data.get('threshold', 60))
         match_field = data.get('matchField', 'all')
         limit = int(data.get('limit', 20))
 
-        company_id = get_company_id_for_user(current_user)
-
-        # Get other incidents from this company (recent)
         candidates = Incident.query.filter(
             Incident.company_id == company_id,
             Incident.id != incident_id,
@@ -152653,7 +152726,6 @@ def similar_ai_search(incident_id):
         if not candidates:
             return jsonify(ai_envelope({'similar': []})), 200
 
-        # Build compact listing for the AI
         blocks = []
         for c in candidates:
             blocks.append({
@@ -152691,16 +152763,28 @@ Sort by similarity_score desc. Max {limit} results."""
 
         try:
             result, model_info, usage, dur = call_gemini(
-                prompt, temperature=float(ai_opts.get('temperature', 0.4)),
+                prompt,
+                temperature=float(ai_opts.get('temperature', 0.4)),
                 max_tokens=4096,
+                feature='similar_search',               # ✅
+                current_user=current_user,              # ✅ FIX
+                company_id=company_id,                  # ✅ FIX
+                incident_id=incident_id,
             )
         except Exception as ai_err:
+            current_app.logger.error(
+                f"similar_ai_search: call_gemini failed: {ai_err}",
+                exc_info=True,
+            )
             log_ai_call('similar_search', incident_id=incident_id, success=False,
                         error_message=str(ai_err), current_user=current_user,
                         company_id=company_id)
-            return jsonify({'success': False, 'error': 'AI failed', 'code': 'AI_UNAVAILABLE'}), 503
+            return jsonify({
+                'success': False,
+                'error': str(ai_err)[:200],
+                'code': 'AI_UNAVAILABLE'
+            }), 503
 
-        # Enrich with full incident data
         scored = {row['id']: row for row in (result.get('similar') or [])}
         out = []
         for c in candidates:
@@ -152718,7 +152802,6 @@ Sort by similarity_score desc. Max {limit} results."""
                 full['matched_fields'] = scored[c.id].get('matched_fields', [])
                 out.append(full)
 
-        # Persist matches (best-effort)
         try:
             for m in out[:20]:
                 existing = SimilarIncidentMatch.query.filter_by(
@@ -152754,8 +152837,8 @@ Sort by similarity_score desc. Max {limit} results."""
         return jsonify(ai_envelope({'similar': out}, model_info, usage)), 200
 
     except Exception as e:
-        current_app.logger.error(f"similar_ai_search error: {e}")
-        return jsonify({'success': False, 'error': 'Server error', 'code': 'INTERNAL_ERROR'}), 500
+        current_app.logger.error(f"similar_ai_search error: {e}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e)[:200], 'code': 'INTERNAL_ERROR'}), 500
 
 
 @app.route('/api/incidents/<int:incident_id>/similar/cluster-analysis',
@@ -152772,10 +152855,11 @@ def similar_cluster_analysis(incident_id):
         if error:
             return jsonify(error), code
 
+        company_id = get_company_id_for_user(current_user)
+
         data = request.get_json() or {}
         similar_ids = data.get('similar_incident_ids') or []
         ai_opts = data.get('ai_options') or {}
-        company_id = get_company_id_for_user(current_user)
 
         if not similar_ids:
             return jsonify(ai_envelope({
@@ -152817,16 +152901,28 @@ Return JSON:
 
         try:
             result, model_info, usage, dur = call_gemini(
-                prompt, temperature=float(ai_opts.get('temperature', 0.4)),
+                prompt,
+                temperature=float(ai_opts.get('temperature', 0.4)),
                 max_tokens=4096,
+                feature='similar_cluster',              # ✅
+                current_user=current_user,              # ✅ FIX
+                company_id=company_id,                  # ✅ FIX
+                incident_id=incident_id,
             )
         except Exception as ai_err:
+            current_app.logger.error(
+                f"similar_cluster_analysis: call_gemini failed: {ai_err}",
+                exc_info=True,
+            )
             log_ai_call('similar_cluster', incident_id=incident_id, success=False,
                         error_message=str(ai_err), current_user=current_user,
                         company_id=company_id)
-            return jsonify({'success': False, 'error': 'AI failed', 'code': 'AI_UNAVAILABLE'}), 503
+            return jsonify({
+                'success': False,
+                'error': str(ai_err)[:200],
+                'code': 'AI_UNAVAILABLE'
+            }), 503
 
-        # Persist
         try:
             row = IncidentClusterAnalysis(
                 source_incident_id=incident_id,
@@ -152854,8 +152950,8 @@ Return JSON:
         return jsonify(ai_envelope(result, model_info, usage)), 200
 
     except Exception as e:
-        current_app.logger.error(f"similar_cluster_analysis error: {e}")
-        return jsonify({'success': False, 'error': 'Server error', 'code': 'INTERNAL_ERROR'}), 500
+        current_app.logger.error(f"similar_cluster_analysis error: {e}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e)[:200], 'code': 'INTERNAL_ERROR'}), 500
 
 
 @app.route('/api/incidents/<int:incident_id>/similar/compare',
@@ -152872,10 +152968,11 @@ def similar_compare(incident_id):
         if error:
             return jsonify(error), code
 
+        company_id = get_company_id_for_user(current_user)
+
         data = request.get_json() or {}
         other_id = data.get('other_incident_id')
         ai_opts = data.get('ai_options') or {}
-        company_id = get_company_id_for_user(current_user)
 
         other = Incident.query.filter_by(id=other_id, company_id=company_id).first()
         if not other:
@@ -152904,14 +153001,27 @@ Return JSON:
 
         try:
             result, model_info, usage, dur = call_gemini(
-                prompt, temperature=float(ai_opts.get('temperature', 0.4)),
+                prompt,
+                temperature=float(ai_opts.get('temperature', 0.4)),
                 max_tokens=3072,
+                feature='similar_compare',              # ✅
+                current_user=current_user,              # ✅ FIX
+                company_id=company_id,                  # ✅ FIX
+                incident_id=incident_id,
             )
         except Exception as ai_err:
+            current_app.logger.error(
+                f"similar_compare: call_gemini failed: {ai_err}",
+                exc_info=True,
+            )
             log_ai_call('similar_compare', incident_id=incident_id, success=False,
                         error_message=str(ai_err), current_user=current_user,
                         company_id=company_id)
-            return jsonify({'success': False, 'error': 'AI failed', 'code': 'AI_UNAVAILABLE'}), 503
+            return jsonify({
+                'success': False,
+                'error': str(ai_err)[:200],
+                'code': 'AI_UNAVAILABLE'
+            }), 503
 
         try:
             db.session.add(IncidentComparison(
@@ -152939,8 +153049,8 @@ Return JSON:
         return jsonify(ai_envelope(result, model_info, usage)), 200
 
     except Exception as e:
-        current_app.logger.error(f"similar_compare error: {e}")
-        return jsonify({'success': False, 'error': 'Server error', 'code': 'INTERNAL_ERROR'}), 500
+        current_app.logger.error(f"similar_compare error: {e}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e)[:200], 'code': 'INTERNAL_ERROR'}), 500
 
 
 @app.route('/api/incidents/<int:incident_id>/similar/preventive-actions',
@@ -152957,10 +153067,11 @@ def similar_preventive_actions(incident_id):
         if error:
             return jsonify(error), code
 
+        company_id = get_company_id_for_user(current_user)
+
         data = request.get_json() or {}
         similar_ids = data.get('similar_incident_ids') or []
         ai_opts = data.get('ai_options') or {}
-        company_id = get_company_id_for_user(current_user)
 
         rows = Incident.query.filter(
             Incident.id.in_(similar_ids), Incident.company_id == company_id
@@ -152982,14 +153093,27 @@ Return JSON:
 
         try:
             result, model_info, usage, dur = call_gemini(
-                prompt, temperature=float(ai_opts.get('temperature', 0.6)),
+                prompt,
+                temperature=float(ai_opts.get('temperature', 0.6)),
                 max_tokens=2048,
+                feature='similar_preventive',           # ✅
+                current_user=current_user,              # ✅ FIX
+                company_id=company_id,                  # ✅ FIX
+                incident_id=incident_id,
             )
         except Exception as ai_err:
+            current_app.logger.error(
+                f"similar_preventive_actions: call_gemini failed: {ai_err}",
+                exc_info=True,
+            )
             log_ai_call('similar_preventive', incident_id=incident_id, success=False,
                         error_message=str(ai_err), current_user=current_user,
                         company_id=company_id)
-            return jsonify({'success': False, 'error': 'AI failed', 'code': 'AI_UNAVAILABLE'}), 503
+            return jsonify({
+                'success': False,
+                'error': str(ai_err)[:200],
+                'code': 'AI_UNAVAILABLE'
+            }), 503
 
         log_ai_call('similar_preventive', incident_id=incident_id,
                     model_info=model_info, usage=usage, duration_ms=dur,
@@ -152998,8 +153122,9 @@ Return JSON:
         return jsonify(ai_envelope(result, model_info, usage)), 200
 
     except Exception as e:
-        current_app.logger.error(f"similar_preventive_actions error: {e}")
-        return jsonify({'success': False, 'error': 'Server error', 'code': 'INTERNAL_ERROR'}), 500
+        current_app.logger.error(f"similar_preventive_actions error: {e}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e)[:200], 'code': 'INTERNAL_ERROR'}), 500
+
 
 
 # =============================================================================
@@ -153071,7 +153196,6 @@ Return JSON:
   "model_recommendation": {{ "reasoning":"...","recommended_model":"...","confidence":"low|medium|high" }}
 }}"""
 
-        # ✅ FIXED: pass current_user + company_id, use feature tag, surface real error
         try:
             result, model_info, usage, dur = call_gemini(
                 prompt,
@@ -153133,13 +153257,13 @@ Return JSON:
         return jsonify(ai_envelope(result, model_info, usage)), 200
 
     except Exception as e:
-        # ✅ FIXED: include traceback for genuine server errors
         current_app.logger.error(f"predictive_ai error: {e}", exc_info=True)
         return jsonify({
             'success': False,
             'error': str(e)[:200],
             'code': 'INTERNAL_ERROR',
         }), 500
+
 
 @app.route('/api/analytics/predictive/scenario', methods=['POST', 'OPTIONS'])
 @jwt_required
@@ -153166,14 +153290,27 @@ Forecast the impact. Return JSON:
 
         try:
             result, model_info, usage, dur = call_gemini(
-                prompt, temperature=float(ai_opts.get('temperature', 0.6)),
+                prompt,
+                temperature=float(ai_opts.get('temperature', 0.6)),
                 max_tokens=2048,
+                feature='predictive_scenario',          # ✅
+                current_user=current_user,              # ✅ FIX
+                company_id=company_id,                  # ✅ FIX
+                incident_id=incident_id,
             )
         except Exception as ai_err:
+            current_app.logger.error(
+                f"predictive_scenario: call_gemini failed: {ai_err}",
+                exc_info=True,                          # ✅ traceback
+            )
             log_ai_call('predictive_scenario', incident_id=incident_id,
                         success=False, error_message=str(ai_err),
                         current_user=current_user, company_id=company_id)
-            return jsonify({'success': False, 'error': 'AI failed', 'code': 'AI_UNAVAILABLE'}), 503
+            return jsonify({
+                'success': False,
+                'error': str(ai_err)[:200],             # ✅ real reason
+                'code': 'AI_UNAVAILABLE'
+            }), 503
 
         try:
             db.session.add(PredictiveScenario(
@@ -153198,8 +153335,8 @@ Forecast the impact. Return JSON:
         return jsonify(ai_envelope(result, model_info, usage)), 200
 
     except Exception as e:
-        current_app.logger.error(f"predictive_scenario error: {e}")
-        return jsonify({'success': False, 'error': 'Server error', 'code': 'INTERNAL_ERROR'}), 500
+        current_app.logger.error(f"predictive_scenario error: {e}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e)[:200], 'code': 'INTERNAL_ERROR'}), 500
 
 
 @app.route('/api/analytics/anomalies/ai', methods=['POST', 'OPTIONS'])
@@ -153240,13 +153377,25 @@ Return JSON:
 
         try:
             result, model_info, usage, dur = call_gemini(
-                prompt, temperature=float(ai_opts.get('temperature', 0.4)),
+                prompt,
+                temperature=float(ai_opts.get('temperature', 0.4)),
                 max_tokens=2048,
+                feature='predictive_anomalies',         # ✅
+                current_user=current_user,              # ✅ FIX
+                company_id=company_id,                  # ✅ FIX
             )
         except Exception as ai_err:
+            current_app.logger.error(
+                f"predictive_anomalies: call_gemini failed: {ai_err}",
+                exc_info=True,
+            )
             log_ai_call('predictive_anomalies', success=False, error_message=str(ai_err),
                         current_user=current_user, company_id=company_id)
-            return jsonify({'success': False, 'error': 'AI failed', 'code': 'AI_UNAVAILABLE'}), 503
+            return jsonify({
+                'success': False,
+                'error': str(ai_err)[:200],
+                'code': 'AI_UNAVAILABLE'
+            }), 503
 
         log_ai_call('predictive_anomalies', model_info=model_info, usage=usage,
                     duration_ms=dur, current_user=current_user, company_id=company_id)
@@ -153254,8 +153403,8 @@ Return JSON:
         return jsonify(ai_envelope(result, model_info, usage)), 200
 
     except Exception as e:
-        current_app.logger.error(f"predictive_anomalies error: {e}")
-        return jsonify({'success': False, 'error': 'Server error', 'code': 'INTERNAL_ERROR'}), 500
+        current_app.logger.error(f"predictive_anomalies error: {e}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e)[:200], 'code': 'INTERNAL_ERROR'}), 500
 
 
 @app.route('/api/analytics/risk-narrative/ai', methods=['POST', 'OPTIONS'])
@@ -153296,13 +153445,25 @@ Return JSON:
 
         try:
             result, model_info, usage, dur = call_gemini(
-                prompt, temperature=float(ai_opts.get('temperature', 0.6)),
+                prompt,
+                temperature=float(ai_opts.get('temperature', 0.6)),
                 max_tokens=2048,
+                feature='predictive_narrative',         # ✅
+                current_user=current_user,              # ✅ FIX
+                company_id=company_id,                  # ✅ FIX
             )
         except Exception as ai_err:
+            current_app.logger.error(
+                f"predictive_narrative: call_gemini failed: {ai_err}",
+                exc_info=True,
+            )
             log_ai_call('predictive_narrative', success=False, error_message=str(ai_err),
                         current_user=current_user, company_id=company_id)
-            return jsonify({'success': False, 'error': 'AI failed', 'code': 'AI_UNAVAILABLE'}), 503
+            return jsonify({
+                'success': False,
+                'error': str(ai_err)[:200],
+                'code': 'AI_UNAVAILABLE'
+            }), 503
 
         log_ai_call('predictive_narrative', model_info=model_info, usage=usage,
                     duration_ms=dur, current_user=current_user, company_id=company_id)
@@ -153310,8 +153471,8 @@ Return JSON:
         return jsonify(ai_envelope(result, model_info, usage)), 200
 
     except Exception as e:
-        current_app.logger.error(f"predictive_narrative error: {e}")
-        return jsonify({'success': False, 'error': 'Server error', 'code': 'INTERNAL_ERROR'}), 500
+        current_app.logger.error(f"predictive_narrative error: {e}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e)[:200], 'code': 'INTERNAL_ERROR'}), 500
 
 
 @app.route('/api/analytics/model-recommendation', methods=['POST', 'OPTIONS'])
@@ -153338,13 +153499,26 @@ Return JSON:
 
         try:
             result, model_info, usage, dur = call_gemini(
-                prompt, temperature=0.4, max_tokens=1024,
+                prompt,
+                temperature=0.4,
+                max_tokens=1024,
+                feature='predictive_model_recommendation',   # ✅
+                current_user=current_user,                   # ✅ FIX
+                company_id=company_id,                       # ✅ FIX
             )
         except Exception as ai_err:
+            current_app.logger.error(
+                f"predictive_model_recommendation: call_gemini failed: {ai_err}",
+                exc_info=True,
+            )
             log_ai_call('predictive_model_recommendation', success=False,
                         error_message=str(ai_err), current_user=current_user,
                         company_id=company_id)
-            return jsonify({'success': False, 'error': 'AI failed', 'code': 'AI_UNAVAILABLE'}), 503
+            return jsonify({
+                'success': False,
+                'error': str(ai_err)[:200],
+                'code': 'AI_UNAVAILABLE'
+            }), 503
 
         log_ai_call('predictive_model_recommendation', model_info=model_info,
                     usage=usage, duration_ms=dur,
@@ -153353,9 +153527,8 @@ Return JSON:
         return jsonify(ai_envelope(result, model_info, usage)), 200
 
     except Exception as e:
-        current_app.logger.error(f"model_recommendation error: {e}")
-        return jsonify({'success': False, 'error': 'Server error', 'code': 'INTERNAL_ERROR'}), 500
-
+        current_app.logger.error(f"model_recommendation error: {e}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e)[:200], 'code': 'INTERNAL_ERROR'}), 500
 # -- ERROR HANDLERS --
 
 
