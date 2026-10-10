@@ -4005,9 +4005,7 @@ def call_gemini(prompt,
                 model_name=None,
                 feature='medical_ai',
                 use_cache=True,
-                # ✅ REQUIRED: every AI call must be attributable to a real user
-                current_user,
-                # ✅ OPTIONAL: falls back to current_user.company_id if not passed
+                current_user=None,         # ✅ default so the file compiles
                 company_id=None,
                 incident_id=None,
                 sub_feature=None):
@@ -4016,9 +4014,11 @@ def call_gemini(prompt,
     Returns (parsed_body, model_info, usage, duration_ms).
     Raises RuntimeError on failure — no fallback.
 
-    REQUIRES current_user (with a valid id). company_id is optional; if not
-    supplied, it is taken from current_user.company_id. This guarantees every
-    row in ai_generation_logs has a real user_id (DB enforces NOT NULL).
+    REQUIRES current_user (with a valid id) at call time. Passing None or
+    an object without .id raises RuntimeError before any Gemini key is used.
+    company_id is optional; if not supplied, it is taken from
+    current_user.company_id. Every row in ai_generation_logs will therefore
+    have a real user_id (DB enforces NOT NULL).
     """
     # --- Enforce user context BEFORE spending a Gemini key ---
     user_id = getattr(current_user, 'id', None) if current_user is not None else None
