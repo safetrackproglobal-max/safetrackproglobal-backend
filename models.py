@@ -7440,7 +7440,73 @@ class EnvironmentalSite(db.Model):
 
     def __repr__(self):
         return f'<EnvironmentalSite {self.id} {self.name}>'
-
+        
+class HospitalFinancialRecord(db.Model):
+    """Hospital patient billing & revenue tracking"""
+    __tablename__ = 'hospital_financial_records'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    hospital_id = db.Column(db.Integer, db.ForeignKey('hospitals.id'), nullable=False, index=True)
+    department_id = db.Column(db.Integer, db.ForeignKey('departments.id'), nullable=True, index=True)
+    patient_id = db.Column(db.Integer, db.ForeignKey('patients.id'), nullable=True, index=True)
+    
+    # ✅ What kind of transaction
+    record_type = db.Column(db.String(50), nullable=False, index=True)
+    # 'service_billed', 'payment_received', 'insurance_claim', 'refund', 'adjustment'
+    
+    # ✅ Payer information
+    payer_type = db.Column(db.String(50), nullable=False)
+    # 'insurance', 'self_pay', 'government', 'corporate'
+    payer_name = db.Column(db.String(200), nullable=True)
+    
+    # ✅ Amounts
+    amount = db.Column(db.Numeric(12, 2), nullable=False)
+    currency = db.Column(db.String(10), default='USD')
+    
+    # ✅ References
+    invoice_number = db.Column(db.String(100), index=True)
+    claim_number = db.Column(db.String(100), index=True)
+    description = db.Column(db.Text)
+    
+    # ✅ Status
+    status = db.Column(db.String(50), default='pending', index=True)
+    # 'pending', 'paid', 'overdue', 'rejected', 'cancelled'
+    
+    # ✅ Dates
+    service_date = db.Column(db.DateTime, nullable=False, index=True)
+    due_date = db.Column(db.DateTime, nullable=True)
+    paid_date = db.Column(db.DateTime, nullable=True)
+    
+    # ✅ Audit
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    created_by = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=True)
+    
+    # Relationships
+    hospital = db.relationship('Hospital', backref='financial_records')
+    department = db.relationship('Department', backref='financial_records')
+    patient = db.relationship('Patient', backref='financial_records')
+    creator = db.relationship('User', foreign_keys=[created_by])
+    
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'hospital_id': self.hospital_id,
+            'department_id': self.department_id,
+            'patient_id': self.patient_id,
+            'record_type': self.record_type,
+            'payer_type': self.payer_type,
+            'payer_name': self.payer_name,
+            'amount': float(self.amount) if self.amount else 0,
+            'currency': self.currency,
+            'invoice_number': self.invoice_number,
+            'claim_number': self.claim_number,
+            'description': self.description,
+            'status': self.status,
+            'service_date': self.service_date.isoformat() if self.service_date else None,
+            'due_date': self.due_date.isoformat() if self.due_date else None,
+            'paid_date': self.paid_date.isoformat() if self.paid_date else None,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+        }
 
 __all__ = [
     # Core models
@@ -7792,7 +7858,7 @@ __all__ = [
     'WitnessStatement', 'InvestigationTeamMember', 'IncidentAuditLog',
      'LessonLearned', 'LessonReaction',
     'EscalationRule', 'EscalationHistory', 'IncidentCost', 'RegulatoryFiling', 'FishboneVersion', 'FishboneFiveWhys', 'AIAssistantSession', 'AIAssistantMessage', 
-    'SimilarIncidentMatch', 'IncidentComparison', 'IncidentClusterAnalysis', 'PredictiveAnalyticsRun', 'PredictiveScenario', 'AIGenerationLog', 'EnvironmentalSite', 
+    'SimilarIncidentMatch', 'IncidentComparison', 'IncidentClusterAnalysis', 'PredictiveAnalyticsRun', 'PredictiveScenario', 'AIGenerationLog', 'EnvironmentalSite', 'HospitalFinancialRecord',
     
 ]
 
