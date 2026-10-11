@@ -2972,6 +2972,7 @@ def create_app():
     socketio.init_app(
         app,
         async_mode='gevent',
+        cors_allowed_origins=ALLOWED_ORIGINS,
         logger=True,
         engineio_logger=True
     )
