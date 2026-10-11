@@ -112569,6 +112569,410 @@ def enable_hospital_ai_service(hospital_id):
         }), 500
 
 
+@app.route('/api/hospital/<hospital_id>/financial', methods=['POST'])
+@jwt_required
+@validate_healthcare_headers
+def create_financial_record(hospital_id):
+    """Create a new financial record (bill, payment, claim)"""
+    try:
+        healthcare_context = get_healthcare_context()
+        
+        if not has_feature_access('hospital_management'):
+            return jsonify({
+                'success': False,
+                'error': 'Hospital management not available',
+                'code': 'FEATURE_NOT_AVAILABLE'
+            }), 403
+        
+        is_super_admin = check_super_admin()
+        if not (is_super_admin or request.user.user_type in ['admin', 'hospital_admin', 'accountant']):
+            return jsonify({
+                'success': False,
+                'error': 'Insufficient permissions',
+                'code': 'PERMISSION_DENIED'
+            }), 403
+        
+        hospital = Hospital.query.get(hospital_id)
+        if not hospital:
+            return jsonify({'success': False, 'error': 'Hospital not found'}), 404
+        
+        if not is_super_admin and str(request.user.hospital_id) != str(hospital_id):
+            return jsonify({'success': False, 'error': 'Access denied'}), 403
+        
+        data = request.get_json()
+        
+        # ✅ Validate required fields
+        required = ['record_type', 'payer_type', 'amount', 'service_date']
+        for field in required:
+            if field not in data:
+                return jsonify({
+                    'success': False,
+                    'error': f'Missing required field: {field}',
+                    'code': 'MISSING_FIELD'
+                }), 400
+        
+        # ✅ Parse service_date
+        try:
+            service_date = datetime.fromisoformat(data['service_date'].replace('Z', '+00:00'))
+        except:
+            return jsonify({
+                'success': False,
+                'error': 'Invalid service_date format',
+                'code': 'INVALID_DATE'
+            }), 400
+        
+        # ✅ Parse optional due_date
+        due_date = None
+        if data.get('due_date'):
+            try:
+                due_date = datetime.fromisoformat(data['due_date'].replace('Z', '+00:00'))
+            except:
+                pass
+        
+        # ✅ Create record
+        record = HospitalFinancialRecord(
+            hospital_id=hospital_id,
+            department_id=data.get('department_id'),
+            patient_id=data.get('patient_id'),
+            record_type=data['record_type'],
+            payer_type=data['payer_type'],
+            payer_name=data.get('payer_name'),
+            amount=data['amount'],
+            currency=data.get('currency', 'USD'),
+            invoice_number=data.get('invoice_number'),
+            claim_number=data.get('claim_number'),
+            description=data.get('description'),
+            status=data.get('status', 'pending'),
+            service_date=service_date,
+            due_date=due_date,
+            paid_date=datetime.utcnow() if data.get('status') == 'paid' else None,
+            created_by=request.user.id
+        )
+        
+        db.session.add(record)
+        db.session.commit()
+        
+        current_app.logger.info(f"Financial record created: {record.id} by {request.user.email}")
+        
+        return jsonify({
+            'success': True,
+            'message': 'Financial record created successfully',
+            'data': record.to_dict(),
+            'healthcare_context': healthcare_context
+        }), 201
+        
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"Financial record creation error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            'success': False,
+            'error': 'Internal server error',
+            'code': 'INTERNAL_ERROR'
+        }), 500
+
+@app.route('/api/hospital/<hospital_id>/financial/records', methods=['GET'])
+@jwt_required
+@validate_healthcare_headers
+def list_financial_records(hospital_id):
+    """List all financial records for a hospital"""
+    try:
+        healthcare_context = get_healthcare_context()
+        
+        if not has_feature_access('hospital_management'):
+            return jsonify({'success': False, 'error': 'Feature not available'}), 403
+        
+        hospital = Hospital.query.get(hospital_id)
+        if not hospital:
+            return jsonify({'success': False, 'error': 'Hospital not found'}), 404
+        
+        is_super_admin = check_super_admin()
+        if not is_super_admin and str(request.user.hospital_id) != str(hospital_id):
+            return jsonify({'success': False, 'error': 'Access denied'}), 403
+        
+        # ✅ Pagination
+        page = int(request.args.get('page', 1))
+        limit = min(int(request.args.get('limit', 50)), 100)
+        offset = (page - 1) * limit
+        
+        # ✅ Filters
+        query = HospitalFinancialRecord.query.filter_by(hospital_id=hospital_id)
+        
+        if request.args.get('record_type'):
+            query = query.filter_by(record_type=request.args['record_type'])
+        if request.args.get('status'):
+            query = query.filter_by(status=request.args['status'])
+        if request.args.get('payer_type'):
+            query = query.filter_by(payer_type=request.args['payer_type'])
+        
+        total = query.count()
+        records = query.order_by(
+            HospitalFinancialRecord.service_date.desc()
+        ).limit(limit).offset(offset).all()
+        
+        return jsonify({
+            'success': True,
+            'data': [r.to_dict() for r in records],
+            'pagination': {
+                'page': page,
+                'limit': limit,
+                'total': total,
+                'pages': (total + limit - 1) // limit
+            },
+            'healthcare_context': healthcare_context
+        }), 200
+        
+    except Exception as e:
+        current_app.logger.error(f"List financial records error: {str(e)}")
+        return jsonify({'success': False, 'error': 'Internal server error'}), 500
+
+@app.route('/api/hospital/<hospital_id>/financial/<int:record_id>', methods=['PUT'])
+@jwt_required
+@validate_healthcare_headers
+def update_financial_record(hospital_id, record_id):
+    """Update a financial record (e.g., mark as paid)"""
+    try:
+        healthcare_context = get_healthcare_context()
+        
+        if not has_feature_access('hospital_management'):
+            return jsonify({'success': False, 'error': 'Feature not available'}), 403
+        
+        is_super_admin = check_super_admin()
+        if not (is_super_admin or request.user.user_type in ['admin', 'hospital_admin', 'accountant']):
+            return jsonify({'success': False, 'error': 'Insufficient permissions'}), 403
+        
+        record = HospitalFinancialRecord.query.filter_by(
+            id=record_id,
+            hospital_id=hospital_id
+        ).first()
+        
+        if not record:
+            return jsonify({'success': False, 'error': 'Record not found'}), 404
+        
+        data = request.get_json()
+        
+        # Update allowed fields
+        allowed = ['status', 'amount', 'description', 'payer_type', 'payer_name', 
+                   'department_id', 'patient_id', 'invoice_number', 'claim_number']
+        for field in allowed:
+            if field in data:
+                setattr(record, field, data[field])
+        
+        # If marking as paid, set paid_date
+        if data.get('status') == 'paid' and not record.paid_date:
+            record.paid_date = datetime.utcnow()
+        
+        db.session.commit()
+        
+        return jsonify({
+            'success': True,
+            'message': 'Record updated',
+            'data': record.to_dict()
+        }), 200
+        
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"Update financial record error: {str(e)}")
+        return jsonify({'success': False, 'error': 'Internal server error'}), 500
+
+@app.route('/api/hospital/<hospital_id>/financial/<int:record_id>', methods=['DELETE'])
+@jwt_required
+@validate_healthcare_headers
+def delete_financial_record(hospital_id, record_id):
+    """Delete a financial record"""
+    try:
+        if not has_feature_access('hospital_management'):
+            return jsonify({'success': False, 'error': 'Feature not available'}), 403
+        
+        is_super_admin = check_super_admin()
+        if not (is_super_admin or request.user.user_type in ['admin', 'hospital_admin', 'accountant']):
+            return jsonify({'success': False, 'error': 'Insufficient permissions'}), 403
+        
+        record = HospitalFinancialRecord.query.filter_by(
+            id=record_id,
+            hospital_id=hospital_id
+        ).first()
+        
+        if not record:
+            return jsonify({'success': False, 'error': 'Record not found'}), 404
+        
+        db.session.delete(record)
+        db.session.commit()
+        
+        return jsonify({'success': True, 'message': 'Record deleted'}), 200
+        
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"Delete financial record error: {str(e)}")
+        return jsonify({'success': False, 'error': 'Internal server error'}), 500
+
+
+@app.route('/api/hospital/<hospital_id>/financial', methods=['GET'])
+@jwt_required
+@validate_healthcare_headers
+def get_hospital_financial(hospital_id):
+    """Get aggregated financial data for a hospital"""
+    try:
+        healthcare_context = get_healthcare_context()
+        current_app.logger.info(f"Financial request: hospital {hospital_id} by {request.user.email}")
+        
+        # ✅ Plan check
+        if not has_feature_access('hospital_management'):
+            return jsonify({
+                'success': False,
+                'error': 'Hospital management not available in your plan',
+                'code': 'FEATURE_NOT_AVAILABLE',
+                'healthcare_context': healthcare_context
+            }), 403
+        
+        # ✅ Hospital exists?
+        hospital = Hospital.query.get(hospital_id)
+        if not hospital:
+            return jsonify({
+                'success': False,
+                'error': 'Hospital not found',
+                'code': 'HOSPITAL_NOT_FOUND'
+            }), 404
+        
+        # ✅ Permission check
+        is_super_admin = check_super_admin()
+        if not is_super_admin and str(request.user.hospital_id) != str(hospital_id):
+            return jsonify({
+                'success': False,
+                'error': 'Access denied to this hospital',
+                'code': 'PERMISSION_DENIED'
+            }), 403
+        
+        # ============================================
+        # AGGREGATE FINANCIAL DATA
+        # ============================================
+        
+        # ✅ Date range — current year
+        year_start = datetime(datetime.utcnow().year, 1, 1)
+        
+        # ✅ Total revenue (completed payments)
+        total_revenue = db.session.query(
+            func.coalesce(func.sum(HospitalFinancialRecord.amount), 0)
+        ).filter(
+            HospitalFinancialRecord.hospital_id == hospital_id,
+            HospitalFinancialRecord.record_type == 'payment_received',
+            HospitalFinancialRecord.status == 'paid',
+            HospitalFinancialRecord.service_date >= year_start
+        ).scalar() or 0
+        
+        # ✅ Outstanding receivables (billed but not paid)
+        outstanding = db.session.query(
+            func.coalesce(func.sum(HospitalFinancialRecord.amount), 0)
+        ).filter(
+            HospitalFinancialRecord.hospital_id == hospital_id,
+            HospitalFinancialRecord.record_type == 'service_billed',
+            HospitalFinancialRecord.status.in_(['pending', 'overdue']),
+            HospitalFinancialRecord.service_date >= year_start
+        ).scalar() or 0
+        
+        # ✅ Total billed for collection rate
+        total_billed = db.session.query(
+            func.coalesce(func.sum(HospitalFinancialRecord.amount), 0)
+        ).filter(
+            HospitalFinancialRecord.hospital_id == hospital_id,
+            HospitalFinancialRecord.record_type == 'service_billed',
+            HospitalFinancialRecord.service_date >= year_start
+        ).scalar() or 0
+        
+        collection_rate = 0
+        if total_billed > 0:
+            collection_rate = round((float(total_revenue) / float(total_billed)) * 100, 1)
+        
+        # ✅ Pending claims (insurance)
+        pending_claims = db.session.query(
+            func.count(HospitalFinancialRecord.id)
+        ).filter(
+            HospitalFinancialRecord.hospital_id == hospital_id,
+            HospitalFinancialRecord.record_type == 'insurance_claim',
+            HospitalFinancialRecord.status == 'pending',
+            HospitalFinancialRecord.service_date >= year_start
+        ).scalar() or 0
+        
+        # ✅ Revenue by department
+        revenue_by_dept_query = db.session.query(
+            Department.name,
+            func.coalesce(func.sum(HospitalFinancialRecord.amount), 0).label('total')
+        ).join(
+            HospitalFinancialRecord,
+            HospitalFinancialRecord.department_id == Department.id
+        ).filter(
+            HospitalFinancialRecord.hospital_id == hospital_id,
+            HospitalFinancialRecord.record_type == 'payment_received',
+            HospitalFinancialRecord.status == 'paid',
+            HospitalFinancialRecord.service_date >= year_start
+        ).group_by(Department.name).all()
+        
+        revenue_by_department = [
+            {'label': name, 'value': float(total)}
+            for name, total in revenue_by_dept_query
+        ]
+        
+        # ✅ Payer mix (% by payer type)
+        payer_mix_query = db.session.query(
+            HospitalFinancialRecord.payer_type,
+            func.coalesce(func.sum(HospitalFinancialRecord.amount), 0).label('total')
+        ).filter(
+            HospitalFinancialRecord.hospital_id == hospital_id,
+            HospitalFinancialRecord.record_type == 'payment_received',
+            HospitalFinancialRecord.status == 'paid',
+            HospitalFinancialRecord.service_date >= year_start
+        ).group_by(HospitalFinancialRecord.payer_type).all()
+        
+        total_payer_amount = sum(float(t) for _, t in payer_mix_query) or 1
+        
+        payer_colors = {
+            'insurance': '#1890ff',
+            'self_pay': '#52c41a',
+            'government': '#faad14',
+            'corporate': '#722ed1'
+        }
+        payer_labels = {
+            'insurance': 'Insurance',
+            'self_pay': 'Self-Pay',
+            'government': 'Government',
+            'corporate': 'Corporate'
+        }
+        
+        payer_mix = [
+            {
+                'label': payer_labels.get(ptype, ptype.replace('_', ' ').title()),
+                'percentage': round((float(total) / total_payer_amount) * 100, 1),
+                'color': payer_colors.get(ptype, '#888')
+            }
+            for ptype, total in payer_mix_query
+        ]
+        
+        return jsonify({
+            'success': True,
+            'data': {
+                'totalRevenue': float(total_revenue),
+                'outstandingReceivables': float(outstanding),
+                'collectionRate': collection_rate,
+                'pendingClaims': int(pending_claims),
+                'revenueByDepartment': revenue_by_department,
+                'payerMix': payer_mix,
+                'currency': 'USD',
+                'periodStart': year_start.isoformat(),
+                'periodEnd': datetime.utcnow().isoformat()
+            },
+            'healthcare_context': healthcare_context
+        }), 200
+        
+    except Exception as e:
+        current_app.logger.error(f"Financial data error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            'success': False,
+            'error': 'Internal server error',
+            'code': 'INTERNAL_ERROR'
+        }), 500
 
 
 @app.route('/api/hospital/<int:hospital_id>/ai-services', methods=['GET'])
