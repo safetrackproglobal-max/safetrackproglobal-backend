@@ -7489,6 +7489,99 @@ class HospitalFinancialRecord(db.Model):
             'paid_date': self.paid_date.isoformat() if self.paid_date else None,
             'created_at': self.created_at.isoformat() if self.created_at else None,
         }
+
+
+class PlatformActivityLog(db.Model):
+    """Platform-wide user activity tracking"""
+    __tablename__ = 'platform_activity_log'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id', ondelete='SET NULL'), nullable=True)
+    hospital_id = db.Column(db.Integer, db.ForeignKey('hospitals.id', ondelete='SET NULL'), nullable=True)
+    
+    activity_type = db.Column(db.String(50), nullable=False, index=True)
+    category = db.Column(db.String(50), index=True)
+    description = db.Column(db.Text)
+    resource_type = db.Column(db.String(50))
+    resource_id = db.Column(db.Integer)
+    
+    ip_address = db.Column(db.String(45))
+    user_agent = db.Column(db.Text)
+    device_type = db.Column(db.String(50))
+    location = db.Column(db.String(200))
+    
+    status = db.Column(db.String(50), default='success')
+    severity = db.Column(db.String(20), default='low')
+    
+    extra_data = db.Column(db.JSON)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    
+    user = db.relationship('User', foreign_keys=[user_id])
+    company = db.relationship('Company', foreign_keys=[company_id])
+    hospital = db.relationship('Hospital', foreign_keys=[hospital_id])
+    
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'user_id': self.user_id,
+            'user_name': self.user.name if self.user else 'System',
+            'user_email': self.user.email if self.user else None,
+            'company_id': self.company_id,
+            'company_name': self.company.name if self.company else None,
+            'hospital_id': self.hospital_id,
+            'hospital_name': self.hospital.name if self.hospital else None,
+            'activity_type': self.activity_type,
+            'category': self.category,
+            'description': self.description,
+            'resource_type': self.resource_type,
+            'resource_id': self.resource_id,
+            'ip_address': self.ip_address,
+            'user_agent': self.user_agent,
+            'device_type': self.device_type,
+            'location': self.location,
+            'status': self.status,
+            'severity': self.severity,
+            'extra_data': self.extra_data,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+class PlatformSessionTracking(db.Model):
+    """Track active user sessions platform-wide"""
+    __tablename__ = 'platform_session_tracking'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
+    session_token = db.Column(db.String(255), nullable=False)
+    
+    ip_address = db.Column(db.String(45))
+    user_agent = db.Column(db.Text)
+    device_type = db.Column(db.String(50))
+    location = db.Column(db.String(200))
+    
+    started_at = db.Column(db.DateTime, default=datetime.utcnow)
+    last_seen_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    expires_at = db.Column(db.DateTime)
+    is_active = db.Column(db.Boolean, default=True, index=True)
+    
+    user = db.relationship('User', foreign_keys=[user_id])
+    
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'user_id': self.user_id,
+            'user_name': self.user.name if self.user else None,
+            'user_email': self.user.email if self.user else None,
+            'ip_address': self.ip_address,
+            'device_type': self.device_type,
+            'location': self.location,
+            'started_at': self.started_at.isoformat() if self.started_at else None,
+            'last_seen_at': self.last_seen_at.isoformat() if self.last_seen_at else None,
+            'is_active': self.is_active,
+        }
+
+
 __all__ = [
     # Core models
     'Industry',
@@ -7840,6 +7933,7 @@ __all__ = [
      'LessonLearned', 'LessonReaction',
     'EscalationRule', 'EscalationHistory', 'IncidentCost', 'RegulatoryFiling', 'FishboneVersion', 'FishboneFiveWhys', 'AIAssistantSession', 'AIAssistantMessage', 
     'SimilarIncidentMatch', 'IncidentComparison', 'IncidentClusterAnalysis', 'PredictiveAnalyticsRun', 'PredictiveScenario', 'AIGenerationLog', 'EnvironmentalSite', 'HospitalFinancialRecord',
+     'PlatformActivityLog', 'PlatformSessionTracking', 
     
 ]
 
