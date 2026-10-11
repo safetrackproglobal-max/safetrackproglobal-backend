@@ -7442,50 +7442,32 @@ class EnvironmentalSite(db.Model):
         return f'<EnvironmentalSite {self.id} {self.name}>'
         
 class HospitalFinancialRecord(db.Model):
-    """Hospital patient billing & revenue tracking"""
     __tablename__ = 'hospital_financial_records'
     
     id = db.Column(db.Integer, primary_key=True)
-    hospital_id = db.Column(db.Integer, db.ForeignKey('hospitals.id'), nullable=False, index=True)
-    department_id = db.Column(db.Integer, db.ForeignKey('departments.id'), nullable=True, index=True)
-    patient_id = db.Column(db.Integer, db.ForeignKey('patients.id'), nullable=True, index=True)
+    hospital_id = db.Column(db.Integer, db.ForeignKey('hospitals.id', ondelete='CASCADE'), nullable=False)
+    department_id = db.Column(db.Integer, db.ForeignKey('departments.id', ondelete='SET NULL'), nullable=True)
+    patient_id = db.Column(db.Integer, db.ForeignKey('patients.id', ondelete='SET NULL'), nullable=True)
     
-    # ✅ What kind of transaction
-    record_type = db.Column(db.String(50), nullable=False, index=True)
-    # 'service_billed', 'payment_received', 'insurance_claim', 'refund', 'adjustment'
-    
-    # ✅ Payer information
+    record_type = db.Column(db.String(50), nullable=False)
     payer_type = db.Column(db.String(50), nullable=False)
-    # 'insurance', 'self_pay', 'government', 'corporate'
     payer_name = db.Column(db.String(200), nullable=True)
     
-    # ✅ Amounts
     amount = db.Column(db.Numeric(12, 2), nullable=False)
     currency = db.Column(db.String(10), default='USD')
     
-    # ✅ References
-    invoice_number = db.Column(db.String(100), index=True)
-    claim_number = db.Column(db.String(100), index=True)
-    description = db.Column(db.Text)
+    invoice_number = db.Column(db.String(100), nullable=True)
+    claim_number = db.Column(db.String(100), nullable=True)
+    description = db.Column(db.Text, nullable=True)
     
-    # ✅ Status
-    status = db.Column(db.String(50), default='pending', index=True)
-    # 'pending', 'paid', 'overdue', 'rejected', 'cancelled'
+    status = db.Column(db.String(50), default='pending')
     
-    # ✅ Dates
-    service_date = db.Column(db.DateTime, nullable=False, index=True)
+    service_date = db.Column(db.DateTime, nullable=False)
     due_date = db.Column(db.DateTime, nullable=True)
     paid_date = db.Column(db.DateTime, nullable=True)
     
-    # ✅ Audit
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    created_by = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=True)
-    
-    # Relationships
-    hospital = db.relationship('Hospital', backref='financial_records')
-    department = db.relationship('Department', backref='financial_records')
-    patient = db.relationship('Patient', backref='financial_records')
-    creator = db.relationship('User', foreign_keys=[created_by])
+    created_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
     
     def to_dict(self):
         return {
@@ -7507,7 +7489,6 @@ class HospitalFinancialRecord(db.Model):
             'paid_date': self.paid_date.isoformat() if self.paid_date else None,
             'created_at': self.created_at.isoformat() if self.created_at else None,
         }
-
 __all__ = [
     # Core models
     'Industry',
