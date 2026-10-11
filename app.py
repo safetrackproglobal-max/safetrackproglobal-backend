@@ -6115,84 +6115,7 @@ def init_medical_ai():
     return medical_ai
 
 
-def debug_middleware():
-    """Global debug middleware to trace ALL requests"""
-    @app.before_request
-    def log_request_details():
-        print("\n" + "="*80)
-        print("🔄 INCOMING REQUEST DEBUG")
-        print("="*80)
-        print(f"📅 Time: {datetime.utcnow().isoformat()}")
-        print(f"🌐 Endpoint: {request.endpoint or 'NO ENDPOINT'}")
-        print(f"🔗 Path: {request.path}")
-        print(f"📋 Method: {request.method}")
-        print(f"📍 Remote Addr: {request.remote_addr}")
-        
-        # Headers
-        print("\n📨 REQUEST HEADERS:")
-        for key, value in request.headers.items():
-            if key.lower() == 'authorization':
-                print(f"  {key}: {value[:50]}... (Length: {len(value)})")
-            else:
-                print(f"  {key}: {value}")
-        
-        # Body for POST/PUT
-        if request.method in ['POST', 'PUT', 'PATCH']:
-            print(f"\n📝 REQUEST BODY:")
-            try:
-                if request.is_json:
-                    print(f"  JSON: {request.get_json(silent=True)}")
-                elif request.form:
-                    print(f"  Form: {dict(request.form)}")
-                elif request.data:
-                    print(f"  Raw Data (first 500 chars): {request.data[:500]}")
-            except Exception as e:
-                print(f"  ❌ Error reading body: {e}")
-        
-        # Query parameters
-        if request.args:
-            print(f"\n🔍 QUERY PARAMETERS: {dict(request.args)}")
-        
-        print("="*80 + "\n")
-    
-    @app.after_request
-    def log_response_details(response):
-        print("\n" + "="*80)
-        print("📤 RESPONSE DEBUG")
-        print("="*80)
-        print(f"📅 Time: {datetime.utcnow().isoformat()}")
-        print(f"🔗 Path: {request.path}")
-        print(f"📋 Method: {request.method}")
-        print(f"✅ Status: {response.status_code}")
-        print(f"📏 Size: {response.content_length or len(response.get_data())} bytes")
-        
-        # Response headers
-        print("\n📨 RESPONSE HEADERS:")
-        for key, value in response.headers.items():
-            print(f"  {key}: {value}")
-        
-        # Response body preview
-        try:
-            if response.is_json:
-                data = response.get_json()
-                print(f"\n📝 RESPONSE BODY (JSON):")
-                print(f"  {data}")
-            elif response.mimetype == 'text/html':
-                print(f"\n📝 RESPONSE BODY (HTML preview):")
-                body = response.get_data(as_text=True)[:500]
-                print(f"  {body}...")
-            else:
-                print(f"\n📝 RESPONSE BODY (Raw preview):")
-                body = response.get_data()[:500]
-                print(f"  {body}...")
-        except Exception as e:
-            print(f"\n📝 RESPONSE BODY: Could not parse - {e}")
-        
-        print("="*80 + "\n")
-        return response
 
-# Initialize debug middleware
-debug_middleware()
 
 def jwt_required(f):
     """
@@ -18931,7 +18854,6 @@ def debug_health():
 @app.route('/api/debug/database', methods=['GET'])
 def debug_database():
     try:
-        # Test a simple query
         user_count = db.session.query(User).count()
         return jsonify({'status': 'healthy', 'user_count': user_count}), 200
     except Exception as e:
@@ -18958,7 +18880,7 @@ def debug_routes():
             'methods': list(rule.methods),
             'path': str(rule)
         })
-    return jsonify({'routes': routes}), 200 
+    return jsonify({'routes': routes}), 200
 
 @app.route('/api/debug/config', methods=['GET'])
 def debug_config():
@@ -18966,30 +18888,18 @@ def debug_config():
         'DEBUG': app.config.get('DEBUG'),
         'TESTING': app.config.get('TESTING'),
         'JWT_SECRET_KEY_SET': bool(app.config.get('JWT_SECRET_KEY')),
-        'SQLALCHEMY_DATABASE_URI': app.config.get('SQLALCHEMY_DATABASE_URI'),
+        # ❌ Removed SQLALCHEMY_DATABASE_URI — leaks DB password
     }
     return jsonify(config), 200
 
-@app.before_request
-def before_request_debug():
-    print(f"🔄 Incoming request: {request.method} {request.path}")
-
-@app.after_request
-def after_request_debug(response):
-    print(f"📤 Response: {response.status_code} for {request.method} {request.path}")
-    return response
-
 @app.errorhandler(422)
 def handle_422(error):
-    print(f"❌ 422 Error: {error}")
-    print(f"❌ Request: {request.method} {request.path}")
-    print(f"❌ Headers: {dict(request.headers)}")
+    app.logger.warning(f"422 on {request.method} {request.path}: {error}")
     return jsonify({
         'success': False,
         'error': 'Unprocessable Entity',
         'message': 'There was an error processing your request'
-    }), 422   
-
+    }), 422
 
 @app.route('/api/incidents', methods=['GET'])
 @jwt_required
