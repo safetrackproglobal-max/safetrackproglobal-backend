@@ -114413,24 +114413,50 @@ def get_security_events():
 @app.route('/api/admin/activity/chart', methods=['GET'])
 @jwt_required
 def get_activity_chart():
-    """Activity trend chart"""
+    """Activity trend chart - last N days"""
     try:
         if not check_super_admin():
             return jsonify({'success': False, 'error': 'Access denied'}), 403
+
         days = int(request.args.get('days', 7))
         since = datetime.utcnow() - timedelta(days=days)
+
+        # ✅ Use DATE() cast instead of date_trunc — more reliable
+        from sqlalchemy import cast, Date
+
         results = db.session.query(
-            func.date_trunc('day', PlatformActivityLog.created_at).label('day'),
+            cast(PlatformActivityLog.created_at, Date).label('day'),
             func.count(PlatformActivityLog.id).label('count')
-        ).filter(PlatformActivityLog.created_at >= since).group_by(
-            func.date_trunc('day', PlatformActivityLog.created_at)
-        ).order_by('day').all()
+        ).filter(
+            PlatformActivityLog.created_at >= since
+        ).group_by(
+            cast(PlatformActivityLog.created_at, Date)
+        ).order_by(
+            cast(PlatformActivityLog.created_at, Date)
+        ).all()
+
+        chart_data = []
+        for day, count in results:
+            chart_data.append({
+                'date': day.isoformat() if day else None,
+                'count': int(count or 0)
+            })
+
         return jsonify({
             'success': True,
-            'data': [{'date': r.day.isoformat(), 'count': r.count} for r in results]
+            'data': chart_data
         }), 200
+
     except Exception as e:
-        return jsonify({'success': False, 'error': 'Internal server error'}), 500
+        # ✅ Log the actual error
+        current_app.logger.error(f"Activity chart error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            'success': False,
+            'error': str(e),
+            'data': []
+        }), 500
 
 
 @app.route('/api/admin/activity/sessions', methods=['GET'])
