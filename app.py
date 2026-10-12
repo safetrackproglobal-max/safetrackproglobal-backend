@@ -114276,6 +114276,267 @@ def hospital_ai_analytics(hospital_id):
             'healthcare_context': healthcare_context if 'healthcare_context' in locals() else {}
         }), 500
 
+
+
+
+# ============================================
+# COMMAND CENTER ENDPOINTS
+# ============================================
+
+@app.route('/api/admin/activity', methods=['GET'])
+@jwt_required
+def get_platform_activity():
+    """Platform-wide activity log"""
+    try:
+        if not check_super_admin():
+            return jsonify({'success': False, 'error': 'Access denied'}), 403
+        
+        page = int(request.args.get('page', 1))
+        limit = min(int(request.args.get('limit', 50)), 200)
+        offset = (page - 1) * limit
+        
+        query = PlatformActivityLog.query
+        
+        if request.args.get('activity_type'):
+            query = query.filter_by(activity_type=request.args['activity_type'])
+        if request.args.get('category'):
+            query = query.filter_by(category=request.args['category'])
+        if request.args.get('status'):
+            query = query.filter_by(status=request.args['status'])
+        if request.args.get('severity'):
+            query = query.filter_by(severity=request.args['severity'])
+        if request.args.get('user_id'):
+            query = query.filter_by(user_id=request.args['user_id'])
+        if request.args.get('company_id'):
+            query = query.filter_by(company_id=request.args['company_id'])
+        
+        if request.args.get('search'):
+            s = f"%{request.args['search']}%"
+            query = query.filter(or_(
+                PlatformActivityLog.description.ilike(s),
+                PlatformActivityLog.ip_address.ilike(s)
+            ))
+        
+        if request.args.get('start_date'):
+            query = query.filter(PlatformActivityLog.created_at >= datetime.fromisoformat(request.args['start_date']))
+        if request.args.get('end_date'):
+            query = query.filter(PlatformActivityLog.created_at <= datetime.fromisoformat(request.args['end_date']))
+        
+        total = query.count()
+        activities = query.order_by(PlatformActivityLog.created_at.desc()).limit(limit).offset(offset).all()
+        
+        since_24h = datetime.utcnow() - timedelta(hours=24)
+        since_7d = datetime.utcnow() - timedelta(days=7)
+        
+        stats = {
+            'total_events_24h': PlatformActivityLog.query.filter(PlatformActivityLog.created_at >= since_24h).count(),
+            'active_users_24h': db.session.query(func.count(func.distinct(PlatformActivityLog.user_id))).filter(
+                PlatformActivityLog.created_at >= since_24h,
+                PlatformActivityLog.activity_type == 'login',
+                PlatformActivityLog.user_id.isnot(None)
+            ).scalar() or 0,
+            'failed_logins_24h': PlatformActivityLog.query.filter(
+                PlatformActivityLog.created_at >= since_24h,
+                PlatformActivityLog.activity_type == 'failed_login'
+            ).count(),
+            'security_alerts_7d': PlatformActivityLog.query.filter(
+                PlatformActivityLog.created_at >= since_7d,
+                PlatformActivityLog.severity.in_(['high', 'critical'])
+            ).count(),
+            'suspicious_activity_7d': PlatformActivityLog.query.filter(
+                PlatformActivityLog.created_at >= since_7d,
+                PlatformActivityLog.activity_type == 'suspicious_activity'
+            ).count(),
+            'total_users': db.session.query(func.count(func.distinct(PlatformActivityLog.user_id))).scalar() or 0,
+            'total_companies': db.session.query(func.count(func.distinct(PlatformActivityLog.company_id))).filter(
+                PlatformActivityLog.company_id.isnot(None)
+            ).scalar() or 0,
+        }
+        
+        return jsonify({
+            'success': True,
+            'data': [a.to_dict() for a in activities],
+            'stats': stats,
+            'pagination': {'page': page, 'limit': limit, 'total': total, 'pages': (total + limit - 1) // limit}
+        }), 200
+    except Exception as e:
+        current_app.logger.error(f"Activity error: {str(e)}")
+        return jsonify({'success': False, 'error': 'Internal server error'}), 500
+
+
+@app.route('/api/admin/activity', methods=['POST'])
+@jwt_required
+def log_platform_activity():
+    """Log activity"""
+    try:
+        data = request.get_json() or {}
+        activity = PlatformActivityLog(
+            user_id=request.user.id if hasattr(request, 'user') else None,
+            company_id=getattr(request.user, 'company_id', None),
+            hospital_id=getattr(request.user, 'hospital_id', None),
+            activity_type=data.get('activity_type', 'unknown'),
+            category=data.get('category'),
+            description=data.get('description'),
+            resource_type=data.get('resource_type'),
+            resource_id=data.get('resource_id'),
+            ip_address=request.remote_addr,
+            user_agent=request.headers.get('User-Agent'),
+            device_type=data.get('device_type'),
+            location=data.get('location'),
+            status=data.get('status', 'success'),
+            severity=data.get('severity', 'low'),
+            extra_data=data.get('extra_data')
+        )
+        db.session.add(activity)
+        db.session.commit()
+        return jsonify({'success': True, 'data': activity.to_dict()}), 201
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'success': False, 'error': 'Internal server error'}), 500
+
+
+@app.route('/api/admin/activity/security-events', methods=['GET'])
+@jwt_required
+def get_security_events():
+    """High-severity events"""
+    try:
+        if not check_super_admin():
+            return jsonify({'success': False, 'error': 'Access denied'}), 403
+        events = PlatformActivityLog.query.filter(
+            PlatformActivityLog.severity.in_(['high', 'critical'])
+        ).order_by(PlatformActivityLog.created_at.desc()).limit(100).all()
+        return jsonify({'success': True, 'data': [e.to_dict() for e in events]}), 200
+    except Exception as e:
+        return jsonify({'success': False, 'error': 'Internal server error'}), 500
+
+
+@app.route('/api/admin/activity/chart', methods=['GET'])
+@jwt_required
+def get_activity_chart():
+    """Activity trend chart"""
+    try:
+        if not check_super_admin():
+            return jsonify({'success': False, 'error': 'Access denied'}), 403
+        days = int(request.args.get('days', 7))
+        since = datetime.utcnow() - timedelta(days=days)
+        results = db.session.query(
+            func.date_trunc('day', PlatformActivityLog.created_at).label('day'),
+            func.count(PlatformActivityLog.id).label('count')
+        ).filter(PlatformActivityLog.created_at >= since).group_by(
+            func.date_trunc('day', PlatformActivityLog.created_at)
+        ).order_by('day').all()
+        return jsonify({
+            'success': True,
+            'data': [{'date': r.day.isoformat(), 'count': r.count} for r in results]
+        }), 200
+    except Exception as e:
+        return jsonify({'success': False, 'error': 'Internal server error'}), 500
+
+
+@app.route('/api/admin/activity/sessions', methods=['GET'])
+@jwt_required
+def get_active_sessions():
+    """Currently active sessions"""
+    try:
+        if not check_super_admin():
+            return jsonify({'success': False, 'error': 'Access denied'}), 403
+        # Active = seen in last 15 minutes
+        since = datetime.utcnow() - timedelta(minutes=15)
+        sessions = PlatformSessionTracking.query.filter(
+            PlatformSessionTracking.is_active == True,
+            PlatformSessionTracking.last_seen_at >= since
+        ).order_by(PlatformSessionTracking.last_seen_at.desc()).limit(100).all()
+        return jsonify({
+            'success': True,
+            'data': [s.to_dict() for s in sessions]
+        }), 200
+    except Exception as e:
+        return jsonify({'success': False, 'error': 'Internal server error'}), 500
+
+
+@app.route('/api/admin/activity/top-users', methods=['GET'])
+@jwt_required
+def get_top_active_users():
+    """Most active users"""
+    try:
+        if not check_super_admin():
+            return jsonify({'success': False, 'error': 'Access denied'}), 403
+        days = int(request.args.get('days', 7))
+        since = datetime.utcnow() - timedelta(days=days)
+        
+        results = db.session.query(
+            PlatformActivityLog.user_id,
+            func.count(PlatformActivityLog.id).label('count')
+        ).filter(
+            PlatformActivityLog.created_at >= since,
+            PlatformActivityLog.user_id.isnot(None)
+        ).group_by(PlatformActivityLog.user_id).order_by(
+            func.count(PlatformActivityLog.id).desc()
+        ).limit(10).all()
+        
+        top_users = []
+        for user_id, count in results:
+            user = User.query.get(user_id)
+            if user:
+                top_users.append({
+                    'user_id': user_id,
+                    'user_name': user.name,
+                    'user_email': user.email,
+                    'count': count
+                })
+        
+        return jsonify({
+            'success': True,
+            'data': top_users
+        }), 200
+    except Exception as e:
+        return jsonify({'success': False, 'error': 'Internal server error'}), 500
+
+
+@app.route('/api/admin/activity/errors', methods=['GET'])
+@jwt_required
+def get_recent_errors():
+    """Recent failed actions"""
+    try:
+        if not check_super_admin():
+            return jsonify({'success': False, 'error': 'Access denied'}), 403
+        errors = PlatformActivityLog.query.filter(
+            PlatformActivityLog.status.in_(['failed', 'blocked'])
+        ).order_by(PlatformActivityLog.created_at.desc()).limit(50).all()
+        return jsonify({'success': True, 'data': [e.to_dict() for e in errors]}), 200
+    except Exception as e:
+        return jsonify({'success': False, 'error': 'Internal server error'}), 500
+
+
+@app.route('/api/admin/activity/geographic', methods=['GET'])
+@jwt_required
+def get_geographic_distribution():
+    """Users by location"""
+    try:
+        if not check_super_admin():
+            return jsonify({'success': False, 'error': 'Access denied'}), 403
+        days = int(request.args.get('days', 30))
+        since = datetime.utcnow() - timedelta(days=days)
+        
+        results = db.session.query(
+            PlatformActivityLog.location,
+            func.count(func.distinct(PlatformActivityLog.user_id)).label('users')
+        ).filter(
+            PlatformActivityLog.created_at >= since,
+            PlatformActivityLog.location.isnot(None),
+            PlatformActivityLog.location != ''
+        ).group_by(PlatformActivityLog.location).order_by(
+            func.count(func.distinct(PlatformActivityLog.user_id)).desc()
+        ).limit(20).all()
+        
+        return jsonify({
+            'success': True,
+            'data': [{'location': loc, 'users': count} for loc, count in results]
+        }), 200
+    except Exception as e:
+        return jsonify({'success': False, 'error': 'Internal server error'}), 500
+
+
 def get_user_engagement(hospital_id: int, days: int = 30) -> Dict[str, Any]:
     """
     Calculate user engagement metrics for a hospital using new models
