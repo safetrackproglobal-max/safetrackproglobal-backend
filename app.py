@@ -3565,6 +3565,8 @@ class UserCache:
                 
                 # Hospital
                 self.hospital_id = data.get('hospital_id')
+                self.avatar_url = data.get('avatar_url')
+                self.profile_image = data.get('profile_image')
                 
                 # Subscription
                 self.subscription_plan = data.get('subscription_plan', 'free')
@@ -3680,7 +3682,8 @@ def user_to_dict(user):
         
         # Hospital
         'hospital_id': getattr(user, 'hospital_id', None),
-        
+        'avatar_url': getattr(user, 'avatar_url', None),
+        'profile_image': getattr(user, 'profile_image', None),
         # Subscription
         'subscription_plan': getattr(user, 'subscription_plan', 'free'),
         'subscription_status': getattr(user, 'subscription_status', 'inactive'),
@@ -9366,90 +9369,92 @@ def upload_profile_image():
     """Upload profile picture for current user"""
     try:
         # Get user from request (set by JWT decorator)
-        user = request.user
-        app.logger.info(f"Profile image upload for user: {user.email} (ID: {user.id})")
-        
+        cached_user = request.user
+        user_id = cached_user.id
+        app.logger.info(f"Profile image upload for user: {cached_user.email} (ID: {user_id})")
+
+        # ✅ Fetch the REAL user from DB (CachedUser can't be saved to)
+        from models import User
+        user = User.query.get(user_id)
+        if not user:
+            return jsonify({'success': False, 'error': 'User not found'}), 404
+
         # Check if file was uploaded
         if 'profile_image' not in request.files:
             app.logger.error("No 'profile_image' field in request")
             return jsonify({'success': False, 'error': 'No file uploaded'}), 400
-        
+
         file = request.files['profile_image']
         app.logger.info(f"File received: {file.filename}, Type: {file.content_type}")
-        
+
         if not file or file.filename == '':
             app.logger.error("Empty filename")
             return jsonify({'success': False, 'error': 'No file selected'}), 400
-        
+
         # Check file size
         file.seek(0, os.SEEK_END)
         file_size = file.tell()
         file.seek(0)
         app.logger.info(f"File size: {file_size} bytes ({file_size / (1024*1024):.2f} MB)")
-        
+
         if file_size > PROFILE_MAX_FILE_SIZE:
             app.logger.error(f"File too large: {file_size} > {PROFILE_MAX_FILE_SIZE}")
             return jsonify({
-                'success': False, 
+                'success': False,
                 'error': f'File too large. Max size: {PROFILE_MAX_FILE_SIZE // (1024*1024)}MB'
             }), 400
-        
+
         # Validate file type
         if not allowed_profile_image(file.filename):
             ext = file.filename.split('.')[-1].lower() if '.' in file.filename else 'unknown'
             app.logger.error(f"Invalid file type: {ext}")
             return jsonify({
-                'success': False, 
+                'success': False,
                 'error': f'Invalid file type. Allowed: {", ".join(PROFILE_ALLOWED_EXTENSIONS)}'
             }), 400
-        
-        # Also validate MIME type as additional check
+
+        # MIME check (soft)
         allowed_mime_types = {
             'image/jpeg', 'image/jpg', 'image/png', 'image/gif', 'image/webp'
         }
         if file.content_type and file.content_type not in allowed_mime_types:
             app.logger.warning(f"Unexpected MIME type: {file.content_type}")
-            # Still accept if extension is valid
-        
+
         # Generate secure filename
         ext = file.filename.rsplit('.', 1)[1].lower()
         safe_filename = f"profile_{user.id}_{uuid.uuid4().hex}.{ext}"
         filepath = os.path.join(PROFILE_UPLOAD_FOLDER, safe_filename)
         app.logger.info(f"Saving to: {filepath}")
-        
+
         # Save file
         file.save(filepath)
         app.logger.info(f"File saved successfully")
-        
+
         # Optimize image
         try:
             img = Image.open(filepath)
             app.logger.info(f"Image opened: {img.format}, Size: {img.size}")
-            
-            # Resize if too large (max 500x500)
+
             if img.width > 500 or img.height > 500:
                 img.thumbnail((500, 500), Image.Resampling.LANCZOS)
                 app.logger.info(f"Resized to: {img.size}")
-            
-            # Convert to RGB if necessary
+
             if img.mode in ('RGBA', 'P'):
                 rgb_img = Image.new('RGB', img.size, (255, 255, 255))
                 rgb_img.paste(img, mask=img.split()[-1] if img.mode == 'RGBA' else None)
                 img = rgb_img
                 app.logger.info(f"Converted to RGB")
-            
-            # Save optimized image
+
             img.save(filepath, optimize=True, quality=85)
             app.logger.info(f"Optimized image saved")
-            
+
         except Exception as img_error:
             app.logger.warning(f"Image optimization failed: {img_error}")
-            # Continue with original file
-        
-        # Delete old avatar if exists
-        if user.avatar_url:
-            # Extract filename from old URL
-            old_filename = user.avatar_url.split('/')[-1]
+
+        # ✅ Safe access — CachedUser may not have avatar_url, real User does
+        old_avatar = getattr(user, 'avatar_url', None)
+        if old_avatar:
+            old_filename = old_avatar.split('/')[-1]
             old_path = os.path.join(PROFILE_UPLOAD_FOLDER, old_filename)
             if os.path.exists(old_path):
                 try:
@@ -9457,23 +9462,31 @@ def upload_profile_image():
                     app.logger.info(f"Deleted old avatar: {old_path}")
                 except Exception as e:
                     app.logger.warning(f"Failed to delete old avatar: {e}")
-        
-        # Generate FULL URL for the image
+
+        # Generate full URL
         base_url = request.host_url.rstrip('/')
         image_url = f"{base_url}/uploads/profiles/{safe_filename}"
-        
-        # Update user with new avatar URL (store full URL)
+
+        # ✅ Update the REAL user (this persists!)
         user.avatar_url = image_url
         db.session.commit()
         app.logger.info(f"Avatar URL updated: {image_url}")
-        
+
+        # ✅ Refresh the Redis cache so next request has the new avatar
+        try:
+            from services.cache import UserCache
+            UserCache.clear(user.id)
+            app.logger.info(f"Cache cleared for user {user.id}")
+        except Exception as cache_err:
+            app.logger.warning(f"Cache clear failed: {cache_err}")
+
         return jsonify({
             'success': True,
             'message': 'Profile picture uploaded successfully',
             'imageUrl': image_url,
             'avatar': image_url
         }), 200
-        
+
     except Exception as e:
         app.logger.error(f"Error uploading profile image: {str(e)}")
         import traceback
