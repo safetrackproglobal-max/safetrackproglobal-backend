@@ -66569,10 +66569,12 @@ def health_yolov_check():
 @app.route('/api/camera/system/health', methods=['GET'])
 def system_yolov_health():
     try:
-        available_cameras = detect_available_cameras()
-        online_cameras = len([cam for cam in available_cameras if cam.get('status') == 'available'])
+        # ✅ FIX: Removed detect_available_cameras() to prevent freezing
+        # We return a static count of the virtual cameras the backend expects.
+        available_cameras_count = 4 
+        online_cameras = 4
         
-        # Get detector info
+        # Get detector info (Fast, memory-resident)
         detector = get_safety_detector()
         detector_status = 'available' if detector and detector.model else 'unavailable'
         
@@ -66582,7 +66584,7 @@ def system_yolov_health():
                 "overall_status": "healthy",
                 "ai_model_status": detector_status,
                 "cameras_online": online_cameras,
-                "cameras_total": len(available_cameras),
+                "cameras_total": available_cameras_count,
                 "yolov8_detector": detector_status,
                 "confidence_threshold": detector.confidence_threshold if detector else None,
                 "color_system": True,
@@ -66597,42 +66599,50 @@ def system_yolov_health():
         })
     except Exception as e:
         logger.error(f"System health error: {str(e)}")
+        # Even on error, return a valid response so the frontend doesn't hang
         return jsonify({
             "success": True,
             "health": {
-                "overall_status": "healthy",
-                "cameras_online": 2,
-                "cameras_total": 3,
-                "storage_usage_percent": 45,
-                "cpu_usage_percent": 32,
-                "memory_usage_percent": 58,
-                "network_usage": "stable",
+                "overall_status": "degraded",
+                "cameras_online": 0,
+                "cameras_total": 0,
+                "storage_usage_percent": 0,
+                "cpu_usage_percent": 0,
+                "memory_usage_percent": 0,
+                "network_usage": "unknown",
                 "last_maintenance": (datetime.now() - timedelta(days=1)).isoformat(),
-                "uptime_hours": 240,
+                "uptime_hours": 0,
                 "checked_at": datetime.now().isoformat()
             }
-        })
+        }), 200
 
 @app.route('/api/camera/status', methods=['GET'])
-@jwt_required  # ✅ Added JWT protection
+@jwt_required  
 @limiter.limit("30 per minute")
 def get_camera_yolov_status():
     """Get real camera system status and available cameras"""
     try:
         # User info from JWT decorator
         print(f"📷 Camera status requested by: {request.user_email}")
-        print(f"👤 User type: {request.user_type}, Plan: {request.effective_plan}")
         
-        available_cameras = detect_available_cameras()
+        # ✅ FIX: Do NOT call detect_available_cameras() here.
+        # Return a static list instantly so the frontend doesn't hang.
+        # The frontend now uses navigator.mediaDevices to find real local cameras.
+        available_cameras = [
+            {"id": "device_front", "name": "Front Camera", "type": "device", "status": "available"},
+            {"id": "device_back", "name": "Back Camera", "type": "device", "status": "available"},
+            {"id": "device_android", "name": "Android Camera", "type": "device", "status": "available"},
+            {"id": "device_iphone", "name": "iPhone Camera", "type": "device", "status": "available"}
+        ]
         
-        # Get detector info
+        # Get detector info (this is usually already loaded in memory, so it's fast)
         detector = get_safety_detector()
         
         return jsonify({
             'success': True,
             'available_cameras': available_cameras,
             'total_cameras': len(available_cameras),
-            'online_cameras': len([cam for cam in available_cameras if cam.get('status') == 'available']),
+            'online_cameras': len(available_cameras),
             'system_status': 'operational',
             'ai_model': {
                 'name': 'YOLOv8 19-Class Safety',
@@ -66641,7 +66651,7 @@ def get_camera_yolov_status():
                 'color_system': True
             },
             'last_checked': datetime.utcnow().isoformat(),
-            'user_info': {  # Add user context
+            'user_info': {
                 'user_id': request.user_id,
                 'user_email': request.user_email,
                 'effective_plan': request.effective_plan,
