@@ -7581,6 +7581,64 @@ class PlatformSessionTracking(db.Model):
             'is_active': self.is_active,
         }
 
+class Chemical(db.Model):
+    """Real database model for Chemical Inventory"""
+    __tablename__ = 'chemical_inventory'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), nullable=True) # Optional if you have companies
+    
+    name = db.Column(db.String(100), nullable=False)
+    location = db.Column(db.String(100), nullable=False)
+    quantity = db.Column(db.String(50), nullable=False)
+    hazard_class = db.Column(db.String(50), nullable=False)
+    risk_level = db.Column(db.String(20), nullable=False)
+    sds_url = db.Column(db.String(500), nullable=True)
+    
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'chemical': self.name,
+            'location': self.location,
+            'quantity': self.quantity,
+            'hazard': self.hazard_class,
+            'riskLevel': self.risk_level,
+            'sds_url': self.sds_url,
+            'date': self.created_at.strftime('%Y-%m-%d')
+        }
+
+class ChemicalIncident(db.Model):
+    """Real database model for Chemical Incidents"""
+    __tablename__ = 'chemical_incidents'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), nullable=True)
+    
+    incident_type = db.Column(db.String(100), nullable=False)
+    location = db.Column(db.String(100), nullable=False)
+    severity = db.Column(db.String(20), nullable=False)
+    description = db.Column(db.Text)
+    status = db.Column(db.String(50), default='Under Investigation')
+    
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'type': self.incident_type,
+            'location': self.location,
+            'severity': self.severity,
+            'description': self.description,
+            'status': self.status,
+            'date': self.created_at.strftime('%Y-%m-%d')
+        }
+
+
 
 __all__ = [
     # Core models
@@ -7933,7 +7991,7 @@ __all__ = [
      'LessonLearned', 'LessonReaction',
     'EscalationRule', 'EscalationHistory', 'IncidentCost', 'RegulatoryFiling', 'FishboneVersion', 'FishboneFiveWhys', 'AIAssistantSession', 'AIAssistantMessage', 
     'SimilarIncidentMatch', 'IncidentComparison', 'IncidentClusterAnalysis', 'PredictiveAnalyticsRun', 'PredictiveScenario', 'AIGenerationLog', 'EnvironmentalSite', 'HospitalFinancialRecord',
-     'PlatformActivityLog', 'PlatformSessionTracking', 
+     'PlatformActivityLog', 'PlatformSessionTracking', 'Chemical', 'ChemicalIncident', 
     
 ]
 
