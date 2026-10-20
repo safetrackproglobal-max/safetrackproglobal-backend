@@ -12297,9 +12297,9 @@ def resend_verification():
         # ✅ FIX: Use correct parameter name 'recipient' (not 'to_email')
         # Your send_email function signature: send_email(recipient, subject, html_content)
         email_sent = send_email(
-            recipient=email,      # ✅ Correct parameter name
+            to=email,
             subject=email_subject,
-            html_content=html_content
+            body=html_content
         )
         
         if email_sent:
