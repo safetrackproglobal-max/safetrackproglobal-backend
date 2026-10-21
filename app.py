@@ -31564,9 +31564,6 @@ def safetypro_dashboard_performance():
         }), 500
 
 
-
-# backend/app.py
-
 @app.route('/api/payment/manual/confirm', methods=['POST', 'OPTIONS'])
 @jwt_required
 def confirm_manual_payment():
@@ -31676,26 +31673,22 @@ def notify_admins_manual_payment(user, payment):
         }.get(payment.payment_method, payment.payment_method)
         
         for admin in admins:
-            # Create notification in database
+            # ✅ Create notification matching your exact model
             notification = Notification(
                 user_id=admin.id,
                 title="Manual Payment Received",
                 message=f"User {user.name} ({user.email}) has submitted a {payment_method_display} payment of {payment.currency} {payment.amount} for {payment.plan} plan. Reference: {payment.payment_reference}",
                 type="payment_verification",
                 priority="high",
-                read=False,
-                metadata=json.dumps({
-                    'user_id': user.id,
-                    'user_email': user.email,
-                    'payment_reference': payment.payment_reference,
-                    'amount': payment.amount,
-                    'currency': payment.currency,
-                    'plan': payment.plan,
-                    'payment_method': payment.payment_method,
-                    'created_at': payment.created_at.isoformat()
-                }),
+                category="system",
+                is_read=False, # ✅ Correctly matched to your model
+                action_url=f"/admin/payments?reference={payment.payment_reference}", # ✅ Added action link
                 created_at=datetime.utcnow()
             )
+            
+            # If you need to store the metadata, append it to the message string instead
+            # since your model doesn't have a metadata column.
+            
             db.session.add(notification)
             
             # Send email notification to admin
@@ -31712,6 +31705,8 @@ def notify_admins_manual_payment(user, payment):
         
     except Exception as e:
         logger.error(f"Failed to send manual payment notification: {e}")
+        # Rollback in case of error so it doesn't lock the DB
+        db.session.rollback()
         return False
 
 
@@ -31783,13 +31778,14 @@ def send_admin_payment_notification(admin, user, payment):
         </html>
         """
         
-        send_email(
-            recipient=admin.email,
+        # ✅ Use the universal function
+        result = send_email(
+            to=admin.email,
             subject=subject,
-            html_content=html_content
+            body=html_content
         )
         
-        return True
+        return result
         
     except Exception as e:
         logger.error(f"Failed to send admin email notification: {e}")
@@ -31863,13 +31859,14 @@ def send_manual_payment_confirmation(user, payment):
         </html>
         """
         
-        send_email(
-            recipient=user.email,
+        # ✅ Use the universal function
+        result = send_email(
+            to=user.email,
             subject=subject,
-            html_content=html_content
+            body=html_content
         )
         
-        return True
+        return result
         
     except Exception as e:
         logger.error(f"Failed to send user confirmation email: {e}")
@@ -33970,8 +33967,6 @@ def calculate_expiry_date_from_duration(duration):
 def send_payment_confirmation_email(user, payment):
     """Send payment confirmation email to user"""
     try:
-        from flask_mail import Message
-        
         # ✅ Get payment details with correct field names for ManualPayment
         payment_reference = getattr(payment, 'payment_reference', 'N/A')
         transaction_id = getattr(payment, 'transaction_id', 'N/A')
@@ -33998,7 +33993,7 @@ def send_payment_confirmation_email(user, payment):
         
         subject = f"✅ Payment Verified - {payment_reference}"
         
-        html = f"""
+        html_content = f"""
         <!DOCTYPE html>
         <html>
         <head>
@@ -34065,10 +34060,15 @@ def send_payment_confirmation_email(user, payment):
         </html>
         """
         
-        msg = Message(subject, recipients=[user.email], html=html)
-        mail.send(msg)
-        app.logger.info(f"✅ Confirmation email sent to {user.email}")
-        return True
+        # ✅ Use the universal function
+        result = send_email(to=user.email, subject=subject, body=html_content)
+        
+        if result:
+            app.logger.info(f"✅ Confirmation email sent to {user.email}")
+        else:
+            app.logger.error(f"❌ Failed to send confirmation email to {user.email}")
+            
+        return result
         
     except Exception as e:
         app.logger.error(f"❌ Error in send_payment_confirmation_email: {e}")
@@ -34076,12 +34076,9 @@ def send_payment_confirmation_email(user, payment):
         app.logger.error(f"Traceback: {traceback.format_exc()}")
         return False
 
-
 def send_payment_rejection_email(user, payment):
     """Send payment rejection email to user"""
     try:
-        from flask_mail import Message
-        
         # ✅ Use correct field names for ManualPayment
         payment_reference = getattr(payment, 'payment_reference', 'N/A')
         amount = getattr(payment, 'amount', 0)
@@ -34099,7 +34096,7 @@ def send_payment_rejection_email(user, payment):
         
         subject = f"❌ Payment Rejected - {payment_reference}"
         
-        html = f"""
+        html_content = f"""
         <!DOCTYPE html>
         <html>
         <head>
@@ -34159,10 +34156,15 @@ def send_payment_rejection_email(user, payment):
         </html>
         """
         
-        msg = Message(subject, recipients=[user.email], html=html)
-        mail.send(msg)
-        app.logger.info(f"✅ Rejection email sent to {user.email}")
-        return True
+        # ✅ Use the universal function
+        result = send_email(to=user.email, subject=subject, body=html_content)
+        
+        if result:
+            app.logger.info(f"✅ Rejection email sent to {user.email}")
+        else:
+            app.logger.error(f"❌ Failed to send rejection email to {user.email}")
+            
+        return result
         
     except Exception as e:
         app.logger.error(f"❌ Error in send_payment_rejection_email: {e}")
@@ -34171,8 +34173,6 @@ def send_payment_rejection_email(user, payment):
 def send_payment_reminder_email(user, payment):
     """Send payment reminder email to user"""
     try:
-        from flask_mail import Message
-        
         # ✅ Use correct field names for ManualPayment
         payment_reference = getattr(payment, 'payment_reference', 'N/A')
         amount = getattr(payment, 'amount', 0)
@@ -34181,7 +34181,7 @@ def send_payment_reminder_email(user, payment):
         
         subject = f"⏳ Payment Reminder - {payment_reference}"
         
-        html = f"""
+        html_content = f"""
         <!DOCTYPE html>
         <html>
         <head>
@@ -34241,10 +34241,15 @@ def send_payment_reminder_email(user, payment):
         </html>
         """
         
-        msg = Message(subject, recipients=[user.email], html=html)
-        mail.send(msg)
-        app.logger.info(f"✅ Reminder email sent to {user.email}")
-        return True
+        # ✅ Use the universal function
+        result = send_email(to=user.email, subject=subject, body=html_content)
+        
+        if result:
+            app.logger.info(f"✅ Reminder email sent to {user.email}")
+        else:
+            app.logger.error(f"❌ Failed to send reminder email to {user.email}")
+            
+        return result
         
     except Exception as e:
         app.logger.error(f"❌ Error in send_payment_reminder_email: {e}")
@@ -42941,23 +42946,29 @@ def approve_safety_admin(admin_id):
     
 def send_admin_approval_notification(super_admin_email, pending_admin):
     """Send notification to super admin about pending approval"""
-    subject = "New Admin Registration Requires Approval"
-    
-    html_content = f"""
-    <h2>New Admin Registration</h2>
-    <p>A new admin registration requires your approval:</p>
-    <ul>
-        <li><strong>Name:</strong> {pending_admin.name}</li>
-        <li><strong>Email:</strong> {pending_admin.email}</li>
-        <li><strong>Company:</strong> {pending_admin.company_name}</li>
-        <li><strong>Role:</strong> {pending_admin.role}</li>
-        <li><strong>Employees:</strong> {pending_admin.employee_count}</li>
-        <li><strong>Country:</strong> {pending_admin.country}</li>
-    </ul>
-    <p>Please review and approve this registration in the admin dashboard.</p>
-    """
-    
-    send_email(super_admin_email, subject, html_content)
+    try:
+        subject = "New Admin Registration Requires Approval"
+        
+        html_content = f"""
+        <h2>New Admin Registration</h2>
+        <p>A new admin registration requires your approval:</p>
+        <ul>
+            <li><strong>Name:</strong> {pending_admin.name}</li>
+            <li><strong>Email:</strong> {pending_admin.email}</li>
+            <li><strong>Company:</strong> {pending_admin.company_name}</li>
+            <li><strong>Role:</strong> {pending_admin.role}</li>
+            <li><strong>Employees:</strong> {pending_admin.employee_count}</li>
+            <li><strong>Country:</strong> {pending_admin.country}</li>
+        </ul>
+        <p>Please review and approve this registration in the admin dashboard.</p>
+        """
+        
+        # ✅ Use the universal function
+        return send_email(to=super_admin_email, subject=subject, body=html_content)
+        
+    except Exception as e:
+        logger.error(f"Failed to send admin approval notification: {e}")
+        return False
 
 
 def send_verification_email(email, verification_code, user_name=None, is_admin=False, company_id=None, company_name=None):
@@ -43079,26 +43090,6 @@ def send_verification_email(email, verification_code, user_name=None, is_admin=F
             </html>
             """
 
-        # Text content
-        text_content = f"""
-        SafetyTrack Pro - Account Verification
-
-        Hello {user_name or 'there'},
-
-        Thank you for registering with SafetyTrack Pro. To complete your registration, please use the verification code below:
-
-        Verification Code: {verification_code}
-
-        This code will expire in 15 minutes.
-
-        {f'Company: {company_name} (ID: {company_id})' if company_name and company_id else ''}
-
-        If you didn't create an account with SafetyTrack Pro, please ignore this email.
-
-        Best regards,
-        The SafetyTrack Pro Team
-        """
-
         print(f"📧 Attempting to send email to: {email}")
         print(f"🔐 Verification code: {verification_code}")
         if company_id:
@@ -43106,25 +43097,25 @@ def send_verification_email(email, verification_code, user_name=None, is_admin=F
         if company_name:
             print(f"🏢 Company Name: {company_name}")
 
-        # Create and send message using Flask-Mail
-        msg = Message(
-            subject=subject,
-            recipients=[email],
-            html=html_content,
-            body=text_content
+        # ✅ Use the universal function
+        result = send_email(
+            to=email, 
+            subject=subject, 
+            body=html_content
         )
-        
-        mail.send(msg)
 
-        logger.info(f"Verification email sent to {email}")
-        print(f"✅ Verification email successfully sent to {email}")
-        return True
+        if result:
+            logger.info(f"Verification email sent to {email}")
+            print(f"✅ Verification email successfully sent to {email}")
+            return True
+        else:
+            logger.error(f"Failed to send verification email to {email}")
+            return False
 
     except Exception as e:
         logger.error(f"Failed to send verification email to {email}: {e}")
         print(f"❌ Failed to send verification email to {email}: {str(e)}")
         
-        # Print detailed error information
         if "535" in str(e):
             print("🔐 Authentication failed - check your Gmail App Password")
         elif "connection refused" in str(e).lower():
@@ -43134,34 +43125,31 @@ def send_verification_email(email, verification_code, user_name=None, is_admin=F
             
         return False
 
-def send_email(recipient, subject, html_content):
-    """Generic email sending function"""
+def send_email(to=None, subject=None, body=None, attachments=None, **kwargs):
+    """
+    Universal email sending function.
+    Supports old syntax (recipient=, html_content=) and new syntax (to=, body=).
+    """
     try:
-        # Create and send message using Flask-Mail
+        # ✅ Handle old keyword arguments gracefully
+        recipient = to or kwargs.get('recipient') or kwargs.get('to_email')
+        html_content = body or kwargs.get('html_content') or kwargs.get('content')
+        
+        if not recipient:
+            logger.error("❌ Email error: No recipient provided")
+            return False
+            
+        if not subject:
+            logger.error("❌ Email error: No subject provided")
+            return False
+            
         msg = Message(
             subject=subject,
             recipients=[recipient],
-            html=html_content
+            html=html_content or "",
+            sender=app.config.get('MAIL_DEFAULT_SENDER')
         )
         
-        mail.send(msg)
-        print(f"✅ Email sent to {recipient}")
-        return True
-    except Exception as e:
-        print(f"❌ Failed to send email to {recipient}: {e}")
-        return False
-
-def send_email(to, subject, body, attachments=None):
-    """Enhanced email sending with attachment support"""
-    try:
-        msg = Message(
-            subject=subject,
-            recipients=[to],
-            html=body,
-            sender=app.config['MAIL_DEFAULT_SENDER']
-        )
-        
-        # Add attachments if provided
         if attachments:
             for attachment in attachments:
                 if os.path.exists(attachment):
@@ -43173,10 +43161,11 @@ def send_email(to, subject, body, attachments=None):
                         )
         
         mail.send(msg)
-        logger.info(f"Email sent successfully to {to}")
+        logger.info(f"✅ Email sent successfully to {recipient}")
         return True
+        
     except Exception as e:
-        logger.error(f"Email error: {e}")
+        logger.error(f"❌ Email error: {e}")
         return False
 
 def send_admin_approval_confirmation(email, admin_name):
@@ -43215,27 +43204,18 @@ def send_admin_approval_confirmation(email, admin_name):
         </body>
         </html>
         """
-
-        msg = Message(
-            subject=subject,
-            recipients=[email],
-            html=html_content
-        )
         
-        mail.send(msg)
-        print(f"✅ Admin approval confirmation sent to {email}")
-        return True
+        # ✅ Use the universal function
+        return send_email(to=email, subject=subject, body=html_content)
 
     except Exception as e:
         print(f"❌ Failed to send admin approval confirmation: {e}")
         return False
 
+
 def send_admin_approval_notification(super_admin_email, admin_user):
-    """
-    Send notification to super admin about pending admin approval using Flask-Mail
-    """
+    """Send notification to super admin about pending admin approval"""
     try:
-        # Email content
         html_content = f"""
         <!DOCTYPE html>
         <html>
@@ -43289,116 +43269,37 @@ def send_admin_approval_notification(super_admin_email, admin_user):
         </body>
         </html>
         """
-
-        text_content = f"""
-        SafetyTrack Pro - Admin Approval Required
-
-        New Admin Registration
-
-        A new administrator has registered and requires approval:
-
-        Applicant Details:
-        Name: {admin_user.name}
-        Email: {admin_user.email}
-        Company: {admin_user.company_name}
-        Role: {admin_user.role}
-        Phone: {admin_user.phone}
-        Country: {admin_user.country}
-        Employee Count: {admin_user.employee_count}
-        Registration Date: {admin_user.created_at.strftime('%Y-%m-%d %H:%M:%S')}
-
-        Please review this application in the admin panel and approve or reject it.
-
-        Admin Panel: {os.getenv('ADMIN_PANEL_URL', 'http://safetrackproglobal.com/admin')}
-
-        Best regards,
-        The SafetyTrack Pro System
-        """
-
-        # Create and send message using Flask-Mail
-        msg = Message(
-            subject='New Admin Account Requires Approval',
-            recipients=[super_admin_email],
-            html=html_content,
-            body=text_content
-        )
         
-        mail.send(msg)
-
-        logger.info(f"Admin approval notification sent to {super_admin_email}")
-        print(f"✅ Admin approval notification sent to {super_admin_email}")
-        return True
+        # ✅ Use the universal function
+        return send_email(to=super_admin_email, subject='New Admin Account Requires Approval', body=html_content)
 
     except Exception as e:
         logger.error(f"Failed to send admin approval notification: {e}")
-        print(f"❌ Failed to send admin approval notification: {e}")
         return False
 
+
 def send_plan_upgrade_email(user, old_plan, new_plan, billing_cycle='1_month', admin_notes=''):
-    """
-    Send plan upgrade confirmation email to user
-    Uses existing send_email() helper
-    """
+    """Send plan upgrade confirmation email to user"""
     try:
         subject = f"🎉 Your SafeTrackPro Global Plan Has Been Upgraded to {new_plan.upper()}"
         
-        # Format friendly plan names
         plan_names = {
-            'free': 'Free',
-            'basic': 'Basic',
-            'pro': 'Pro',
-            'enterprise': 'Enterprise',
-            'platform_owner': 'Platform Owner',
-            'custom': 'Custom',
-            'professional': 'Professional'
+            'free': 'Free', 'basic': 'Basic', 'pro': 'Pro', 'enterprise': 'Enterprise',
+            'platform_owner': 'Platform Owner', 'custom': 'Custom', 'professional': 'Professional'
         }
         old_plan_label = plan_names.get(old_plan.lower() if old_plan else 'free', old_plan or 'Free')
         new_plan_label = plan_names.get(new_plan.lower(), new_plan)
         
-        # Plan feature highlights
         plan_features = {
-            'basic': [
-                'Up to 10 users',
-                'Basic safety reports',
-                'Standard support'
-            ],
-            'pro': [
-                'Up to 50 users',
-                'Advanced analytics',
-                'Priority email support',
-                'Custom reports'
-            ],
-            'professional': [
-                'Up to 100 users',
-                'Advanced analytics',
-                'Priority support',
-                'Custom integrations'
-            ],
-            'enterprise': [
-                'Unlimited users',
-                'Full AI features',
-                'Dedicated support',
-                'Custom integrations',
-                'Advanced compliance tools'
-            ],
-            'platform_owner': [
-                'Full platform access',
-                'Unlimited everything',
-                'Admin controls',
-                'Priority everything'
-            ],
-            'custom': [
-                'Custom features',
-                'Custom user limits',
-                'Dedicated support'
-            ]
+            'basic': ['Up to 10 users', 'Basic safety reports', 'Standard support'],
+            'pro': ['Up to 50 users', 'Advanced analytics', 'Priority email support', 'Custom reports'],
+            'professional': ['Up to 100 users', 'Advanced analytics', 'Priority support', 'Custom integrations'],
+            'enterprise': ['Unlimited users', 'Full AI features', 'Dedicated support', 'Custom integrations', 'Advanced compliance tools'],
+            'platform_owner': ['Full platform access', 'Unlimited everything', 'Admin controls', 'Priority everything'],
+            'custom': ['Custom features', 'Custom user limits', 'Dedicated support']
         }
         
-        features = plan_features.get(new_plan.lower(), [
-            'Access to all features',
-            'Standard support'
-        ])
-        
+        features = plan_features.get(new_plan.lower(), ['Access to all features', 'Standard support'])
         features_html = ''.join([f'<li style="margin: 8px 0;">✅ {f}</li>' for f in features])
         
         html_content = f"""
@@ -43477,37 +43378,22 @@ def send_plan_upgrade_email(user, old_plan, new_plan, billing_cycle='1_month', a
         </html>
         """
         
-        # Use your existing send_email helper
-        result = send_email(user.email, subject, html_content)
-        
-        if result:
-            logger.info(f"✅ Upgrade email sent to {user.email} ({old_plan} → {new_plan})")
-            print(f"✅ Upgrade email sent to {user.email}")
-        else:
-            logger.warning(f"⚠️ Upgrade email returned False for {user.email}")
-        
-        return result
+        # ✅ Use the universal function
+        return send_email(to=user.email, subject=subject, body=html_content)
         
     except Exception as e:
         logger.error(f"❌ Failed to send upgrade email to {user.email}: {e}")
-        print(f"❌ Failed to send upgrade email: {e}")
         return False
 
 
 def send_plan_downgrade_email(user, old_plan, new_plan, admin_notes=''):
-    """
-    Send plan downgrade notification email to user
-    Uses existing send_email() helper
-    """
+    """Send plan downgrade notification email to user"""
     try:
         subject = f"Your SafeTrackPro Global Plan Has Changed to {new_plan.upper()}"
         
         plan_names = {
-            'free': 'Free',
-            'basic': 'Basic',
-            'pro': 'Pro',
-            'enterprise': 'Enterprise',
-            'platform_owner': 'Platform Owner'
+            'free': 'Free', 'basic': 'Basic', 'pro': 'Pro',
+            'enterprise': 'Enterprise', 'platform_owner': 'Platform Owner'
         }
         old_plan_label = plan_names.get(old_plan.lower() if old_plan else 'free', old_plan or 'Free')
         new_plan_label = plan_names.get(new_plan.lower(), new_plan)
@@ -43581,19 +43467,11 @@ def send_plan_downgrade_email(user, old_plan, new_plan, admin_notes=''):
         </html>
         """
         
-        result = send_email(user.email, subject, html_content)
-        
-        if result:
-            logger.info(f"✅ Downgrade email sent to {user.email} ({old_plan} → {new_plan})")
-            print(f"✅ Downgrade email sent to {user.email}")
-        else:
-            logger.warning(f"⚠️ Downgrade email returned False for {user.email}")
-        
-        return result
+        # ✅ Use the universal function
+        return send_email(to=user.email, subject=subject, body=html_content)
         
     except Exception as e:
         logger.error(f"❌ Failed to send downgrade email to {user.email}: {e}")
-        print(f"❌ Failed to send downgrade email: {e}")
         return False
 
 from flask_jwt_extended import create_access_token, get_jwt_identity
