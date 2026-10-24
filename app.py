@@ -735,6 +735,7 @@ COUNTRY_PRICING = {
 PLANS = {
     "free": {
         "label": "Free Forever",
+        "price_usd": 0,
         "limits": {
             "uploads_per_month": 5,
             "api_calls_per_month": 50,
@@ -742,7 +743,9 @@ PLANS = {
             "monitoring_stations": 1,
             "ai_requests_per_month": 10,
             "camera_feeds": 1,
-            "video_analysis_minutes": 10
+            "video_analysis_minutes": 10,
+            "storage_mb": 100,
+            "hospitals": 0,
         },
         "features": [
             "Basic document analysis",
@@ -753,11 +756,29 @@ PLANS = {
             "1 team member",
             "1 monitoring station",
             "1 camera feed",
-            "10 minutes video analysis"
-        ]
+            "10 minutes video analysis",
+            "Basic incident reporting",
+            "Basic environmental dashboard",
+        ],
+        "feature_flags": {
+            "hospital_management": False,
+            "fishbone_analysis": False,
+            "ai_camera_monitoring": False,
+            "weather_intelligence": False,
+            "predictive_analytics": "none",
+            "compliance_automation": False,
+            "document_management": False,
+            "white_label": False,
+            "api_access": False,
+            "sla_guarantee": False,
+            "on_premise": False,
+        },
+        "support": "community",
     },
+
     "basic": {
         "label": "Basic",
+        "price_usd": 20,
         "limits": {
             "uploads_per_month": 100,
             "api_calls_per_month": 1000,
@@ -765,7 +786,9 @@ PLANS = {
             "monitoring_stations": 5,
             "ai_requests_per_month": 100,
             "camera_feeds": 3,
-            "video_analysis_minutes": 120
+            "video_analysis_minutes": 120,
+            "storage_mb": 500,
+            "hospitals": 0,
         },
         "features": [
             "All Free features",
@@ -777,11 +800,32 @@ PLANS = {
             "Up to 10 team members",
             "Up to 5 monitoring stations",
             "Up to 3 camera feeds",
-            "2 hours video analysis"
-        ]
+            "2 hours video analysis",
+            "Fishbone root cause analysis",
+            "Compliance automation (ISO 14001, OSHA)",
+            "Environmental intelligence dashboard",
+            "Carbon footprint tracking",
+            "Basic predictive analytics",
+        ],
+        "feature_flags": {
+            "hospital_management": False,
+            "fishbone_analysis": True,
+            "ai_camera_monitoring": False,
+            "weather_intelligence": False,
+            "predictive_analytics": "basic",
+            "compliance_automation": True,
+            "document_management": False,
+            "white_label": False,
+            "api_access": False,
+            "sla_guarantee": False,
+            "on_premise": False,
+        },
+        "support": "email",
     },
+
     "pro": {
         "label": "Professional",
+        "price_usd": 50,
         "limits": {
             "uploads_per_month": 500,
             "api_calls_per_month": 5000,
@@ -789,7 +833,9 @@ PLANS = {
             "monitoring_stations": 20,
             "ai_requests_per_month": 500,
             "camera_feeds": 10,
-            "video_analysis_minutes": 600
+            "video_analysis_minutes": 600,
+            "storage_mb": 2000,
+            "hospitals": 1,
         },
         "features": [
             "All Basic features",
@@ -803,13 +849,35 @@ PLANS = {
             "Up to 20 monitoring stations",
             "Up to 10 camera feeds",
             "10 hours video analysis",
+            "AI camera monitoring (PPE + hazards)",
+            "Weather intelligence",
+            "Advanced predictive analytics",
+            "Document management (39+ features)",
+            "Compliance document generation",
             "Real-time monitoring alerts",
+            "Hospital management (1 hospital)",
             "Priority email support",
-            "Custom reporting"
-        ]
+            "Custom reporting",
+        ],
+        "feature_flags": {
+            "hospital_management": True,
+            "fishbone_analysis": True,
+            "ai_camera_monitoring": True,
+            "weather_intelligence": True,
+            "predictive_analytics": "advanced",
+            "compliance_automation": True,
+            "document_management": True,
+            "white_label": False,
+            "api_access": True,
+            "sla_guarantee": False,
+            "on_premise": False,
+        },
+        "support": "priority",
     },
+
     "enterprise": {
         "label": "Enterprise",
+        "price_usd": "Custom",
         "limits": {
             "uploads_per_month": "Unlimited",
             "api_calls_per_month": "Unlimited",
@@ -817,7 +885,9 @@ PLANS = {
             "monitoring_stations": "Unlimited",
             "ai_requests_per_month": "Unlimited",
             "camera_feeds": "Unlimited",
-            "video_analysis_minutes": "Unlimited"
+            "video_analysis_minutes": "Unlimited",
+            "storage_mb": "Unlimited",
+            "hospitals": "Unlimited",
         },
         "features": [
             "All Pro features",
@@ -829,24 +899,95 @@ PLANS = {
             "Dedicated account manager & support",
             "Custom training & onboarding",
             "White-labeling options",
-            "Advanced AI models",
-            "Predictive analytics",
-            "Custom integrations"
-        ]
-    }
+            "Advanced AI models (custom training)",
+            "Predictive analytics (custom)",
+            "Custom integrations",
+            "Unlimited hospital management",
+            "Multi-hospital support",
+            "24/7 premium support",
+        ],
+        "feature_flags": {
+            "hospital_management": True,
+            "fishbone_analysis": True,
+            "ai_camera_monitoring": True,
+            "weather_intelligence": True,
+            "predictive_analytics": "custom",
+            "compliance_automation": True,
+            "document_management": True,
+            "white_label": True,
+            "api_access": True,
+            "sla_guarantee": True,
+            "on_premise": True,
+        },
+        "support": "dedicated",
+    },
 }
 
+
+# ============================================
+# PLAN NAME MAPPING (Aliases)
+# ============================================
 PLAN_NAME_MAPPING = {
-    'free_trial': 'free', 'trial': 'free', 'free_forever': 'free',
-    'basic_trial': 'free', 'trial_basic': 'free',
-    'starter': 'basic', 'basic_legacy': 'basic', 'basic_old': 'basic',
-    'standard': 'basic', 'lite': 'basic',
-    'professional': 'pro', 'pro_legacy': 'pro', 'pro_old': 'pro',
-    'business': 'pro', 'plus': 'pro', 'premium': 'pro',
-    'enterprise_legacy': 'enterprise', 'enterprise_old': 'enterprise',
-    'ultimate': 'enterprise', 'elite': 'enterprise', 'corporate': 'enterprise',
-    'free': 'free', 'basic': 'basic', 'pro': 'pro', 'enterprise': 'enterprise'
+    # Free aliases
+    'free_trial': 'free',
+    'trial': 'free',
+    'free_forever': 'free',
+    'basic_trial': 'free',
+    'trial_basic': 'free',
+
+    # Basic aliases
+    'starter': 'basic',
+    'basic_legacy': 'basic',
+    'basic_old': 'basic',
+    'standard': 'basic',
+    'lite': 'basic',
+
+    # Pro aliases
+    'professional': 'pro',
+    'pro_legacy': 'pro',
+    'pro_old': 'pro',
+    'business': 'pro',
+    'plus': 'pro',
+    'premium': 'pro',
+
+    # Enterprise aliases
+    'enterprise_legacy': 'enterprise',
+    'enterprise_old': 'enterprise',
+    'ultimate': 'enterprise',
+    'elite': 'enterprise',
+    'corporate': 'enterprise',
+
+    # Platform owner / super admin → Enterprise
+    'platform_owner': 'enterprise',
+    'super_admin': 'enterprise',
+    'system': 'enterprise',
+
+    # Direct matches
+    'free': 'free',
+    'basic': 'basic',
+    'pro': 'pro',
+    'enterprise': 'enterprise',
 }
+
+
+# ============================================
+# HELPER: Resolve plan name
+# ============================================
+def resolve_plan_name(plan):
+    """Normalize any plan name to canonical: free/basic/pro/enterprise"""
+    if not plan:
+        return 'free'
+    plan = str(plan).lower().strip()
+    return PLAN_NAME_MAPPING.get(plan, 'free')
+
+
+# ============================================
+# HELPER: Get plan config
+# ============================================
+def get_plan_config(plan):
+    """Get full plan config (limits + features + flags)"""
+    canonical = resolve_plan_name(plan)
+    return PLANS.get(canonical, PLANS['free'])
 
 PLAN_HIERARCHY = {
     'free': 0,
@@ -135753,39 +135894,78 @@ def get_manual_payment_method(method_id):
     
     return methods.get(method_id)
 
+# ============================================
+# USAGE HELPER FUNCTIONS
+# ============================================
+
+def _calculate_remaining(used, total):
+    """Calculate remaining quota - handles 'Unlimited'/'Custom'"""
+    if total in ('Unlimited', 'Custom', None):
+        return 'Unlimited'
+    if not isinstance(total, (int, float)):
+        return 'Unlimited'
+    return max(0, total - used)
+
+
+def _calculate_percentage(used, total):
+    """Calculate usage percentage - handles 'Unlimited'/'Custom'"""
+    if total in ('Unlimited', 'Custom', None):
+        return 0
+    if not isinstance(total, (int, float)) or total <= 0:
+        return 0
+    return min(100, round((used / total) * 100, 2))
+
+
+# ============================================
+# CURRENT USAGE ENDPOINT
+# ============================================
+
 @app.route('/api/usage/current', methods=['GET'])
 @jwt_required
 def get_current_usage():
-    """Get current user usage statistics - ACCURATE VERSION"""
+    """Get current user usage statistics - ALIGNED WITH NEW PLANS"""
     try:
         user = request.user
         user_id = user.id
-        plan = user.subscription_plan or user.plan or 'free'
-        
-        logger.info(f"📊 Fetching usage data for user: {user.email} (Plan: {plan})")
-        
-        # Get current month boundaries
+
+        # ✅ Read plan from multiple possible sources
+        plan = (
+            getattr(user, 'subscription_plan', None)
+            or getattr(user, 'plan', None)
+            or getattr(request, 'effective_plan', None)
+            or 'free'
+        )
+
+        logger.info(f"📊 Fetching usage for user: {user.email} (Plan: {plan})")
+
+        # ============================================
+        # PERIOD BOUNDARIES
+        # ============================================
         now = datetime.utcnow()
         month_start = datetime(now.year, now.month, 1, 0, 0, 0)
-        
-        # Calculate next month start
-        if now.month == 12:
-            next_month_start = datetime(now.year + 1, 1, 1, 0, 0, 0)
-        else:
-            next_month_start = datetime(now.year, now.month + 1, 1, 0, 0, 0)
-        
-        # Get plan limits
+        next_month_start = (
+            datetime(now.year + 1, 1, 1, 0, 0, 0)
+            if now.month == 12
+            else datetime(now.year, now.month + 1, 1, 0, 0, 0)
+        )
+
+        # ============================================
+        # PLAN LIMITS
+        # ============================================
         plan_limits = get_plan_limits(plan)
-        
-        # ===== 1. API CALLS USAGE (from APIUsage model) =====
+
+        # ============================================
+        # 1. API CALLS
+        # ============================================
+        api_calls_used = 0
+        feature_breakdown = {}
         try:
             api_calls_used = APIUsage.query.filter(
                 APIUsage.user_id == user_id,
                 APIUsage.timestamp >= month_start,
                 APIUsage.timestamp < next_month_start
             ).count()
-            
-            # Group by feature if needed for detailed breakdown
+
             feature_usage = db.session.query(
                 APIUsage.feature,
                 db.func.count(APIUsage.id).label('count')
@@ -135795,116 +135975,142 @@ def get_current_usage():
                 APIUsage.timestamp < next_month_start,
                 APIUsage.feature.isnot(None)
             ).group_by(APIUsage.feature).all()
-            
+
             feature_breakdown = {f.feature: f.count for f in feature_usage}
-            
         except Exception as e:
             logger.warning(f"Error counting API calls: {e}")
-            api_calls_used = 0
-            feature_breakdown = {}
-        
-        # ===== 2. UPLOADS USAGE (from Document model) =====
+
+        # ============================================
+        # 2. UPLOADS + STORAGE
+        # ============================================
+        uploads_used = 0
+        storage_mb = 0
         try:
             uploads_used = Document.query.filter(
                 Document.user_id == user_id,
                 Document.uploaded_at >= month_start,
                 Document.uploaded_at < next_month_start
             ).count()
-            
-            # Calculate total storage used
+
             storage_result = db.session.query(
                 db.func.sum(Document.file_size).label('total_bytes')
-            ).filter(
-                Document.user_id == user_id
-            ).first()
-            
+            ).filter(Document.user_id == user_id).first()
+
             storage_bytes = storage_result.total_bytes if storage_result and storage_result.total_bytes else 0
             storage_mb = round(storage_bytes / (1024 * 1024), 2)
-            
         except Exception as e:
             logger.warning(f"Error counting uploads: {e}")
-            uploads_used = 0
-            storage_bytes = 0
-            storage_mb = 0
-        
-        # ===== 3. TEAM MEMBERS USAGE =====
+
+        # ============================================
+        # 3. TEAM MEMBERS
+        # ============================================
+        team_members_used = 1
         try:
-            if hasattr(user, 'organization_id') and user.organization_id:
-                team_members_used = User.query.filter_by(
-                    organization_id=user.organization_id
-                ).count()
+            company_id = getattr(user, 'company_id', None)
+
+            if company_id:
+                team_members_used = User.query.filter_by(company_id=company_id).count()
+
+                if team_members_used == 0:
+                    team_members_used = 1
             else:
-                # Count users with same company/team
-                team_members_used = 1  # Just the user themselves
-                
-                # If user has company_name, try to find others
-                if hasattr(user, 'company_name') and user.company_name:
-                    team_members_used = User.query.filter(
-                        User.company_name == user.company_name,
-                        User.id != user_id
-                    ).count() + 1
+                team_members_used = 1
         except Exception as e:
             logger.warning(f"Error counting team members: {e}")
-            team_members_used = 1
-        
-        # ===== 4. AI REQUESTS USAGE =====
+
+        # ============================================
+        # 4. AI REQUESTS
+        # ============================================
+        ai_requests_used = 0
         try:
-            # Try to count from APIUsage with feature='ai_request'
             ai_requests_used = APIUsage.query.filter(
                 APIUsage.user_id == user_id,
                 APIUsage.feature == 'ai_request',
                 APIUsage.timestamp >= month_start,
                 APIUsage.timestamp < next_month_start
             ).count()
-            
-            # If no feature tracking, try from AIRequest model if exists
-            if ai_requests_used == 0 and 'AIRequest' in dir():
-                ai_requests_used = AIRequest.query.filter(
-                    AIRequest.user_id == user_id,
-                    AIRequest.created_at >= month_start,
-                    AIRequest.created_at < next_month_start
-                ).count()
+
+            if ai_requests_used == 0:
+                try:
+                    from models import AIRequest
+                    ai_requests_used = AIRequest.query.filter(
+                        AIRequest.user_id == user_id,
+                        AIRequest.created_at >= month_start,
+                        AIRequest.created_at < next_month_start
+                    ).count()
+                except (ImportError, AttributeError):
+                    pass
         except Exception as e:
             logger.warning(f"Error counting AI requests: {e}")
-            ai_requests_used = 0
-        
-        # ===== 5. VIDEO MINUTES USAGE =====
+
+        # ============================================
+        # 5. VIDEO MINUTES
+        # ============================================
+        video_minutes_used = 0
         try:
-            # Calculate from VideoAnalysis model if exists
-            if 'VideoAnalysis' in dir():
-                video_result = db.session.query(
-                    db.func.sum(VideoAnalysis.duration).label('total_minutes')
-                ).filter(
-                    VideoAnalysis.user_id == user_id,
-                    VideoAnalysis.analyzed_at >= month_start,
-                    VideoAnalysis.analyzed_at < next_month_start
-                ).first()
-                
-                video_minutes_used = round(video_result.total_minutes / 60, 2) if video_result and video_result.total_minutes else 0
-            else:
-                video_minutes_used = 0
+            from models import VideoAnalysis
+            video_result = db.session.query(
+                db.func.sum(VideoAnalysis.duration).label('total_seconds')
+            ).filter(
+                VideoAnalysis.user_id == user_id,
+                VideoAnalysis.analyzed_at >= month_start,
+                VideoAnalysis.analyzed_at < next_month_start
+            ).first()
+
+            if video_result and video_result.total_seconds:
+                video_minutes_used = round(video_result.total_seconds / 60, 2)
+        except (ImportError, AttributeError):
+            pass
         except Exception as e:
             logger.warning(f"Error counting video minutes: {e}")
-            video_minutes_used = 0
-        
-        # ===== 6. CAMERAS USAGE =====
+
+        # ============================================
+        # 6. CAMERAS
+        # ============================================
+        cameras_used = 0
         try:
-            # Count from CameraFeed model if exists
-            if 'CameraFeed' in dir():
-                cameras_used = CameraFeed.query.filter_by(
-                    user_id=user_id,
-                    is_active=True
-                ).count()
-            else:
-                cameras_used = 0
+            from models import CameraFeed
+            cameras_used = CameraFeed.query.filter_by(
+                user_id=user_id,
+                is_active=True
+            ).count()
+        except (ImportError, AttributeError):
+            pass
         except Exception as e:
             logger.warning(f"Error counting cameras: {e}")
-            cameras_used = 0
-        
-        # ===== BUILD RESPONSE =====
+
+        # ============================================
+        # 7. MONITORING STATIONS
+        # ============================================
+        monitoring_stations_used = 0
+        try:
+            from models import MonitoringStation
+            monitoring_stations_used = MonitoringStation.query.filter_by(
+                user_id=user_id,
+                is_active=True
+            ).count()
+        except (ImportError, AttributeError):
+            pass
+        except Exception as e:
+            logger.warning(f"Error counting monitoring stations: {e}")
+
+        # ============================================
+        # 8. HOSPITALS
+        # ============================================
+        hospitals_used = 0
+        try:
+            company_id = getattr(user, 'company_id', None)
+            if company_id:
+                hospitals_used = Hospital.query.filter_by(company_id=company_id).count()
+        except Exception as e:
+            logger.warning(f"Error counting hospitals: {e}")
+
+        # ============================================
+        # BUILD RESPONSE
+        # ============================================
         usage_data = {
             'plan': plan,
-            'plan_display': PLANS.get(plan, {}).get('label', plan.capitalize()) if 'PLANS' in dir() else plan.capitalize(),
+            'plan_display': plan.capitalize(),
             'period': {
                 'month': now.month,
                 'year': now.year,
@@ -135912,93 +136118,140 @@ def get_current_usage():
                 'end': next_month_start.isoformat(),
                 'reset_date': next_month_start.isoformat()
             },
+
+            # Numeric quotas
             'uploads': {
                 'used': uploads_used,
-                'total': plan_limits.get('uploads', 3),
-                'remaining': _calculate_remaining(uploads_used, plan_limits.get('uploads', 3)),
-                'percentage': _calculate_percentage(uploads_used, plan_limits.get('uploads', 3))
+                'total': plan_limits.get('uploads', 5),
+                'remaining': _calculate_remaining(uploads_used, plan_limits.get('uploads', 5)),
+                'percentage': _calculate_percentage(uploads_used, plan_limits.get('uploads', 5)),
             },
             'apiCalls': {
                 'used': api_calls_used,
-                'total': plan_limits.get('apiCalls', 20),
-                'remaining': _calculate_remaining(api_calls_used, plan_limits.get('apiCalls', 20)),
-                'percentage': _calculate_percentage(api_calls_used, plan_limits.get('apiCalls', 20)),
-                'breakdown': feature_breakdown if feature_breakdown else None
+                'total': plan_limits.get('apiCalls', 50),
+                'remaining': _calculate_remaining(api_calls_used, plan_limits.get('apiCalls', 50)),
+                'percentage': _calculate_percentage(api_calls_used, plan_limits.get('apiCalls', 50)),
+                'breakdown': feature_breakdown if feature_breakdown else None,
             },
             'teamMembers': {
                 'used': team_members_used,
                 'total': plan_limits.get('teamMembers', 1),
                 'remaining': _calculate_remaining(team_members_used, plan_limits.get('teamMembers', 1)),
-                'percentage': _calculate_percentage(team_members_used, plan_limits.get('teamMembers', 1))
+                'percentage': _calculate_percentage(team_members_used, plan_limits.get('teamMembers', 1)),
             },
             'videoMinutes': {
                 'used': video_minutes_used,
-                'total': plan_limits.get('videoMinutes', 0),
-                'remaining': _calculate_remaining(video_minutes_used, plan_limits.get('videoMinutes', 0)),
-                'percentage': _calculate_percentage(video_minutes_used, plan_limits.get('videoMinutes', 0))
+                'total': plan_limits.get('videoMinutes', 10),
+                'remaining': _calculate_remaining(video_minutes_used, plan_limits.get('videoMinutes', 10)),
+                'percentage': _calculate_percentage(video_minutes_used, plan_limits.get('videoMinutes', 10)),
             },
             'aiRequests': {
                 'used': ai_requests_used,
                 'total': plan_limits.get('aiRequests', 10),
                 'remaining': _calculate_remaining(ai_requests_used, plan_limits.get('aiRequests', 10)),
-                'percentage': _calculate_percentage(ai_requests_used, plan_limits.get('aiRequests', 10))
+                'percentage': _calculate_percentage(ai_requests_used, plan_limits.get('aiRequests', 10)),
             },
             'storage': {
                 'used': storage_mb,
                 'total': plan_limits.get('storage', 100),
                 'unit': 'MB',
-                'remaining': max(0, plan_limits.get('storage', 100) - storage_mb) if isinstance(plan_limits.get('storage', 100), (int, float)) else 'Unlimited',
-                'percentage': min(100, round((storage_mb / plan_limits.get('storage', 100)) * 100, 2)) if isinstance(plan_limits.get('storage', 100), (int, float)) and plan_limits.get('storage', 100) > 0 else 0
+                'remaining': _calculate_remaining(storage_mb, plan_limits.get('storage', 100)),
+                'percentage': _calculate_percentage(storage_mb, plan_limits.get('storage', 100)),
             },
             'cameras': {
                 'used': cameras_used,
                 'total': plan_limits.get('cameras', 1),
                 'remaining': _calculate_remaining(cameras_used, plan_limits.get('cameras', 1)),
-                'percentage': _calculate_percentage(cameras_used, plan_limits.get('cameras', 1))
+                'percentage': _calculate_percentage(cameras_used, plan_limits.get('cameras', 1)),
             },
-            'limits': plan_limits,  # Include full limits for reference
-            'is_unlimited': any(v == 'Unlimited' or v == 'Custom' for v in plan_limits.values())
+            'monitoringStations': {
+                'used': monitoring_stations_used,
+                'total': plan_limits.get('monitoringStations', 1),
+                'remaining': _calculate_remaining(monitoring_stations_used, plan_limits.get('monitoringStations', 1)),
+                'percentage': _calculate_percentage(monitoring_stations_used, plan_limits.get('monitoringStations', 1)),
+            },
+            'hospitals': {
+                'used': hospitals_used,
+                'total': plan_limits.get('hospitals', 0),
+                'remaining': _calculate_remaining(hospitals_used, plan_limits.get('hospitals', 0)),
+                'percentage': _calculate_percentage(hospitals_used, plan_limits.get('hospitals', 0)),
+            },
+
+            # Feature flags (so frontend can show/hide modules)
+            'featureFlags': {
+                'hospitalManagement': plan_limits.get('hospitalManagement', False),
+                'fishboneAnalysis': plan_limits.get('fishboneAnalysis', False),
+                'aiCameraMonitoring': plan_limits.get('aiCameraMonitoring', False),
+                'weatherIntelligence': plan_limits.get('weatherIntelligence', False),
+                'predictiveAnalytics': plan_limits.get('predictiveAnalytics', 'none'),
+                'complianceAutomation': plan_limits.get('complianceAutomation', False),
+                'documentManagement': plan_limits.get('documentManagement', False),
+                'whiteLabel': plan_limits.get('whiteLabel', False),
+                'apiAccess': plan_limits.get('apiAccess', False),
+                'slaGuarantee': plan_limits.get('slaGuarantee', False),
+            },
+
+            'limits': plan_limits,
+            'is_unlimited': any(
+                v in ('Unlimited', 'Custom')
+                for k, v in plan_limits.items()
+                if isinstance(v, str)
+            ),
         }
-        
-        # Add warning if approaching limits
+
+        # ============================================
+        # WARNINGS
+        # ============================================
         warnings = []
-        for key, data in usage_data.items():
-            if isinstance(data, dict) and 'percentage' in data and data.get('percentage', 0) >= 80:
-                if data.get('percentage', 0) >= 95:
-                    warnings.append(f"Critical: {key} usage at {data['percentage']}%")
-                else:
-                    warnings.append(f"Warning: {key} usage at {data['percentage']}%")
-        
+        for key in ['uploads', 'apiCalls', 'teamMembers', 'videoMinutes', 'aiRequests', 'storage', 'cameras']:
+            data = usage_data.get(key, {})
+            pct = data.get('percentage', 0)
+            if isinstance(pct, (int, float)) and pct >= 80:
+                level = 'Critical' if pct >= 95 else 'Warning'
+                warnings.append(f"{level}: {key} usage at {pct}%")
+
         if warnings:
             usage_data['warnings'] = warnings
-        
-        logger.info(f"✅ Usage data retrieved for user: {user.email} (Plan: {plan})")
-        
+
+        logger.info(f"✅ Usage retrieved for {user.email} (Plan: {plan})")
         return jsonify(usage_data), 200
-        
+
     except Exception as e:
-        logger.error(f"❌ Error getting usage data: {e}")
+        logger.error(f"❌ Error getting usage: {e}")
         import traceback
         traceback.print_exc()
-        
-        # Return safe fallback data
+
+        # Safe fallback
         return jsonify({
             'plan': 'free',
             'period': {
                 'month': datetime.utcnow().month,
                 'year': datetime.utcnow().year,
-                'reset_date': datetime.utcnow().isoformat()
+                'reset_date': datetime.utcnow().isoformat(),
             },
-            'uploads': {'used': 0, 'total': 3, 'remaining': 3, 'percentage': 0},
-            'apiCalls': {'used': 0, 'total': 20, 'remaining': 20, 'percentage': 0},
+            'uploads': {'used': 0, 'total': 5, 'remaining': 5, 'percentage': 0},
+            'apiCalls': {'used': 0, 'total': 50, 'remaining': 50, 'percentage': 0},
             'teamMembers': {'used': 1, 'total': 1, 'remaining': 0, 'percentage': 100},
-            'videoMinutes': {'used': 0, 'total': 0, 'remaining': 0, 'percentage': 0},
+            'videoMinutes': {'used': 0, 'total': 10, 'remaining': 10, 'percentage': 0},
             'aiRequests': {'used': 0, 'total': 10, 'remaining': 10, 'percentage': 0},
             'storage': {'used': 0, 'total': 100, 'unit': 'MB', 'remaining': 100, 'percentage': 0},
             'cameras': {'used': 0, 'total': 1, 'remaining': 1, 'percentage': 0},
-            'error': str(e)
+            'monitoringStations': {'used': 0, 'total': 1, 'remaining': 1, 'percentage': 0},
+            'hospitals': {'used': 0, 'total': 0, 'remaining': 0, 'percentage': 0},
+            'featureFlags': {
+                'hospitalManagement': False,
+                'fishboneAnalysis': False,
+                'aiCameraMonitoring': False,
+                'weatherIntelligence': False,
+                'predictiveAnalytics': 'none',
+                'complianceAutomation': False,
+                'documentManagement': False,
+                'whiteLabel': False,
+                'apiAccess': False,
+                'slaGuarantee': False,
+            },
+            'error': str(e),
         }), 200
-
 
 def _calculate_remaining(used, total):
     """Calculate remaining units with proper handling of 'Unlimited'"""
@@ -136017,167 +136270,117 @@ def _calculate_percentage(used, total):
 
 
 def get_plan_limits(plan):
-    """Get limits for a specific plan - ENHANCED VERSION"""
-    # Normalize plan name
-    plan = plan.lower() if plan else 'free'
-    
-    # Plan mapping for variations
-    plan_mapping = {
-        'free_trial': 'free',
-        'trial': 'free',
-        'free_forever': 'free',
-        'basic_trial': 'free',
-        'starter': 'basic',
-        'standard': 'basic',
-        'professional': 'pro',
-        'business': 'pro',
-        'premium': 'pro',
-        'enterprise_plus': 'enterprise',
-        'corporate': 'enterprise',
-        'ultimate': 'enterprise'
-    }
-    
-    # Apply mapping if needed
-    if plan in plan_mapping:
-        plan = plan_mapping[plan]
-    
-    limits = {
-        'free': {
-            'uploads': 3,
-            'apiCalls': 20,
-            'teamMembers': 1,
-            'videoMinutes': 0,
-            'aiRequests': 10,
-            'storage': 100,  # MB
-            'cameras': 1,
-            'support': 'community',
-            'features': ['basic_dashboard', 'incident_reporting']
-        },
-        'basic': {
-            'uploads': 100,
-            'apiCalls': 500,
-            'teamMembers': 5,
-            'videoMinutes': 0,
-            'aiRequests': 100,
-            'storage': 500,  # MB
-            'cameras': 3,
-            'support': 'email',
-            'features': ['advanced_dashboard', 'incident_reporting', 'document_generation', 'basic_analytics']
-        },
-        'pro': {
-            'uploads': 500,
-            'apiCalls': 2000,
-            'teamMembers': 20,
-            'videoMinutes': 100,
-            'aiRequests': 500,
-            'storage': 2000,  # MB (2GB)
-            'cameras': 10,
-            'support': 'priority',
-            'features': ['all_basic', 'ml_analysis', 'api_access', 'advanced_analytics', 'custom_reports', 'team_management']
-        },
-        'enterprise': {
-            'uploads': 'Unlimited',
-            'apiCalls': 'Custom',
-            'teamMembers': 'Unlimited',
-            'videoMinutes': 'Custom',
-            'aiRequests': 'Unlimited',
-            'storage': 'Custom',
-            'cameras': 'Unlimited',
-            'support': 'dedicated',
-            'features': ['all_pro', 'sla_guarantee', 'custom_integrations', 'on_premise', 'white_label', 'dedicated_support']
-        }
-    }
-    
-    # Return limits for requested plan, default to free
-    result = limits.get(plan, limits['free']).copy()
-    result['plan_name'] = plan
-    return result
+    """
+    Get limits for a plan — derived from PLANS dict.
+    Returns both camelCase and snake_case for compatibility.
+    """
+    canonical = resolve_plan_name(plan)
+    config = PLANS.get(canonical, PLANS['free'])
+    limits = config['limits']
+    flags = config['feature_flags']
 
+    return {
+        # Snake case (original)
+        'uploads_per_month': limits.get('uploads_per_month'),
+        'api_calls_per_month': limits.get('api_calls_per_month'),
+        'team_members': limits.get('team_members'),
+        'monitoring_stations': limits.get('monitoring_stations'),
+        'ai_requests_per_month': limits.get('ai_requests_per_month'),
+        'camera_feeds': limits.get('camera_feeds'),
+        'video_analysis_minutes': limits.get('video_analysis_minutes'),
+        'storage_mb': limits.get('storage_mb'),
+        'hospitals': limits.get('hospitals'),
+
+        # Camel case (for usage endpoint)
+        'uploads': limits.get('uploads_per_month'),
+        'apiCalls': limits.get('api_calls_per_month'),
+        'teamMembers': limits.get('team_members'),
+        'monitoringStations': limits.get('monitoring_stations'),
+        'aiRequests': limits.get('ai_requests_per_month'),
+        'cameras': limits.get('camera_feeds'),
+        'videoMinutes': limits.get('video_analysis_minutes'),
+        'storage': limits.get('storage_mb'),
+
+        # Feature flags
+        'hospitalManagement': flags.get('hospital_management'),
+        'fishboneAnalysis': flags.get('fishbone_analysis'),
+        'aiCameraMonitoring': flags.get('ai_camera_monitoring'),
+        'weatherIntelligence': flags.get('weather_intelligence'),
+        'predictiveAnalytics': flags.get('predictive_analytics'),
+        'complianceAutomation': flags.get('compliance_automation'),
+        'documentManagement': flags.get('document_management'),
+        'whiteLabel': flags.get('white_label'),
+        'apiAccess': flags.get('api_access'),
+        'slaGuarantee': flags.get('sla_guarantee'),
+        'onPremise': flags.get('on_premise'),
+
+        # Support
+        'support': config.get('support'),
+
+        # Plan identity
+        'plan_name': canonical,
+        'label': config.get('label'),
+    }
 
 @app.route('/api/plans/pricing', methods=['GET'])
-# No @jwt_required - make it public for pricing page
 def get_plans_pricing():
-    """Get pricing for all plans - PUBLIC ENDPOINT"""
+    """Get pricing + features for all plans — PUBLIC ENDPOINT"""
     try:
         country = request.args.get('country', 'default')
-        
-        # Define static pricing data directly in the endpoint
-        pricing = {
-            'free': {
-                '1_month': 0,
-                '6_month': 0,
-                '1_year': 0,
-                'currency': 'USD'
-            },
-            'basic': {
-                '1_month': 20,
-                '6_month': 100,
-                '1_year': 180,
-                'currency': 'USD'
-            },
-            'pro': {
-                '1_month': 50,
-                '6_month': 250,
-                '1_year': 450,
-                'currency': 'USD'
-            },
-            'enterprise': {
-                '1_month': 'Custom',
-                '6_month': 'Custom',
-                '1_year': 'Custom',
-                'currency': 'USD'
+
+        # Build pricing from PLANS dict
+        pricing = {}
+        for plan_id, config in PLANS.items():
+            pricing[plan_id] = {
+                'label': config['label'],
+                '1_month': config['price_usd'],
+                '6_month': round(config['price_usd'] * 5, 2) if isinstance(config['price_usd'], (int, float)) else 'Custom',
+                '1_year': round(config['price_usd'] * 9, 2) if isinstance(config['price_usd'], (int, float)) else 'Custom',
+                'currency': 'USD',
+                'features': config['features'],
+                'limits': config['limits'],
+                'feature_flags': config['feature_flags'],
+                'support': config['support'],
             }
-        }
-        
-        # Country-specific pricing overrides
+
+        # Country-specific overrides
         country_pricing = {
             'Ghana': {
                 'basic': {'1_month': 100, '6_month': 500, '1_year': 900, 'currency': 'GHS'},
                 'pro': {'1_month': 200, '6_month': 1000, '1_year': 1800, 'currency': 'GHS'},
-                'enterprise': {'1_month': 'Custom', '6_month': 'Custom', '1_year': 'Custom', 'currency': 'GHS'}
+                'enterprise': {'1_month': 'Custom', '6_month': 'Custom', '1_year': 'Custom', 'currency': 'GHS'},
             },
             'Qatar': {
                 'basic': {'1_month': 100, '6_month': 500, '1_year': 900, 'currency': 'QAR'},
                 'pro': {'1_month': 300, '6_month': 1500, '1_year': 2700, 'currency': 'QAR'},
-                'enterprise': {'1_month': 'Custom', '6_month': 'Custom', '1_year': 'Custom', 'currency': 'QAR'}
+                'enterprise': {'1_month': 'Custom', '6_month': 'Custom', '1_year': 'Custom', 'currency': 'QAR'},
             },
             'India': {
                 'basic': {'1_month': 1500, '6_month': 7500, '1_year': 13500, 'currency': 'INR'},
                 'pro': {'1_month': 3500, '6_month': 17500, '1_year': 31500, 'currency': 'INR'},
-                'enterprise': {'1_month': 'Custom', '6_month': 'Custom', '1_year': 'Custom', 'currency': 'INR'}
+                'enterprise': {'1_month': 'Custom', '6_month': 'Custom', '1_year': 'Custom', 'currency': 'INR'},
             },
             'United States': {
                 'basic': {'1_month': 29, '6_month': 150, '1_year': 270, 'currency': 'USD'},
                 'pro': {'1_month': 79, '6_month': 420, '1_year': 756, 'currency': 'USD'},
-                'enterprise': {'1_month': 'Custom', '6_month': 'Custom', '1_year': 'Custom', 'currency': 'USD'}
-            }
+                'enterprise': {'1_month': 'Custom', '6_month': 'Custom', '1_year': 'Custom', 'currency': 'USD'},
+            },
         }
-        
-        # Apply country-specific overrides if available
+
         if country in country_pricing:
-            for plan, plan_pricing in country_pricing[country].items():
+            for plan, overrides in country_pricing[country].items():
                 if plan in pricing:
-                    pricing[plan].update(plan_pricing)
-                else:
-                    pricing[plan] = plan_pricing
-        
-        logger.info(f"Pricing retrieved for country: {country}")
-        
-        return jsonify(pricing), 200
-        
+                    pricing[plan].update(overrides)
+
+        return jsonify({
+            'success': True,
+            'country': country,
+            'data': pricing,
+        }), 200
+
     except Exception as e:
         logger.error(f"Error getting pricing: {e}")
-        import traceback
-        traceback.print_exc()
-        
-        # Return fallback pricing
-        fallback_pricing = {
-            'free': {'1_month': 0, '6_month': 0, '1_year': 0, 'currency': 'USD'},
-            'basic': {'1_month': 20, '6_month': 100, '1_year': 180, 'currency': 'USD'},
-            'pro': {'1_month': 50, '6_month': 250, '1_year': 450, 'currency': 'USD'},
-            'enterprise': {'1_month': 'Custom', '6_month': 'Custom', '1_year': 'Custom', 'currency': 'USD'}
-        }
-        return jsonify(fallback_pricing), 200
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 # Change this endpoint from requiring JWT to public access
 @app.route('/api/payment/methods/<country>', methods=['GET'])
