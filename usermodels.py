@@ -710,15 +710,9 @@ class Document(db.Model):
     
     id = db.Column(db.Integer, primary_key=True)
     
-    # ============================================================
-    # BACKWARD COMPATIBILITY - Keep user_id for existing endpoints
-    # ============================================================
     user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False, index=True)
     analysis_result = db.Column(db.JSON, nullable=True, default=None)
     
-    # ============================================================
-    # NEW DOCUMENT MANAGEMENT FIELDS
-    # ============================================================
     title = db.Column(db.String(255), nullable=False)
     description = db.Column(db.Text)
     content = db.Column(db.Text)
@@ -736,14 +730,8 @@ class Document(db.Model):
     file_hash = db.Column(db.String(255))
     mime_type = db.Column(db.String(100))
     
-    # ✅ FIXED: Store tags as JSON string in TEXT column
     tags = db.Column(db.Text, default='[]')
     
-    # ============================================================
-    # ✅ NEW: Editing Source — distinguishes where a doc came from
-    #   'regular' — normal upload or modal-edited document
-    #   'sidebar' — created/edited in standalone sidebar editor
-    # ============================================================
     editing_source = db.Column(db.String(20), default='regular', index=True)
     
     is_confidential = db.Column(db.Boolean, default=False)
@@ -759,27 +747,18 @@ class Document(db.Model):
     site_id = db.Column(db.Integer)
     parent_document_id = db.Column(db.Integer)
     
-    # ============================================================
-    # USER REFERENCES (Both for backward compatibility)
-    # ============================================================
     created_by = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
     updated_by = db.Column(db.Integer, db.ForeignKey('users.id'))
     reviewed_by = db.Column(db.Integer, db.ForeignKey('users.id'))
     approved_by = db.Column(db.Integer, db.ForeignKey('users.id'))
     
-    # ============================================================
-    # TIMESTAMPS
-    # ============================================================
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     reviewed_at = db.Column(db.DateTime)
     approved_at = db.Column(db.DateTime)
     published_at = db.Column(db.DateTime)
     archived_at = db.Column(db.DateTime)
-    
-    # ============================================================
-    # RELATIONSHIPS
-    # ============================================================
+
     user = db.relationship('User', foreign_keys=[user_id], backref=db.backref('user_documents', lazy='dynamic'))
     
     creator = db.relationship('User', foreign_keys=[created_by], backref=db.backref('created_documents', lazy='dynamic'))
