@@ -7638,7 +7638,43 @@ class ChemicalIncident(db.Model):
             'date': self.created_at.strftime('%Y-%m-%d')
         }
 
+class VideoEvidence(db.Model):
+    __tablename__ = 'video_evidence'
 
+    id = db.Column(db.Integer, primary_key=True)
+    
+    # 🔐 Tenant Isolation
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), nullable=False, index=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False, index=True)
+    site_id = db.Column(db.Integer, db.ForeignKey('sites.id'), nullable=True, index=True)
+    
+    # 📹 Metadata
+    session_id = db.Column(db.String(100), index=True)
+    camera_id = db.Column(db.String(100))
+    violation_type = db.Column(db.String(50), nullable=False)
+    confidence = db.Column(db.Float, default=0.0)
+    
+    # 📁 File
+    filename = db.Column(db.String(255), nullable=False)
+    file_size = db.Column(db.Integer)
+    mime_type = db.Column(db.String(50), default="video/webm")
+    
+    # ⏱️ Lifecycle
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    expires_at = db.Column(db.DateTime, default=lambda: datetime.utcnow() + timedelta(days=30))
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'violation_type': self.violation_type,
+            'confidence': self.confidence,
+            'camera_id': self.camera_id,
+            'session_id': self.session_id,
+            'created_at': self.created_at.isoformat(),
+            'expires_at': self.expires_at.isoformat(),
+            'file_size_mb': round((self.file_size or 0) / (1024 * 1024), 2),
+            'download_url': f"/api/evidence/{self.id}/download"
+        }
 
 __all__ = [
     # Core models
@@ -7991,7 +8027,7 @@ __all__ = [
      'LessonLearned', 'LessonReaction',
     'EscalationRule', 'EscalationHistory', 'IncidentCost', 'RegulatoryFiling', 'FishboneVersion', 'FishboneFiveWhys', 'AIAssistantSession', 'AIAssistantMessage', 
     'SimilarIncidentMatch', 'IncidentComparison', 'IncidentClusterAnalysis', 'PredictiveAnalyticsRun', 'PredictiveScenario', 'AIGenerationLog', 'EnvironmentalSite', 'HospitalFinancialRecord',
-     'PlatformActivityLog', 'PlatformSessionTracking', 'Chemical', 'ChemicalIncident', 
+     'PlatformActivityLog', 'PlatformSessionTracking', 'Chemical', 'ChemicalIncident', VideoEvidence, 
     
 ]
 
