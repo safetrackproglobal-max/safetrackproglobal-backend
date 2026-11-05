@@ -181,7 +181,7 @@ class Hospital(db.Model):
     
     
     company = db.relationship('Company', foreign_keys=[company_id], backref='hospitals', lazy=True)
-    # NO RELATIONSHIPS HERE - they cause mapper initialization errors
+    
     
     def to_dict(self):
         return {
