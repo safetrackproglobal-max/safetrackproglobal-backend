@@ -2912,8 +2912,12 @@ def get_healthcare_context():
 def create_app():
     """Application factory pattern"""
     
-    # ✅ Postgres via pg8000 (pure-Python — avoids OpenSSL segfault with TF/torch)
-        # Normalize to psycopg2 driver
+    # ✅ Get the URL from environment
+    _db_url = os.getenv('DATABASE_URL') or os.getenv('DATABASE_URI')
+    if not _db_url:
+        raise RuntimeError("DATABASE_URL is not set — Postgres is required")
+        
+    # ✅ Normalize to psycopg2 driver
     if _db_url.startswith('postgres://'):
         _db_url = _db_url.replace('postgres://', 'postgresql+psycopg2://', 1)
     elif _db_url.startswith('postgresql://') and '+psycopg2' not in _db_url:
@@ -2921,8 +2925,7 @@ def create_app():
     
     print(f"🔗 [STARTUP] Using DB URL: {_db_url[:60]}...", flush=True)
     
-    app = Flask(__name__)
-    ...
+    app = Flask(__name__)    ...
     
     # Enhanced Configuration
     app.config.update(
