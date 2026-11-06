@@ -7701,20 +7701,19 @@ class VideoEvidence(db.Model):
 class ConsentRecord(db.Model):
     __tablename__ = 'consent_records'
 
-    id          = Column(Integer, primary_key=True)
-    user_id     = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
-    doc_type    = Column(String(32), nullable=False)
-    version     = Column(String(32), nullable=True)
-    accepted    = Column(Boolean, nullable=False, default=True)
-    accepted_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
-    ip_address  = Column(String(64), nullable=True)
-    user_agent  = Column(String(512), nullable=True)
-    source      = Column(String(32), nullable=False, default='signup')
+    id          = db.Column(db.Integer, primary_key=True)
+    user_id     = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False, index=True)
+    doc_type    = db.Column(db.String(32), nullable=False)
+    version     = db.Column(db.String(32), nullable=True)
+    accepted    = db.Column(db.Boolean, nullable=False, default=True)
+    accepted_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow, index=True)
+    ip_address  = db.Column(db.String(64), nullable=True)
+    user_agent  = db.Column(db.String(512), nullable=True)
+    source      = db.Column(db.String(32), nullable=False, default='signup')
 
     __table_args__ = (
-        Index('ix_consent_user_doc_time', 'user_id', 'doc_type', 'accepted_at'),
+        db.Index('ix_consent_user_doc_time', 'user_id', 'doc_type', 'accepted_at'),
     )
-
 
 __all__ = [
     # Core models
