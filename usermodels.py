@@ -26,7 +26,7 @@ class User(db.Model):
     currency = db.Column(db.String(16), default='USD')
     preferred_language = db.Column(db.String(8), default='en')
     hospital_id = db.Column(db.Integer, db.ForeignKey('hospitals.id'), nullable=True)
-    industry = db.Column(db.String(64), default='Healthcare')
+    industry = db.Column(db.String(64), nullable=True, default=None)
     company_name = db.Column(db.String(256))
     company_logo = db.Column(db.String(512))
     timezone = db.Column(db.String(64), default='UTC')
@@ -132,6 +132,28 @@ class User(db.Model):
     pdf_templates_created = db.Column(db.Integer, default=0, server_default='0')
     max_pdf_templates = db.Column(db.Integer, default=10, server_default='10')
 
+       # ==================== COMPLIANCE: CONSENT VERSIONS ====================
+    terms_version       = db.Column(db.String(32), nullable=True)
+    privacy_version     = db.Column(db.String(32), nullable=True)
+    dpa_version         = db.Column(db.String(32), nullable=True)
+    e_consent           = db.Column(db.Boolean, default=False, nullable=False, server_default='false')
+    marketing_consent   = db.Column(db.Boolean, default=False, nullable=False, server_default='false')
+    needs_consent       = db.Column(db.Boolean, default=False, nullable=False, server_default='false', index=True)
+
+    # ==================== COMPLIANCE: MFA ====================
+    mfa_enabled         = db.Column(db.Boolean, default=False, nullable=False, server_default='false', index=True)
+    mfa_secret          = db.Column(db.String(64), nullable=True)            # base32 TOTP
+    mfa_pending_secret  = db.Column(db.String(64), nullable=True)            # during setup
+    mfa_backup_codes    = db.Column(db.Text, nullable=True)                  # JSON array of SHA-256 hashes
+
+    # ==================== COMPLIANCE: AGE GATE / GUARDIAN ====================
+    date_of_birth          = db.Column(db.Date, nullable=True)
+    is_minor               = db.Column(db.Boolean, default=False, nullable=False, server_default='false')
+    guardian_email         = db.Column(db.String(255), nullable=True)
+    guardian_consent_given = db.Column(db.Boolean, default=False, nullable=False, server_default='false')
+    guardian_token         = db.Column(db.String(128), nullable=True)
+    is_super_admin = db.Column(db.Boolean, default=False, nullable=False, server_default='false')
+
     # ==================== RELATIONSHIPS ====================
     assigned_tasks = db.relationship('Task', back_populates='assigned_to', foreign_keys='Task.assigned_to_id')
     training_records = db.relationship('TrainingRecord', back_populates='user', foreign_keys='TrainingRecord.user_id')
@@ -159,6 +181,7 @@ class User(db.Model):
     approved_admins = db.relationship('User', backref=db.backref('approver', remote_side=[id]))
     subscription_history = db.relationship('SubscriptionHistory', backref='user', lazy=True, cascade='all, delete-orphan')
     payment_history = db.relationship('PaymentHistory', backref='user', lazy=True, cascade='all, delete-orphan')
+    
 
     # ---------- Null-safe helper ----------
     @staticmethod
@@ -250,6 +273,23 @@ class User(db.Model):
                 'subscription_ends_at': self.subscription_ends_at.isoformat() if self.subscription_ends_at else None
             }
             base_dict.update(admin_dict)
+
+                 # Compliance fields — always emitted so AuthContext can read them
+        compliance_dict = {
+            'terms_version':          self.terms_version,
+            'privacy_version':        self.privacy_version,
+            'dpa_version':            self.dpa_version,
+            'e_consent':              self.e_consent,
+            'marketing_consent':      self.marketing_consent,
+            'needs_consent':          self.needs_consent,
+            'mfa_enabled':            self.mfa_enabled,
+            'date_of_birth':          self.date_of_birth.isoformat() if self.date_of_birth else None,
+            'is_minor':               self.is_minor,
+            'guardian_email':         self.guardian_email,      # intentionally exposed; user may need to see it
+            'guardian_consent_given': self.guardian_consent_given,
+            # NEVER expose mfa_secret, mfa_pending_secret, mfa_backup_codes, or guardian_token
+        }
+        base_dict.update(compliance_dict)
         
         # Add usage tracking fields for all users (null-safe)
         usage_dict = {

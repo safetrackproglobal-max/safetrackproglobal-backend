@@ -1727,7 +1727,12 @@ class Company(db.Model):
     
     # Features & limits
     features = db.Column(db.Text, nullable=True)
+
     custom_limits = db.Column(db.Text, nullable=True)
+        # ==================== COMPLIANCE ====================
+    mfa_policy  = db.Column(db.String(16), nullable=False, default='optional', server_default='optional')
+    dpa_version = db.Column(db.String(32), nullable=True)
+    baa_version = db.Column(db.String(32), nullable=True)
     
     # Usage tracking
     monthly_api_calls_used = db.Column(db.Integer, default=0)
@@ -1810,6 +1815,9 @@ class Company(db.Model):
             'department_count': len(self.departments) if self.departments else 0,
             'project_count': len(self.projects) if self.projects else 0,
             'incident_count': len(self.incidents) if self.incidents else 0,
+            'mfa_policy': self.mfa_policy,
+            'dpa_version': self.dpa_version,
+            'baa_version': self.baa_version,
             'usage': {
                 'api_calls_used': self.monthly_api_calls_used,
                 'ai_requests_used': self.monthly_ai_requests_used,
@@ -1908,6 +1916,19 @@ class Company(db.Model):
         if 'all' in features:
             return True
         return feature_name in features
+        def requires_mfa_for(self, user_type):
+        """
+        Whether the company policy mandates MFA for this user type.
+        - 'optional'            → never required
+        - 'required_for_admins' → required for admin / company_admin
+        - 'required'            → required for everyone
+        """
+        if self.mfa_policy == 'required':
+            return True
+        if self.mfa_policy == 'required_for_admins' and user_type in ('admin', 'company_admin'):
+            return True
+        return False
+
     
     def reset_monthly_usage(self):
         """Reset monthly usage counters"""
@@ -2634,6 +2655,7 @@ class UserSession(db.Model):
     expires_at = db.Column(db.DateTime, nullable=False)
     is_active = db.Column(db.Boolean, default=True)
     logout_time = db.Column(db.DateTime)
+    mfa_used = db.Column(db.Boolean, default=False, nullable=False, server_default='false')
     
     # Relationship
     user = db.relationship('User', backref=db.backref('sessions', lazy=True))
@@ -7676,6 +7698,24 @@ class VideoEvidence(db.Model):
             'download_url': f"/api/evidence/{self.id}/download"
         }
 
+class ConsentRecord(db.Model):
+    __tablename__ = 'consent_records'
+
+    id          = Column(Integer, primary_key=True)
+    user_id     = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
+    doc_type    = Column(String(32), nullable=False)
+    version     = Column(String(32), nullable=True)
+    accepted    = Column(Boolean, nullable=False, default=True)
+    accepted_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+    ip_address  = Column(String(64), nullable=True)
+    user_agent  = Column(String(512), nullable=True)
+    source      = Column(String(32), nullable=False, default='signup')
+
+    __table_args__ = (
+        Index('ix_consent_user_doc_time', 'user_id', 'doc_type', 'accepted_at'),
+    )
+
+
 __all__ = [
     # Core models
     'Industry',
@@ -8027,7 +8067,7 @@ __all__ = [
      'LessonLearned', 'LessonReaction',
     'EscalationRule', 'EscalationHistory', 'IncidentCost', 'RegulatoryFiling', 'FishboneVersion', 'FishboneFiveWhys', 'AIAssistantSession', 'AIAssistantMessage', 
     'SimilarIncidentMatch', 'IncidentComparison', 'IncidentClusterAnalysis', 'PredictiveAnalyticsRun', 'PredictiveScenario', 'AIGenerationLog', 'EnvironmentalSite', 'HospitalFinancialRecord',
-     'PlatformActivityLog', 'PlatformSessionTracking', 'Chemical', 'ChemicalIncident', 'VideoEvidence', 
+     'PlatformActivityLog', 'PlatformSessionTracking', 'Chemical', 'ChemicalIncident', 'VideoEvidence', 'ConsentRecord',
     
 ]
 

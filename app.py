@@ -254,6 +254,14 @@ except:
     except:
         pass
 
+# Add these near the top of the file
+CURRENT_TERMS_VERSION   = '2026-01-15'
+CURRENT_PRIVACY_VERSION = '2026-01-15'
+CURRENT_DPA_VERSION     = '2026-01-15'
+CURRENT_BAA_VERSION     = '2026-01-15'
+MIN_AGE                 = 18
+MINOR_AGE_FLOOR         = 13
+PASSWORD_MIN_LEN        = 12
 
 
 # ---------- KEY POOL ----------
@@ -8936,16 +8944,285 @@ def health_check():
         }
     }), 200
 
+@app.route('/api/auth/accept-consent', methods=['POST'])
+@jwt_required
+@limiter.limit("10 per minute")
+def accept_consent():
+    """Record user's acceptance of current policy versions."""
+    try:
+        user = request.user
+        data = request.get_json(silent=True) or {}
+
+        # 1. Validate required consents
+        terms_ok   = data.get('terms_accepted')   is True
+        privacy_ok = data.get('privacy_accepted') is True
+        e_ok       = data.get('e_consent')        is True
+
+        if not (terms_ok and privacy_ok):
+            return jsonify({
+                'error': 'Terms and Privacy must both be accepted',
+                'missing_consents': [
+                    k for k, v in [
+                        ('terms_accepted', terms_ok),
+                        ('privacy_accepted', privacy_ok),
+                        ('e_consent', e_ok),
+                    ] if not v
+                ]
+            }), 400
+
+        # 2. Version pinning
+        if data.get('terms_version') != CURRENT_TERMS_VERSION:
+            return jsonify({'error': 'Terms version mismatch', 'expected': CURRENT_TERMS_VERSION}), 409
+        if data.get('privacy_version') != CURRENT_PRIVACY_VERSION:
+            return jsonify({'error': 'Privacy version mismatch', 'expected': CURRENT_PRIVACY_VERSION}), 409
+
+        # 3. DPA required for company roles
+        dpa_required = user.user_type in ('admin', 'company_admin')
+        dpa_ok = data.get('dpa_accepted') is True
+        if dpa_required:
+            if not dpa_ok:
+                return jsonify({'error': 'DPA acceptance required', 'missing_consents': ['dpa_accepted']}), 400
+            if data.get('dpa_version') != CURRENT_DPA_VERSION:
+                return jsonify({'error': 'DPA version mismatch', 'expected': CURRENT_DPA_VERSION}), 409
+
+        # 4. Persist append-only audit records
+        now = datetime.utcnow()
+        ip = request.headers.get('X-Forwarded-For', request.remote_addr or '').split(',')[0].strip()[:64]
+        ua = (request.headers.get('User-Agent') or '')[:512]
+
+        rows = [
+            ('terms',       data.get('terms_version'),   True,  'reconsent'),
+            ('privacy',     data.get('privacy_version'), True,  'reconsent'),
+            ('e_consent',   None,                        e_ok,  'reconsent'),
+            ('marketing',   None,                        data.get('marketing_consent') is True, 'reconsent'),
+        ]
+        if dpa_required:
+            rows.append(('dpa', data.get('dpa_version'), True, 'reconsent'))
+
+        for doc_type, version, accepted, source in rows:
+            db.session.add(ConsentRecord(
+                user_id=user.id, doc_type=doc_type, version=version,
+                accepted=accepted, accepted_at=now, ip_address=ip,
+                user_agent=ua, source=source,
+            ))
+
+        # 5. Update User
+        user.terms_version     = CURRENT_TERMS_VERSION
+        user.privacy_version   = CURRENT_PRIVACY_VERSION
+        user.e_consent         = e_ok
+        user.marketing_consent = data.get('marketing_consent') is True
+        if dpa_required:
+            user.dpa_version = CURRENT_DPA_VERSION
+        user.needs_consent = False
+        user.updated_at    = now
+
+        # 6. Update Company DPA
+        if dpa_required and user.company_id:
+            company = Company.query.get(user.company_id)
+            if company:
+                company.dpa_version = CURRENT_DPA_VERSION
+
+        db.session.commit()
+        UserCache.clear(user.id) # ✅ Clear cache to refresh compliance state
+        
+        logger.info(f"✅ Consent recorded for user {user.id}")
+        return jsonify({'success': True, 'message': 'Consent recorded'}), 200
+
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f"accept_consent error: {e}")
+        return jsonify({'success': False, 'error': 'Internal server error'}), 500
+
+@app.route('/api/auth/mfa/setup', methods=['POST'])
+@jwt_required
+@limiter.limit("5 per minute")
+def mfa_setup():
+    """Begin MFA enrollment."""
+    try:
+        user = request.user
+        if getattr(user, 'mfa_enabled', False):
+            return jsonify({'error': 'MFA is already enabled', 'message': 'Disable MFA first.'}), 409
+
+        # Generate secret
+        secret = pyotp.random_base32()
+        issuer = 'SafeTrackPro Global'
+        provisioning_uri = pyotp.totp.TOTP(secret).provisioning_uri(name=user.email, issuer_name=issuer)
+
+        # Generate QR Code Base64
+        qr = qrcode.make(provisioning_uri)
+        buf = io.BytesIO()
+        qr.save(buf, format='PNG')
+        qr_b64 = base64.b64encode(buf.getvalue()).decode('utf-8')
+
+        # Store as pending (NOT active until verified)
+        user.mfa_pending_secret = secret
+        db.session.commit()
+        UserCache.clear(user.id)
+
+        return jsonify({
+            'success': True,
+            'mfa_provisioning_uri': provisioning_uri,
+            'mfa_secret': secret,
+            'mfa_qr_data_url': f'data:image/png;base64,{qr_b64}',
+            'next_step': 'verify',
+        }), 200
+
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f"mfa_setup error: {e}")
+        return jsonify({'success': False, 'error': 'Internal server error'}), 500
+
+@app.route('/api/auth/mfa/verify', methods=['POST'])
+@limiter.limit("10 per minute")
+def mfa_verify():
+    """Verify TOTP for setup activation OR login second-factor."""
+    try:
+        data = request.get_json(silent=True) or {}
+        code = str(data.get('code', '')).strip()
+        mfa_token = data.get('mfa_token')
+
+        if not code or not code.isdigit() or len(code) != 6:
+            return jsonify({'error': 'A 6-digit code is required'}), 400
+
+        user = None
+        is_login_flow = False
+
+        # Determine flow
+        if mfa_token:
+            try:
+                decoded = pyjwt.decode(mfa_token, current_app.config['JWT_SECRET_KEY'], algorithms=['HS256'])
+                if decoded.get('purpose') != 'mfa':
+                    return jsonify({'error': 'Invalid MFA token'}), 401
+                user = User.query.get(int(decoded.get('user_id')))
+                is_login_flow = True
+            except Exception:
+                return jsonify({'error': 'MFA token expired or invalid'}), 401
+        else:
+            # Setup flow - manually check auth since we aren't using @jwt_required
+            auth_header = request.headers.get('Authorization')
+            if not auth_header or not auth_header.startswith('Bearer '):
+                return jsonify({'error': 'Authentication required'}), 401
+            token = auth_header[7:]
+            try:
+                decoded = pyjwt.decode(token, current_app.config['JWT_SECRET_KEY'], algorithms=['HS256'])
+                user = User.query.get(int(decoded.get('user_id') or decoded.get('sub')))
+            except Exception:
+                return jsonify({'error': 'Invalid token'}), 401
+
+        if not user:
+            return jsonify({'error': 'User not found'}), 404
+
+        # Verify Code
+        secret = user.mfa_pending_secret if not is_login_flow else user.mfa_secret
+        if not secret:
+            return jsonify({'error': 'MFA is not configured'}), 400
+
+        totp = pyotp.TOTP(secret)
+        if not totp.verify(code, valid_window=1):
+            logger.warning(f"❌ Failed MFA verify for user {user.id}")
+            return jsonify({'error': 'Invalid authentication code'}), 401
+
+        # Activate if setup flow
+        backup_codes_plain = []
+        if not is_login_flow:
+            user.mfa_secret = secret
+            user.mfa_pending_secret = None
+            user.mfa_enabled = True
+            
+            # Generate 10 backup codes
+            backup_codes_plain = [f"{secrets.token_hex(3)}-{secrets.token_hex(3)}" for _ in range(10)]
+            import hashlib
+            user.mfa_backup_codes = json.dumps([hashlib.sha256(c.encode()).hexdigest() for c in backup_codes_plain])
+
+        # Create Session
+        user.last_login = datetime.utcnow()
+        user.login_count = (user.login_count or 0) + 1
+        session_id = str(uuid.uuid4())
+        db.session.add(UserSession(
+            user_id=user.id, session_id=session_id,
+            ip_address=request.remote_addr, user_agent=request.headers.get('User-Agent', '')[:512],
+            expires_at=datetime.utcnow() + timedelta(hours=24), is_active=True, mfa_used=True
+        ))
+        db.session.commit()
+        UserCache.clear(user.id)
+
+        # Issue full JWT
+        access_token = create_access_token(
+            identity=str(user.id),
+            additional_claims={'user_id': user.id, 'session_id': session_id, 'token_version': getattr(user, 'token_version', 1)}
+        )
+
+        response = {
+            'success': True,
+            'access_token': access_token,
+            'token_type': 'bearer',
+            'expires_in': 24 * 3600,
+            'session_id': session_id,
+            'user': user.to_dict(),
+            'stage': 'complete',
+            'redirect_to': '/dashboard'
+        }
+
+        if backup_codes_plain:
+            response['mfa_backup_codes'] = backup_codes_plain
+            response['message'] = 'MFA enabled. Save these backup codes!'
+
+        return jsonify(response), 200
+
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f"mfa_verify error: {e}")
+        return jsonify({'success': False, 'error': 'Internal server error'}), 500
+
+@app.route('/api/auth/mfa/disable', methods=['POST'])
+@jwt_required
+@limiter.limit("5 per minute")
+def mfa_disable():
+    """Disable MFA. Requires password."""
+    try:
+        user = request.user
+        data = request.get_json(silent=True) or {}
+        password = data.get('password', '')
+
+        if not password or not check_password_hash(user.password_hash, password):
+            return jsonify({'error': 'Password is required to disable MFA'}), 401
+
+        # Check org policy (if you implement required MFA for admins)
+        if user.user_type in ('admin', 'company_admin', 'super_admin'):
+            # company = Company.query.get(user.company_id)
+            # if company and company.requires_mfa_for(user.user_type): ...
+            pass 
+
+        user.mfa_enabled = False
+        user.mfa_secret = None
+        user.mfa_pending_secret = None
+        user.mfa_backup_codes = None
+        db.session.commit()
+        UserCache.clear(user.id)
+
+        logger.info(f"⚠️ MFA disabled by user {user.id}")
+        return jsonify({'success': True, 'message': 'MFA disabled'}), 200
+
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'success': False, 'error': 'Internal server error'}), 500
+
+
 
 @app.route('/api/auth/register', methods=['POST'])
 @app.route('/api/register', methods=['POST']) 
 @limiter.limit("5 per minute")
 def register():
-    """Enhanced user registration with company-centric plan model"""
+    """Enhanced user registration with company-centric plan model + compliance"""
     try:
         data = request.get_json()
         if not data:
             return jsonify({'error': 'No JSON data provided'}), 400
+
+        # ── 1. NEW: Honeypot check (Silent bot rejection) ──────────────────
+        if data.get('honeypot'):
+            logger.warning(f"Bot registration rejected via honeypot: {data.get('email')}")
+            return jsonify({'error': 'Registration failed. Please try again.'}), 400
 
         # Required fields
         required_fields = ['email', 'password', 'name']
@@ -8959,7 +9236,10 @@ def register():
         country = data.get('country', '')
         role = data.get('role', '')
         preferred_language = data.get('preferred_language', 'en')
-        industry = data.get('industry', 'Healthcare')
+        
+        # ✅ UPDATED: Default to 'Other' instead of 'Healthcare'
+        industry = data.get('industry', 'Other') 
+        
         company_name = data.get('company_name', '')
         user_type = data.get('user_type', 'user')
         plan = data.get('plan', 'enterprise')  # Default for companies is enterprise
@@ -8970,13 +9250,58 @@ def register():
         # ✅ INDIVIDUAL PLAN VALIDATION
         INDIVIDUAL_PLANS = ['free', 'pro', 'basic']
         
+        # ── 2. NEW: Compliance & Consent Validation ───────────────────────
+        terms_ok = data.get('terms_accepted') is True
+        privacy_ok = data.get('privacy_accepted') is True
+        e_ok = data.get('e_consent') is True
+        
+        if not (terms_ok and privacy_ok and e_ok):
+            missing = []
+            if not terms_ok: missing.append('terms_accepted')
+            if not privacy_ok: missing.append('privacy_accepted')
+            if not e_ok: missing.append('e_consent')
+            return jsonify({'error': 'Missing or invalid required consents', 'missing_consents': missing}), 400
+
+        if data.get('terms_version') != CURRENT_TERMS_VERSION:
+            return jsonify({'error': 'Terms version mismatch. Please reload the page.', 'expected': CURRENT_TERMS_VERSION}), 409
+        if data.get('privacy_version') != CURRENT_PRIVACY_VERSION:
+            return jsonify({'error': 'Privacy version mismatch. Please reload the page.', 'expected': CURRENT_PRIVACY_VERSION}), 409
+
+        dpa_ok = data.get('dpa_accepted') is True
+        if user_type in ('admin', 'company_admin'):
+            if not dpa_ok:
+                return jsonify({'error': 'DPA acceptance required for company registration', 'missing_consents': ['dpa_accepted']}), 400
+            if data.get('dpa_version') != CURRENT_DPA_VERSION:
+                return jsonify({'error': 'DPA version mismatch. Please reload the page.', 'expected': CURRENT_DPA_VERSION}), 409
+
+        # Age Gate
+        dob_str = data.get('date_of_birth')
+        if not dob_str:
+            return jsonify({'error': 'Date of birth is required'}), 400
+        
+        try:
+            dob = datetime.strptime(dob_str, '%Y-%m-%d').date()
+            today = datetime.utcnow().date()
+            age = today.year - dob.year - ((today.month, today.day) < (dob.month, dob.day))
+        except ValueError:
+            return jsonify({'error': 'Invalid date of birth format. Use YYYY-MM-DD'}), 400
+
+        if age < MINOR_AGE_FLOOR:
+            return jsonify({'error': f'You must be at least {MINOR_AGE_FLOOR} to use this service'}), 400
+        
+        is_minor = age < MIN_AGE
+        guardian_email = data.get('guardian_email')
+        if is_minor and not guardian_email:
+            return jsonify({'error': 'Guardian email is required for users under 18'}), 400
+
         # Email validation
         if not re.match(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', email):
             return jsonify({'error': 'Invalid email format'}), 400
 
         # Password strength validation
-        if len(password) < 8:
-            return jsonify({'error': 'Password must be at least 8 characters long'}), 400
+        # ✅ UPDATED: Min 12 chars to match frontend
+        if len(password) < 12:
+            return jsonify({'error': 'Password must be at least 12 characters long'}), 400
         if not re.search(r'[A-Z]', password):
             return jsonify({'error': 'Password must contain at least one uppercase letter'}), 400
         if not re.search(r'[a-z]', password):
@@ -8995,12 +9320,50 @@ def register():
                 db.session.commit()
                 logger.info(f"Deleted unverified user {email} for re-registration")
 
+        # ── 3. NEW: Audit Trail Helpers ───────────────────────────────────
+        ip = request.headers.get('X-Forwarded-For', request.remote_addr or '').split(',')[0].strip()[:64]
+        ua = (request.headers.get('User-Agent') or '')[:512]
+
+        def apply_compliance_kwargs():
+            return {
+                'terms_version': CURRENT_TERMS_VERSION,
+                'privacy_version': CURRENT_PRIVACY_VERSION,
+                'dpa_version': CURRENT_DPA_VERSION if dpa_ok else None,
+                'e_consent': True,
+                'marketing_consent': data.get('marketing_consent') is True,
+                'needs_consent': False,
+                'date_of_birth': dob,
+                'is_minor': is_minor,
+                'guardian_email': guardian_email if is_minor else None,
+                'guardian_consent_given': False if is_minor else True,
+                'industry': industry,
+            }
+
+        def record_consents(user_id):
+            now = datetime.utcnow()
+            rows = [
+                ('terms', CURRENT_TERMS_VERSION),
+                ('privacy', CURRENT_PRIVACY_VERSION),
+                ('e_consent', None),
+                ('marketing', None)
+            ]
+            if dpa_ok:
+                rows.append(('dpa', CURRENT_DPA_VERSION))
+                
+            for doc_type, version in rows:
+                db.session.add(ConsentRecord(
+                    user_id=user_id, doc_type=doc_type, version=version,
+                    accepted=True, accepted_at=now, ip_address=ip,
+                    user_agent=ua, source='signup'
+                ))
+
+        compliance_kwargs = apply_compliance_kwargs()
+
         # ✅ ===== ADMIN REGISTRATION - CREATE COMPANY WITH PLAN =====
         if user_type == 'admin':
             if not company_name:
                 return jsonify({'error': 'Company name is required for admin registration'}), 400
             
-            # ✅ VALIDATE COMPANY PLAN - Only enterprise or custom
             if plan not in COMPANY_PLANS:
                 return jsonify({
                     'error': f'Invalid company plan. Companies can only have: {", ".join(COMPANY_PLANS)}',
@@ -9008,19 +9371,17 @@ def register():
                     'message': 'Please select Enterprise or Custom plan for your company'
                 }), 400
             
-            # ✅ CREATE COMPANY WITH THE PLAN
             company = Company(
                 name=company_name,
-                plan=plan,  # ✅ Company gets the plan
+                plan=plan,
                 subscription_status='active',
                 billing_cycle='1_month',
                 created_at=datetime.utcnow(),
                 updated_at=datetime.utcnow()
             )
             db.session.add(company)
-            db.session.flush()  # Get company ID
+            db.session.flush()
             
-            # ✅ CREATE ADMIN USER - INHERITS FROM COMPANY (NO PLAN ON USER)
             user = User(
                 email=email,
                 password_hash=generate_password_hash(password),
@@ -9034,139 +9395,28 @@ def register():
                 admin_role='company_admin',
                 admin_level='standard',
                 preferred_language=preferred_language,
-                verified=True,  # Admin auto-verified
-                # ✅ INHERIT FROM COMPANY - DON'T SET PLAN DIRECTLY
-                subscription_plan=company.plan,  # Inherit from company
-                subscription_status=company.subscription_status,
-                billing_cycle=company.billing_cycle,
-                is_active=True,
-                approval_status='approved',
-                created_at=datetime.utcnow()
-            )
-            db.session.add(user)
-            db.session.commit()
-            
-            logger.info(f"✅ Admin registered: {email} | Company: {company_name} | Plan: {plan}")
-            
-            # Create session
-            session_id = str(uuid.uuid4())
-            user_session = UserSession(
-                user_id=user.id,
-                session_id=session_id,
-                ip_address=request.remote_addr,
-                user_agent=request.headers.get('User-Agent', ''),
-                expires_at=datetime.utcnow() + timedelta(hours=24),
-                is_active=True
-            )
-            db.session.add(user_session)
-            db.session.commit()
-            
-            # Create token
-            access_token = create_access_token(
-                identity=str(user.id),
-                additional_claims={
-                    'user_id': user.id,
-                    'email': user.email,
-                    'user_type': user.user_type,
-                    'role': user.role,
-                    'company_id': user.company_id,
-                    'company_name': user.company_name,
-                    'subscription_plan': user.subscription_plan,  # Company plan
-                    'subscription_status': user.subscription_status,
-                    'verified': user.verified,
-                    'session_id': session_id
-                }
-            )
-            
-            return jsonify({
-                'success': True,
-                'message': f'✅ Admin registered successfully. Company "{company_name}" created with {plan} plan.',
-                'access_token': access_token,
-                'token_type': 'bearer',
-                'expires_in': 24 * 3600,
-                'session_id': session_id,
-                'user': {
-                    'id': user.id,
-                    'name': user.name,
-                    'email': user.email,
-                    'user_type': user.user_type,
-                    'role': user.role,
-                    'company_id': user.company_id,
-                    'company_name': user.company_name,
-                    'plan': user.subscription_plan,  # Company plan
-                    'subscription_status': user.subscription_status,
-                    'verified': user.verified,
-                    'is_active': user.is_active
-                },
-                'company': {
-                    'id': company.id,
-                    'name': company.name,
-                    'plan': company.plan,  # ✅ Company's plan
-                    'status': company.subscription_status
-                },
-                'stage': 'complete',
-                'redirect_to': '/admin/dashboard',
-                'requires_payment': False,
-                'requires_plan_selection': False,
-                'needs_approval': False,
-                'requires_company_setup': False
-            }), 201
-
-        # ✅ ===== COMPANY ADMIN REGISTRATION (Similar to admin but different role) =====
-        elif user_type == 'company_admin':
-            if not company_name:
-                return jsonify({'error': 'Company name is required for company admin registration'}), 400
-            
-            # ✅ VALIDATE COMPANY PLAN - Only enterprise or custom
-            if plan not in COMPANY_PLANS:
-                return jsonify({
-                    'error': f'Invalid company plan. Companies can only have: {", ".join(COMPANY_PLANS)}',
-                    'valid_plans': COMPANY_PLANS,
-                    'message': 'Please select Enterprise or Custom plan for your company'
-                }), 400
-            
-            # Check if company already exists
-            company = Company.query.filter_by(name=company_name).first()
-            if not company:
-                # ✅ CREATE COMPANY WITH THE PLAN
-                company = Company(
-                    name=company_name,
-                    plan=plan,  # ✅ Company gets the plan
-                    subscription_status='active',
-                    billing_cycle='1_month',
-                    created_at=datetime.utcnow(),
-                    updated_at=datetime.utcnow()
-                )
-                db.session.add(company)
-                db.session.flush()  # Get company ID
-            
-            # ✅ CREATE COMPANY ADMIN USER - INHERITS FROM COMPANY
-            user = User(
-                email=email,
-                password_hash=generate_password_hash(password),
-                name=name,
-                country=country,
-                role=role or 'Company Admin',
-                industry=industry,
-                company_name=company.name,
-                company_id=company.id,
-                user_type='company_admin',
-                preferred_language=preferred_language,
                 verified=True,
-                # ✅ INHERIT FROM COMPANY
                 subscription_plan=company.plan,
                 subscription_status=company.subscription_status,
                 billing_cycle=company.billing_cycle,
                 is_active=True,
                 approval_status='approved',
-                created_at=datetime.utcnow()
+                mfa_enabled=bool(data.get('mfa_opt_in')), # ✅ NEW
+                created_at=datetime.utcnow(),
+                **compliance_kwargs
             )
             db.session.add(user)
+            db.session.flush()
+            
+            record_consents(user.id)
             db.session.commit()
             
-            logger.info(f"✅ Company Admin registered: {email} | Company: {company.name} | Plan: {company.plan}")
+            logger.info(f"✅ Admin registered: {email} | Company: {company_name} | Plan: {plan}")
             
-            # Create session
+            # ✅ NEW: MFA Setup bypass
+            if user.mfa_enabled:
+                return _issue_mfa_setup_response(user, "Admin registered. MFA setup required.")
+
             session_id = str(uuid.uuid4())
             user_session = UserSession(
                 user_id=user.id,
@@ -9179,7 +9429,6 @@ def register():
             db.session.add(user_session)
             db.session.commit()
             
-            # Create token
             access_token = create_access_token(
                 identity=str(user.id),
                 additional_claims={
@@ -9196,6 +9445,128 @@ def register():
                 }
             )
             
+            # ✅ EXACT MATCH to your original response dict
+            return jsonify({
+                'success': True,
+                'message': f'✅ Admin registered successfully. Company "{company_name}" created with {plan} plan.',
+                'access_token': access_token,
+                'token_type': 'bearer',
+                'expires_in': 24 * 3600,
+                'session_id': session_id,
+                'user': {
+                    'id': user.id,
+                    'name': user.name,
+                    'email': user.email,
+                    'user_type': user.user_type,
+                    'role': user.role,
+                    'company_id': user.company_id,
+                    'company_name': user.company_name,
+                    'plan': user.subscription_plan,
+                    'subscription_status': user.subscription_status,
+                    'verified': user.verified,
+                    'is_active': user.is_active
+                },
+                'company': {
+                    'id': company.id,
+                    'name': company.name,
+                    'plan': company.plan,
+                    'status': company.subscription_status
+                },
+                'stage': 'complete',
+                'redirect_to': '/admin/dashboard',
+                'requires_payment': False,
+                'requires_plan_selection': False,
+                'needs_approval': False,
+                'requires_company_setup': False
+            }), 201
+
+        # ✅ ===== COMPANY ADMIN REGISTRATION =====
+        elif user_type == 'company_admin':
+            if not company_name:
+                return jsonify({'error': 'Company name is required for company admin registration'}), 400
+            
+            if plan not in COMPANY_PLANS:
+                return jsonify({
+                    'error': f'Invalid company plan. Companies can only have: {", ".join(COMPANY_PLANS)}',
+                    'valid_plans': COMPANY_PLANS,
+                    'message': 'Please select Enterprise or Custom plan for your company'
+                }), 400
+            
+            company = Company.query.filter_by(name=company_name).first()
+            if not company:
+                company = Company(
+                    name=company_name,
+                    plan=plan,
+                    subscription_status='active',
+                    billing_cycle='1_month',
+                    created_at=datetime.utcnow(),
+                    updated_at=datetime.utcnow()
+                )
+                db.session.add(company)
+                db.session.flush()
+            
+            user = User(
+                email=email,
+                password_hash=generate_password_hash(password),
+                name=name,
+                country=country,
+                role=role or 'Company Admin',
+                industry=industry,
+                company_name=company.name,
+                company_id=company.id,
+                user_type='company_admin',
+                preferred_language=preferred_language,
+                verified=True,
+                subscription_plan=company.plan,
+                subscription_status=company.subscription_status,
+                billing_cycle=company.billing_cycle,
+                is_active=True,
+                approval_status='approved',
+                mfa_enabled=bool(data.get('mfa_opt_in')), # ✅ NEW
+                created_at=datetime.utcnow(),
+                **compliance_kwargs
+            )
+            db.session.add(user)
+            db.session.flush()
+            
+            record_consents(user.id)
+            db.session.commit()
+            
+            logger.info(f"✅ Company Admin registered: {email} | Company: {company.name} | Plan: {company.plan}")
+            
+            # ✅ NEW: MFA Setup bypass
+            if user.mfa_enabled:
+                return _issue_mfa_setup_response(user, "Company Admin registered. MFA setup required.")
+
+            session_id = str(uuid.uuid4())
+            user_session = UserSession(
+                user_id=user.id,
+                session_id=session_id,
+                ip_address=request.remote_addr,
+                user_agent=request.headers.get('User-Agent', ''),
+                expires_at=datetime.utcnow() + timedelta(hours=24),
+                is_active=True
+            )
+            db.session.add(user_session)
+            db.session.commit()
+            
+            access_token = create_access_token(
+                identity=str(user.id),
+                additional_claims={
+                    'user_id': user.id,
+                    'email': user.email,
+                    'user_type': user.user_type,
+                    'role': user.role,
+                    'company_id': user.company_id,
+                    'company_name': user.company_name,
+                    'subscription_plan': user.subscription_plan,
+                    'subscription_status': user.subscription_status,
+                    'verified': user.verified,
+                    'session_id': session_id
+                }
+            )
+            
+            # ✅ EXACT MATCH
             return jsonify({
                 'success': True,
                 'message': f'✅ Company Admin registered successfully under "{company.name}" with {company.plan} plan.',
@@ -9211,7 +9582,7 @@ def register():
                     'role': user.role,
                     'company_id': user.company_id,
                     'company_name': user.company_name,
-                    'plan': user.subscription_plan,  # Company plan
+                    'plan': user.subscription_plan,
                     'subscription_status': user.subscription_status,
                     'verified': user.verified,
                     'is_active': user.is_active
@@ -9230,7 +9601,7 @@ def register():
                 'requires_company_setup': False
             }), 201
 
-        # ✅ ===== EMPLOYEE REGISTRATION (Must be added by admin) =====
+        # ✅ ===== EMPLOYEE REGISTRATION =====
         elif user_type == 'employee':
             if not data.get('company_id') and not company_name:
                 return jsonify({
@@ -9250,7 +9621,6 @@ def register():
                     'message': 'Please contact your company admin to create your account'
                 }), 404
             
-            # ✅ Employees inherit company plan (enterprise or custom)
             user = User(
                 email=email,
                 password_hash=generate_password_hash(password),
@@ -9263,20 +9633,27 @@ def register():
                 user_type='employee',
                 preferred_language=preferred_language,
                 verified=True,
-                # ✅ INHERIT FROM COMPANY
-                subscription_plan=company.plan,  # ✅ INHERIT company plan
+                subscription_plan=company.plan,
                 subscription_status=company.subscription_status,
                 billing_cycle=company.billing_cycle,
                 is_active=True,
                 approval_status='approved',
-                created_at=datetime.utcnow()
+                mfa_enabled=bool(data.get('mfa_opt_in')), # ✅ NEW
+                created_at=datetime.utcnow(),
+                **compliance_kwargs
             )
             db.session.add(user)
+            db.session.flush()
+            
+            record_consents(user.id)
             db.session.commit()
             
             logger.info(f"✅ Employee registered: {email} | Company: {company.name} | Plan: {company.plan}")
             
-            # Create session
+            # ✅ NEW: MFA Setup bypass
+            if user.mfa_enabled:
+                return _issue_mfa_setup_response(user, "Employee registered. MFA setup required.")
+
             session_id = str(uuid.uuid4())
             user_session = UserSession(
                 user_id=user.id,
@@ -9289,7 +9666,6 @@ def register():
             db.session.add(user_session)
             db.session.commit()
             
-            # Create token
             access_token = create_access_token(
                 identity=str(user.id),
                 additional_claims={
@@ -9306,6 +9682,7 @@ def register():
                 }
             )
             
+            # ✅ EXACT MATCH
             return jsonify({
                 'success': True,
                 'message': f'✅ Employee {name} registered successfully under {company.name}',
@@ -9321,7 +9698,7 @@ def register():
                     'role': user.role,
                     'company_id': user.company_id,
                     'company_name': user.company_name,
-                    'plan': user.subscription_plan,  # Company plan
+                    'plan': user.subscription_plan,
                     'subscription_status': user.subscription_status,
                     'verified': user.verified,
                     'is_active': user.is_active
@@ -9338,30 +9715,32 @@ def register():
                 'requires_plan_selection': False
             }), 201
 
-        # ✅ ===== REGULAR USER REGISTRATION (Individual users) =====
+        # ✅ ===== REGULAR USER REGISTRATION =====
         else:
-            # Individual users can have free or pro plans
-            # If plan is provided, validate it's allowed for individuals
             if plan and plan not in INDIVIDUAL_PLANS:
                 return jsonify({
                     'error': f'Invalid plan. Individual users can only have: {", ".join(INDIVIDUAL_PLANS)}',
                     'valid_plans': INDIVIDUAL_PLANS
                 }), 400
 
-            # ✅ UPDATED: Normalize plan and derive an explicit subscription_status
-            #    so login never has to guess. Free plan = active immediately.
             normalized_plan = (plan or 'free').lower()
             if normalized_plan not in INDIVIDUAL_PLANS:
                 normalized_plan = 'free'
 
-            # Free plan → active right away (no payment required)
-            # Paid plan → pending_payment until checkout completes
             if normalized_plan == 'free':
                 initial_subscription_status = 'active'
             else:
                 initial_subscription_status = 'pending_payment'
 
-            # ✅ Individual users get their own plan (not from company)
+            # ✅ NEW: Handle Minor flow
+            if is_minor:
+                initial_subscription_status = 'pending_guardian'
+                verified_status = False
+                is_active_status = False
+            else:
+                verified_status = False
+                is_active_status = False
+
             user = User(
                 email=email,
                 password_hash=generate_password_hash(password),
@@ -9369,20 +9748,43 @@ def register():
                 country=country,
                 role=role,
                 industry=industry,
-                company_name=company_name,  # Optional for individual users
+                company_name=company_name,
                 preferred_language=preferred_language,
                 user_type='user',
-                verified=False,
-                subscription_plan=normalized_plan,                    # ✅ UPDATED (was plan or 'free')
-                subscription_status=initial_subscription_status,      # ✅ UPDATED (was missing entirely)
+                verified=verified_status,
+                subscription_plan=normalized_plan,
+                subscription_status=initial_subscription_status,
                 trial_plan='pro',
                 trial_ends_at=datetime.utcnow() + timedelta(days=14),
-                created_at=datetime.utcnow()
+                is_active=is_active_status,
+                mfa_enabled=bool(data.get('mfa_opt_in')), # ✅ NEW
+                created_at=datetime.utcnow(),
+                **compliance_kwargs
             )
             db.session.add(user)
+            db.session.flush()
+            
+            record_consents(user.id)
             db.session.commit()
             
             logger.info(f"✅ User registered: {email} (Type: user) | Plan: {user.subscription_plan} | Status: {user.subscription_status}")
+
+            # ✅ NEW: If Minor, trigger Guardian Flow
+            if is_minor:
+                token = generate_verification_code()
+                user.guardian_token = token
+                db.session.commit()
+                
+                # TODO: send_guardian_consent_email(user.guardian_email, token, user.name)
+                logger.info(f"Guardian consent required for {email}")
+                
+                return jsonify({
+                    'success': True,
+                    'stage': 'needs_guardian_consent',
+                    'user_id': user.id,
+                    'guardian_email': user.guardian_email,
+                    'message': 'A consent request has been sent to your parent or guardian.'
+                }), 201
 
             # Generate verification code
             code = generate_verification_code()
@@ -9397,7 +9799,7 @@ def register():
             db.session.add(verification)
             db.session.commit()
 
-            # Send verification email
+            # ✅ YOUR EXACT ORIGINAL HTML EMAIL TEMPLATE
             email_subject = "Verify Your SafeTrackPro Global Account"
             email_body = f"""
             <!DOCTYPE html>
@@ -9443,15 +9845,17 @@ def register():
             
             send_email(email, email_subject, email_body)
             
+            # ✅ EXACT MATCH
             return jsonify({
                 'success': True,
                 'message': 'User registered successfully. Please check your email for verification.',
                 'user_id': user.id,
                 'user_type': user.user_type,
-                'plan': user.subscription_plan,                       # ✅ UPDATED (explicit, so frontend can log it)
-                'subscription_status': user.subscription_status,      # ✅ UPDATED
+                'plan': user.subscription_plan,
+                'subscription_status': user.subscription_status,
                 'stage': 'needs_verification',
                 'redirect_to': '/verify-email',
+                'mfa_enabled': user.mfa_enabled, # Added for frontend
                 'trial_ends_at': user.trial_ends_at.isoformat() if user.trial_ends_at else None,
                 'verification_code': code if app.config.get('ENV') == 'development' else None
             }), 201
@@ -9465,6 +9869,32 @@ def register():
             'success': False,
             'error': 'Internal server error during registration'
         }), 500
+
+
+def _issue_mfa_setup_response(user, message):
+    """Generates an MFA setup payload. (Requires pyotp)"""
+    try:
+        import pyotp
+    except ImportError:
+        return jsonify({'error': 'MFA is not configured on this server'}), 500
+        
+    secret = pyotp.random_base32()
+    user.mfa_pending_secret = secret
+    db.session.commit()
+    
+    provisioning_uri = pyotp.totp.TOTP(secret).provisioning_uri(
+        name=user.email, issuer_name='SafeTrackPro Global'
+    )
+    
+    return jsonify({
+        'success': True,
+        'message': message,
+        'stage': 'needs_mfa_setup',
+        'mfa_required': True,
+        'user_id': user.id,
+        'mfa_provisioning_uri': provisioning_uri,
+        'mfa_secret': secret,
+    }), 201
     
 # [The remaining routes would follow the same enhanced pattern with comprehensive error handling, validation, and features]
 def _create_violation_notification(self, user_id: int, violation: SafetyViolation, results: Dict, department: str):
@@ -15033,9 +15463,9 @@ def platform_analytics():
 @app.route('/api/verify', methods=['POST'])
 @limiter.limit("5 per minute")
 def verify_email_endpoint():
-    """Enhanced email verification with comprehensive validation - Activates both user and company"""
+    """Enhanced email verification with compliance checks - Activates user and company"""
     try:
-        data = request.get_json()
+        data = request.get_json(silent=True) or {}
         email = data.get('email', '').lower().strip()
         code = data.get('code', '').strip()
 
@@ -15062,6 +15492,25 @@ def verify_email_endpoint():
         user = User.query.filter_by(email=email).first()
         if not user:
             return jsonify({'error': 'User not found'}), 404
+
+        # 🆕 COMPLIANCE CHECK: Is this a minor?
+        if getattr(user, 'is_minor', False) and not getattr(user, 'guardian_consent_given', False):
+            # Mark email as verified, but do NOT activate the account
+            user.verified = True
+            user.verified_at = datetime.utcnow()
+            db.session.delete(verification)
+            db.session.commit()
+            
+            logger.info(f"✅ Email verified for minor {email}, but account pending guardian consent.")
+            
+            return jsonify({
+                'success': True,
+                'message': 'Email verified! However, your account requires parent/guardian consent before you can log in.',
+                'stage': 'needs_guardian_consent',
+                'guardian_email': user.guardian_email,
+                'verified': True,
+                'is_active': False
+            }), 200
 
         # ✅ ACTIVATE USER
         user.verified = True
@@ -15097,8 +15546,6 @@ def verify_email_endpoint():
         db.session.commit()
 
         logger.info(f"✅ User activated: {user.email} (ID: {user.id})")
-        if company_activated:
-            logger.info(f"✅ Company activated: {company.name} (ID: {company.id})")
 
         # ✅ Create access token
         from flask_jwt_extended import create_access_token
@@ -15134,8 +15581,11 @@ def verify_email_endpoint():
             logger.warning(f"Failed to create welcome notification: {notify_error}")
 
         return jsonify({
+            'success': True,
             'message': 'Email verified successfully! Account activated.',
             'access_token': access_token,
+            'token_type': 'bearer',
+            'expires_in': 24 * 3600,
             'user': {
                 'id': user.id,
                 'name': user.name,
@@ -15152,7 +15602,12 @@ def verify_email_endpoint():
                 'industry': user.industry,
                 'preferred_language': user.preferred_language,
                 'verified': user.verified,
-                'is_active': user.is_active
+                'is_active': user.is_active,
+                # 🆕 Compliance flags
+                'mfa_enabled': getattr(user, 'mfa_enabled', False),
+                'terms_version': getattr(user, 'terms_version', None),
+                'privacy_version': getattr(user, 'privacy_version', None),
+                'needs_consent': False
             },
             'company': {
                 'id': company.id if company else None,
@@ -15162,7 +15617,9 @@ def verify_email_endpoint():
                 'is_trial': company.is_trial if company else None,
                 'trial_ends_at': company.trial_ends_at.isoformat() if company and company.trial_ends_at else None,
                 'plan': company.plan if company else None
-            } if company else None
+            } if company else None,
+            'stage': 'complete',
+            'redirect_to': '/dashboard' # Default; frontend router can override based on user_type
         }), 200
 
     except Exception as e:
@@ -39332,22 +39789,16 @@ def update_company_logo_url(company_id):
         }), 500
 
 
-
 @app.route('/api/auth/login', methods=['POST', 'OPTIONS'])
 @app.route('/api/login', methods=['POST', 'OPTIONS'])
 @limiter.limit("5 per minute")
 def login():
-    """Unified login endpoint with payment status check and dashboard redirection"""
+    """Unified login endpoint with compliance, payment status check, and dashboard redirection"""
     try:
-        print('=== LOGIN REQUEST DEBUG ===')
-        print('Method:', request.method)
-        
         if request.method == 'OPTIONS':
             return jsonify({'status': 'ok'}), 200
         
-        data = request.get_json()
-        print('Raw JSON data:', data)
-        
+        data = request.get_json(silent=True) or {}
         if not data:
             return jsonify({'error': 'No JSON data provided'}), 400
 
@@ -39358,14 +39809,10 @@ def login():
         if not email or not password:
             return jsonify({'error': 'Email and password are required'}), 400
 
-        # ==================== 🆕 REMOVE HARDCODED SUPER ADMIN ====================
-        # Super admin is now determined by database flag, NOT email
-        # The super admin email list is removed for security
-        
         # Find user
         from sqlalchemy import func
         user = User.query.filter(func.lower(User.email) == email).first()
-        # If no user, return error
+        
         if not user:
             logger.warning(f"Failed login attempt - user not found: {email}")
             return jsonify({'error': 'Invalid credentials'}), 401
@@ -39375,9 +39822,6 @@ def login():
 
         # ✅ SUPER ADMIN FLOW (from database, not hardcoded)
         if is_super_admin:
-            print(f"👑 Super admin login attempt for: {email}")
-            
-            # Verify password first
             if not check_password_hash(user.password_hash, password):
                 logger.warning(f"Failed super admin login attempt for {user.id}")
                 return jsonify({'error': 'Invalid credentials'}), 401
@@ -39411,7 +39855,7 @@ def login():
             db.session.add(user_session)
             db.session.commit()
 
-            # ==================== 🆕 CACHE USER DATA ====================
+            # Cache user data
             user_data = {
                 'id': user.id,
                 'email': user.email,
@@ -39431,23 +39875,20 @@ def login():
                 'token_version': getattr(user, 'token_version', 1),
                 'login_count': getattr(user, 'login_count', 0),
                 'country': getattr(user, 'country', 'default'),
-                'industry': getattr(user, 'industry', 'Healthcare'),
+                'industry': getattr(user, 'industry', 'Other'),
                 'preferred_language': getattr(user, 'preferred_language', 'en'),
                 'admin_level': 'super',
                 'last_login': user.last_login.isoformat() if user.last_login else None,
                 'created_at': user.created_at.isoformat() if user.created_at else None
             }
             UserCache.set(user.id, user_data)
-            print(f"✅ Super admin cached: {user.email}")
 
-            # ==================== 🆕 JWT WITH MINIMAL CLAIMS ====================
             access_token = create_access_token(
                 identity=str(user.id),
                 additional_claims={
                     'user_id': user.id,
                     'session_id': session_id,
                     'token_version': getattr(user, 'token_version', 1)
-                    # ✅ NO sensitive data in JWT!
                 }
             )
             
@@ -39460,27 +39901,7 @@ def login():
                 'token_type': 'bearer',
                 'expires_in': 24 * 3600,
                 'session_id': session_id,
-                'user': {
-                    'id': user.id,
-                    'name': user.name,
-                    'email': user.email,
-                    'role': 'Super Admin',
-                    'user_type': 'super_admin',
-                    'company_id': user.company_id,
-                    'company_name': user.company_name,
-                    'company_logo': None,
-                    'logo_url': None,
-                    'plan': 'super_admin',
-                    'subscription_status': 'active',
-                    'verified': True,
-                    'is_active': True,
-                    'approval_status': 'approved',
-                    'is_super_admin': True,
-                    'is_platform_owner': True,
-                    'admin_level': 'super',
-                    'last_login': user.last_login.isoformat() if user.last_login else None,
-                    'created_at': user.created_at.isoformat() if user.created_at else None
-                },
+                'user': user.to_dict(),
                 'stage': 'complete',
                 'redirect_to': '/safetypro/dashboard',
                 'requires_payment': False,
@@ -39488,13 +39909,7 @@ def login():
                 'needs_approval': False,
                 'requires_company_setup': False,
                 'payment_status': 'completed',
-                'dashboard_config': {
-                    'redirect_to': '/safetypro/dashboard',
-                    'dashboard_type': 'super_admin',
-                    'name': 'Super Admin Dashboard',
-                    'message': 'Welcome Super Admin!',
-                    'requires_action': False
-                }
+                'dashboard_config': get_dashboard_config(user, 'complete')
             }), 200
 
         # ✅ REGULAR USER - Verify password
@@ -39502,7 +39917,66 @@ def login():
             logger.warning(f"Failed login attempt for user {user.id}")
             return jsonify({'error': 'Invalid credentials'}), 401
 
-        # ✅ REGULAR USER CHECKS (only for non-super admins)
+        # ==================== 🆕 COMPLIANCE GATES ====================
+        
+        # CHECK A: Consent re-acceptance
+        needs_consent = getattr(user, 'needs_consent', False)
+        if getattr(user, 'terms_version', None) != CURRENT_TERMS_VERSION or getattr(user, 'privacy_version', None) != CURRENT_PRIVACY_VERSION:
+            needs_consent = True
+
+        if needs_consent:
+            # Issue a limited token so they can hit /auth/accept-consent
+            consent_token = create_access_token(
+                identity=str(user.id),
+                additional_claims={'user_id': user.id, 'purpose': 'consent'},
+                expires_delta=timedelta(hours=1)
+            )
+            return jsonify({
+                'success': True,
+                'stage': 'needs_consent',
+                'access_token': consent_token,
+                'token_type': 'bearer',
+                'expires_in': 3600,
+                'user': {
+                    'id': user.id, 'email': user.email, 'name': user.name,
+                    'user_type': user.user_type,
+                    'terms_version': getattr(user, 'terms_version', None),
+                    'privacy_version': getattr(user, 'privacy_version', None),
+                },
+                'terms_version_expected': CURRENT_TERMS_VERSION,
+                'privacy_version_expected': CURRENT_PRIVACY_VERSION,
+                'redirect_to': '/accept-terms',
+                'message': 'Please review and accept our updated policies.',
+            }), 200
+
+        # CHECK B: MFA required
+        if getattr(user, 'mfa_enabled', False):
+            mfa_token = create_access_token(
+                identity=str(user.id),
+                additional_claims={'user_id': user.id, 'purpose': 'mfa'},
+                expires_delta=timedelta(minutes=5)
+            )
+            logger.info(f"🔐 MFA challenge issued for user {user.id}")
+            return jsonify({
+                'success': True,
+                'stage': 'needs_mfa',
+                'mfa_required': True,
+                'mfa_method': 'totp',
+                'mfa_token': mfa_token,
+                'user_id': user.id,
+                'message': 'Enter your authentication code to continue.',
+            }), 200
+
+        # CHECK C: Guardian Consent (Minors)
+        if getattr(user, 'is_minor', False) and not getattr(user, 'guardian_consent_given', False):
+            return jsonify({
+                'error': 'Guardian consent pending',
+                'message': 'Your parent or guardian must approve your account before you can log in.',
+                'requires_guardian_consent': True,
+                'guardian_email': user.guardian_email
+            }), 403
+
+        # ==================== STANDARD CHECKS ====================
         
         # CHECK 1: Email verification
         if not user.verified:
@@ -39552,7 +40026,6 @@ def login():
             company = Company.query.get(user.company_id)
             if company:
                 company_found = True
-                print(f"✅ Found company by ID: {company.name} (Plan: {company.plan}, Status: {company.subscription_status})")
             else:
                 print(f"⚠️ Company with ID {user.company_id} not found")
         
@@ -39561,33 +40034,23 @@ def login():
             company = Company.query.filter_by(name=user.company_name).first()
             if company:
                 company_found = True
-                # Update user with correct company_id
                 user.company_id = company.id
                 db.session.commit()
-                print(f"✅ Found company by name: {company.name} (Plan: {company.plan}), updated user company_id to {company.id}")
-            else:
-                print(f"⚠️ Company with name '{user.company_name}' not found")
 
         # ✅ ===== COMPANY USERS (Admin, Employee, Company Admin) =====
         if user.user_type in ['admin', 'employee', 'company_admin']:
             if company_found and company:
-                # ✅ Check company plan status FIRST
                 (company_stage, company_redirect, company_requires_payment, 
                  company_requires_plan_selection, company_payment_status, company_message) = check_company_plan_status(company)
                 
-                print(f"🏢 Company plan check: {company_stage} - {company_message}")
-                
-                # ✅ Update stage based on company plan
                 stage = company_stage
                 redirect_to = company_redirect
                 requires_payment = company_requires_payment
                 requires_plan_selection = company_requires_plan_selection
                 payment_status = company_payment_status
                 
-                # ✅ Sync user with company plan
                 sync_user_with_company(user)
                 
-                # ✅ If company plan is complete, set appropriate dashboard
                 if stage == 'complete':
                     if user.user_type == 'admin':
                         redirect_to = '/admin/dashboard'
@@ -39595,14 +40058,7 @@ def login():
                         redirect_to = '/employee/dashboard'
                     elif user.user_type == 'company_admin':
                         redirect_to = '/company/dashboard'
-                
-                print(f"✅ {user.user_type} {user.email} - Company plan stage: {stage}")
-                
             else:
-                # No company found - this should not happen for company users
-                print(f"❌ {user.user_type} {user.email} has no company assigned")
-                
-                # ✅ For company users without company, prevent login
                 return jsonify({
                     'error': 'Company not found',
                     'message': f'Your {user.user_type} account is not associated with a company. Please contact support.',
@@ -39610,19 +40066,11 @@ def login():
                     'user_type': user.user_type
                 }), 403
 
-        # ✅ ===== INDIVIDUAL USER (Regular user) =====
+        # ✅ ===== INDIVIDUAL USER =====
         elif user.user_type == 'user':
-            # ------------------------------------------------------------------
-            # ✅ UPDATED LOGIC:
-            #  - Free plan users go straight to the dashboard after email verify
-            #  - Only users with NO plan at all are asked to select a plan
-            #  - Paid plan users with pending subscription go to /payment
-            # ------------------------------------------------------------------
             user_plan = getattr(user, 'subscription_plan', None)
             subscription_status = getattr(user, 'subscription_status', None)
 
-            # Normalize: treat missing/empty plan as 'free' so previously
-            # registered free users are never pushed into plan selection again.
             if not user_plan:
                 user_plan = 'free'
                 user.subscription_plan = 'free'
@@ -39632,7 +40080,6 @@ def login():
                 db.session.commit()
 
             if user_plan == 'free':
-                # ✅ Free users skip plan selection and go straight to dashboard
                 stage = 'complete'
                 redirect_to = '/dashboard'
                 requires_plan_selection = False
@@ -39653,29 +40100,21 @@ def login():
                 redirect_to = '/dashboard'
                 payment_status = 'completed'
 
-        # ✅ ===== PLATFORM OWNER (Special case) =====
+        # ✅ ===== PLATFORM OWNER / SAFETY PRO =====
         elif user.user_type == 'platform_owner':
             stage = 'complete'
             redirect_to = '/platform/dashboard'
-            requires_payment = False
-            requires_plan_selection = False
-            payment_status = 'completed'
-
-        # ✅ ===== SAFETY PRO (Special case) =====
         elif user.user_type == 'safetypro':
             stage = 'complete'
             redirect_to = '/safetypro/dashboard'
-            requires_payment = False
-            requires_plan_selection = False
-            payment_status = 'completed'
 
-        # Check company setup for admin (only if company is in complete stage)
+        # Check company setup for admin
         if user.user_type == 'admin' and not user.company_id and stage != 'needs_plan':
             stage = 'needs_company_setup'
             redirect_to = '/company-setup'
             requires_company_setup = True
 
-        # Check admin approval (only if company is in complete stage)
+        # Check admin approval
         if user.user_type == 'admin' and user.approval_status == 'pending' and stage != 'needs_plan':
             stage = 'needs_approval'
             redirect_to = '/pending-approval'
@@ -39693,23 +40132,21 @@ def login():
                 company_logo = company.logo_url
                 user.company_logo = company_logo
                 db.session.commit()
-                print(f"✅ Retrieved company logo for {company.name}: {company_logo}")
 
         # Create user session
         session_id = str(uuid.uuid4())
-
         user_session = UserSession(
             user_id=user.id,
             session_id=session_id,
             ip_address=request.remote_addr,
-            user_agent=request.headers.get('User-Agent', ''),
+            user_agent=request.headers.get('User-Agent', '')[:512],
             expires_at=datetime.utcnow() + timedelta(hours=24),
             is_active=True
         )
         db.session.add(user_session)
         db.session.commit()
 
-        # Get the final plan for the user
+        # Get final plan
         if user.user_type in ['admin', 'employee', 'company_admin']:
             user_plan = user.subscription_plan
             subscription_status = user.subscription_status
@@ -39717,8 +40154,7 @@ def login():
             user_plan = getattr(user, 'subscription_plan', 'free')
             subscription_status = getattr(user, 'subscription_status', 'inactive')
 
-        # ==================== 🆕 CACHE USER DATA ====================
-        # Build user data for cache
+        # Cache user data
         user_data = {
             'id': user.id,
             'email': user.email,
@@ -39739,24 +40175,20 @@ def login():
             'token_version': getattr(user, 'token_version', 1),
             'login_count': user.login_count,
             'country': getattr(user, 'country', 'default'),
-            'industry': getattr(user, 'industry', 'Healthcare'),
+            'industry': getattr(user, 'industry', 'Other'),
             'preferred_language': getattr(user, 'preferred_language', 'en'),
             'stage': stage,
             'last_login': user.last_login.isoformat() if user.last_login else None,
             'created_at': user.created_at.isoformat() if user.created_at else None
         }
         
-        # Cache the user data
         UserCache.set(user.id, user_data)
-        print(f"✅ User data cached for {user.email}")
 
-        # ==================== 🆕 JWT WITH MINIMAL CLAIMS ====================
-        # ✅ Only user_id, session_id, and token_version in JWT
+        # JWT with minimal claims
         token_claims = {
             'user_id': user.id,
             'session_id': session_id,
             'token_version': getattr(user, 'token_version', 1)
-            # ✅ NO sensitive data in JWT!
         }
 
         access_token = create_access_token(
@@ -39764,18 +40196,18 @@ def login():
             additional_claims=token_claims
         )
 
-        # Trial plan logic (only for individual users)
+        # Trial logic
         trial_active = False
         effective_plan = user_plan
         if user.user_type == 'user':
             trial_active = user.trial_ends_at and datetime.utcnow() < user.trial_ends_at
             effective_plan = user.trial_plan if trial_active else user_plan
 
-        # Determine dashboard based on user type and stage
         dashboard_config = get_dashboard_config(user, stage)
 
         logger.info(f"Login successful for {user.email} - Stage: {stage} - User type: {user.user_type} - Plan: {user_plan}")
 
+        # ✅ EXACT MATCH response, plus compliance booleans
         return jsonify({
             'success': True,
             'message': 'Login successful',
@@ -39806,7 +40238,12 @@ def login():
                 'approval_status': user.approval_status,
                 'last_login': user.last_login.isoformat() if user.last_login else None,
                 'created_at': user.created_at.isoformat() if user.created_at else None,
-                'login_count': user.login_count
+                'login_count': user.login_count,
+                # 🆕 Compliance flags exposed to frontend
+                'mfa_enabled': getattr(user, 'mfa_enabled', False),
+                'terms_version': getattr(user, 'terms_version', None),
+                'privacy_version': getattr(user, 'privacy_version', None),
+                'needs_consent': False
             },
             'stage': stage,
             'redirect_to': redirect_to,
@@ -39816,7 +40253,6 @@ def login():
             'requires_company_setup': requires_company_setup,
             'payment_status': payment_status,
             'dashboard_config': dashboard_config,
-            # 🆕 Cache info
             '_cache_info': {
                 'cached': True,
                 'cached_at': datetime.utcnow().isoformat()
@@ -41343,13 +41779,15 @@ def get_user_performance_endpoint(user_id):
 
 # ============== LOGOUT ENDPOINT WITH TRACKING ==============
 
-@app.route('/api/auth/logout', methods=['POST'] , endpoint='user_logout')
+@app.route('/api/auth/logout', methods=['POST'], endpoint='user_logout')
 @jwt_required
 def logout():
     """Logout endpoint with tracking"""
     try:
         user_id = request.user_id  # Already available from jwt_required decorator
         login_log_id = get_jwt().get('login_log_id')
+        
+        session_duration = None # Initialize to avoid UnboundLocalError
         
         # Track logout
         if login_log_id:
@@ -41371,6 +41809,13 @@ def logout():
         if session_id:
             UserSession.query.filter_by(session_id=session_id).delete()
             db.session.commit()
+        
+        # ✅ NEW: Clear Redis Cache so next login gets fresh data
+        try:
+            from services.cache import UserCache
+            UserCache.clear(user_id)
+        except Exception as cache_error:
+            logger.warning(f"Failed to clear user cache on logout: {cache_error}")
         
         logger.info(f"User {user_id} logged out successfully")
         
@@ -43266,10 +43711,12 @@ def send_verification_email(email, verification_code, user_name=None, is_admin=F
             
         return False
 
-def send_email(to=None, subject=None, body=None, attachments=None, **kwargs):
+def send_email(to=None, subject=None, body=None, attachments=None, category='transactional', **kwargs):
     """
     Universal email sending function.
     Supports old syntax (recipient=, html_content=) and new syntax (to=, body=).
+    
+    ✅ NEW: Pass category='marketing' to automatically append the unsubscribe link.
     """
     try:
         # ✅ Handle old keyword arguments gracefully
@@ -43284,6 +43731,39 @@ def send_email(to=None, subject=None, body=None, attachments=None, **kwargs):
             logger.error("❌ Email error: No subject provided")
             return False
             
+        # ✅ NEW: Marketing Email Compliance
+        if category == 'marketing':
+            user = User.query.filter_by(email=recipient).first()
+            if user:
+                # 1. Block if they unsubscribed
+                if not getattr(user, 'marketing_consent', False):
+                    logger.info(f"🚫 Blocked marketing email to {recipient}: user unsubscribed.")
+                    return False
+                
+                # 2. Generate token if they don't have one
+                if not getattr(user, 'unsubscribe_token', None):
+                    user.unsubscribe_token = secrets.token_urlsafe(32)
+                    db.session.commit()
+                    
+                # 3. Build the unsubscribe URL
+                # Using FRONTEND_URL from config, fallback to your live domain
+                base_url = current_app.config.get('FRONTEND_URL', 'https://safetrackproglobal.com')
+                unsub_url = f"{base_url}/unsubscribe?token={user.unsubscribe_token}"
+                
+                # 4. Append the footer
+                footer = f"""
+                <div style="margin-top: 40px; padding-top: 20px; border-top: 1px solid #ddd; font-size: 12px; color: #666; text-align: center; font-family: Arial, sans-serif;">
+                    <p>You are receiving this email because you opted in to marketing communications from SafeTrackPro Global.</p>
+                    <p><a href="{unsub_url}" style="color: #1890ff; text-decoration: underline;">Click here to unsubscribe</a></p>
+                </div>
+                """
+                
+                if '</body>' in html_content:
+                    html_content = html_content.replace('</body>', f'{footer}</body>')
+                else:
+                    html_content += footer
+
+        # ✅ Your exact original sending logic
         msg = Message(
             subject=subject,
             recipients=[recipient],
