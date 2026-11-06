@@ -2936,7 +2936,9 @@ def create_app():
         JWT_REFRESH_TOKEN_EXPIRES=timedelta(days=int(os.getenv('JWT_REFRESH_TOKEN_DAYS', '30'))),
         
         # ✅ Database — Postgres only
-                SQLALCHEMY_ENGINE_OPTIONS={
+        SQLALCHEMY_DATABASE_URI=_db_url,  # <--- ADD THIS LINE
+        SQLALCHEMY_TRACK_MODIFICATIONS=False,
+        SQLALCHEMY_ENGINE_OPTIONS={
             'pool_recycle': int(os.getenv('DB_POOL_RECYCLE', '300')),
             'pool_pre_ping': os.getenv('DB_POOL_PRE_PING', 'True').lower() == 'true',
             'connect_args': {'sslmode': 'disable'} if '+psycopg2' in _db_url and 'railway.internal' in _db_url else {}
