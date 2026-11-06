@@ -8027,7 +8027,7 @@ __all__ = [
      'LessonLearned', 'LessonReaction',
     'EscalationRule', 'EscalationHistory', 'IncidentCost', 'RegulatoryFiling', 'FishboneVersion', 'FishboneFiveWhys', 'AIAssistantSession', 'AIAssistantMessage', 
     'SimilarIncidentMatch', 'IncidentComparison', 'IncidentClusterAnalysis', 'PredictiveAnalyticsRun', 'PredictiveScenario', 'AIGenerationLog', 'EnvironmentalSite', 'HospitalFinancialRecord',
-     'PlatformActivityLog', 'PlatformSessionTracking', 'Chemical', 'ChemicalIncident', VideoEvidence, 
+     'PlatformActivityLog', 'PlatformSessionTracking', 'Chemical', 'ChemicalIncident', 'VideoEvidence', 
     
 ]
 
