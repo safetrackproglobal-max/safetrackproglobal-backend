@@ -345,5 +345,6 @@ zope.event==6.0
 zope.interface==8.0.1
 zopfli==0.4.0
 zstandard==0.25.0
-pg8000==1.31.2
-scramp>=1.4.5
+# pg8000==1.31.2
+psycopg2-binary==2.9.10
+# scramp>=1.4.5
