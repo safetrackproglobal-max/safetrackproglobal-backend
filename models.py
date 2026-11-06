@@ -1908,7 +1908,7 @@ class Company(db.Model):
             'incidents_remaining': get_remaining(plan_limits.get('max_incidents', 0), self.monthly_incidents_reported)
         }
     
-    def has_feature(self, feature_name):
+     def has_feature(self, feature_name):
         """Check if company has a specific feature"""
         plan_limits = self.get_plan_limits()
         features = plan_limits.get('features', [])
@@ -1916,7 +1916,8 @@ class Company(db.Model):
         if 'all' in features:
             return True
         return feature_name in features
-        def requires_mfa_for(self, user_type):
+
+    def requires_mfa_for(self, user_type):
         """
         Whether the company policy mandates MFA for this user type.
         - 'optional'            → never required
