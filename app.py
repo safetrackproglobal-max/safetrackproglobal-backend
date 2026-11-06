@@ -2913,15 +2913,11 @@ def create_app():
     """Application factory pattern"""
     
     # ✅ Postgres via pg8000 (pure-Python — avoids OpenSSL segfault with TF/torch)
-    _db_url = os.getenv('DATABASE_URL') or os.getenv('DATABASE_URI')
-    if not _db_url:
-        raise RuntimeError("DATABASE_URL is not set — Postgres is required")
-    
-    # Normalize to pg8000 driver
+        # Normalize to psycopg2 driver
     if _db_url.startswith('postgres://'):
-        _db_url = _db_url.replace('postgres://', 'postgresql+pg8000://', 1)
-    elif _db_url.startswith('postgresql://') and '+pg8000' not in _db_url:
-        _db_url = _db_url.replace('postgresql://', 'postgresql+pg8000://', 1)
+        _db_url = _db_url.replace('postgres://', 'postgresql+psycopg2://', 1)
+    elif _db_url.startswith('postgresql://') and '+psycopg2' not in _db_url:
+        _db_url = _db_url.replace('postgresql://', 'postgresql+psycopg2://', 1)
     
     print(f"🔗 [STARTUP] Using DB URL: {_db_url[:60]}...", flush=True)
     
@@ -2937,11 +2933,10 @@ def create_app():
         JWT_REFRESH_TOKEN_EXPIRES=timedelta(days=int(os.getenv('JWT_REFRESH_TOKEN_DAYS', '30'))),
         
         # ✅ Database — Postgres only
-        SQLALCHEMY_DATABASE_URI=_db_url,
-        SQLALCHEMY_TRACK_MODIFICATIONS=False,
-        SQLALCHEMY_ENGINE_OPTIONS={
+                SQLALCHEMY_ENGINE_OPTIONS={
             'pool_recycle': int(os.getenv('DB_POOL_RECYCLE', '300')),
-            'pool_pre_ping': os.getenv('DB_POOL_PRE_PING', 'True').lower() == 'true'
+            'pool_pre_ping': os.getenv('DB_POOL_PRE_PING', 'True').lower() == 'true',
+            'connect_args': {'sslmode': 'disable'} if '+psycopg2' in _db_url and 'railway.internal' in _db_url else {}
         },
         
         # Email
