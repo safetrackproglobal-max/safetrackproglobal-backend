@@ -2925,7 +2925,7 @@ def create_app():
     
     print(f"🔗 [STARTUP] Using DB URL: {_db_url[:60]}...", flush=True)
     
-    app = Flask(__name__)    ...
+    app = Flask(__name__)
     
     # Enhanced Configuration
     app.config.update(
