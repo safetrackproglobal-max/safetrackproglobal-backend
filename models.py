@@ -1727,10 +1727,10 @@ class Company(db.Model):
     
     # Features & limits
     features = db.Column(db.Text, nullable=True)
-
     custom_limits = db.Column(db.Text, nullable=True)
-        # ==================== COMPLIANCE ====================
-    mfa_policy  = db.Column(db.String(16), nullable=False, default='optional', server_default='optional')
+
+    # ==================== COMPLIANCE ====================
+    mfa_policy = db.Column(db.String(16), nullable=False, default='optional', server_default='optional')
     dpa_version = db.Column(db.String(32), nullable=True)
     baa_version = db.Column(db.String(32), nullable=True)
     
@@ -1908,7 +1908,7 @@ class Company(db.Model):
             'incidents_remaining': get_remaining(plan_limits.get('max_incidents', 0), self.monthly_incidents_reported)
         }
     
-     def has_feature(self, feature_name):
+    def has_feature(self, feature_name):
         """Check if company has a specific feature"""
         plan_limits = self.get_plan_limits()
         features = plan_limits.get('features', [])
@@ -1930,7 +1930,6 @@ class Company(db.Model):
             return True
         return False
 
-    
     def reset_monthly_usage(self):
         """Reset monthly usage counters"""
         now = datetime.utcnow()
