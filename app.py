@@ -3091,33 +3091,7 @@ def create_app():
             app.cv_system = AdvancedComputerVisionSystem()
             app.cv_system.yolov5_available = False
     
-    # ✅ CORS setup
-    ALLOWED_ORIGINS = [
-        'https://www.safetrackproglobal.com',
-        'https://safetrackproglobal.com',
-        'https://safetrack-pro-frontend.vercel.app',
-        'https://safetrackproglobal-backend-production.up.railway.app',
-        'http://localhost:3000',
-        'http://127.0.0.1:3000',
-        'http://127.0.0.1:5000',
-        'http://localhost:5000',
-    ]
-    
-    CORS(app,
-         origins=ALLOWED_ORIGINS,
-         supports_credentials=True,
-         methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-         allow_headers=[
-             "Content-Type", "Authorization", "X-Requested-With",
-             "X-Industry-Standard", "X-Client-Version", "X-Industry-Type",
-             "X-Module", "X-Standards", "X-Compliance-Level",
-             "X-Healthcare-Facility", "X-User-Role", "X-HIPAA-Compliant",
-             "X-Data-Sensitivity", "X-Healthcare-Version", "X-Healthcare-Context",
-             "X-User-Plan", "X-Is-Super-Admin"
-         ],
-         expose_headers=["Content-Range", "X-Content-Range"],
-         max_age=3600
-    )
+   
     
     # ✅ SocketIO — async only, NO cors_allowed_origins (Flask-CORS handles it)
     socketio.init_app(
@@ -3165,25 +3139,23 @@ for dir_name, dir_path in UPLOAD_DIRS.items():
 os.makedirs(MODELS_DIR, exist_ok=True)
 
 
+ALLOWED_ORIGINS = {
+    'http://localhost:3000',
+    'http://127.0.0.1:3000',
+    'https://safetrackproglobal-backend-production.up.railway.app',
+    'https://www.safetrackproglobal.com',
+    'https://safetrackproglobal.com',
+    'https://safetrack-pro-frontend.vercel.app',
+}
+
 @app.after_request
 def add_cors_headers(response):
-    """Add CORS headers to every response"""
-    origin = request.headers.get('Origin', '')
+    origin = request.headers.get('Origin')
     
-    allowed_origins = [
-        'http://localhost:3000',
-        'http://127.0.0.1:3000',
-        'https://safetrackproglobal-backend-production.up.railway.app',
-        'https://www.safetrackproglobal.com',
-        'https://safetrackproglobal.com',
-        'https://safetrack-pro-frontend.vercel.app',
-        'https://safetrackproglobal.com',
-    ]
-    
-    if origin in allowed_origins:
+    # ✅ Strict matching: only whitelisted origins are allowed
+    if origin in ALLOWED_ORIGINS:
         response.headers['Access-Control-Allow-Origin'] = origin
         response.headers['Access-Control-Allow-Credentials'] = 'true'
-        # ✅ Allow ALL headers your frontend sends
         response.headers['Access-Control-Allow-Headers'] = (
             'Content-Type, Authorization, X-Requested-With, '
             'X-Healthcare-Facility, X-User-Role, X-HIPAA-Compliant, '
@@ -3193,9 +3165,17 @@ def add_cors_headers(response):
         response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS, PATCH'
         response.headers['Access-Control-Expose-Headers'] = 'Content-Range, X-Content-Range'
         response.headers['Access-Control-Max-Age'] = '3600'
+        # ✅ Very important: prevent caching issues
+        response.headers['Vary'] = 'Origin'
     
     return response
 
+@app.before_request
+def handle_preflight():
+    if request.method == "OPTIONS":
+        response = app.make_default_options_response()
+        # CORS headers will be added by after_request
+        return response
 # ============================================================================
 # ✅ Force-create tables in dependency order
 # Base tables first, then everything else
