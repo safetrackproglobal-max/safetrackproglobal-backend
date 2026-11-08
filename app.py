@@ -3091,7 +3091,16 @@ def create_app():
             app.cv_system = AdvancedComputerVisionSystem()
             app.cv_system.yolov5_available = False
     
-   
+    ALLOWED_ORIGINS = [
+         'https://www.safetrackproglobal.com',
+         'https://safetrackproglobal.com',
+         'https://safetrack-pro-frontend.vercel.app',
+         'https://safetrackproglobal-backend-production.up.railway.app',
+         'http://localhost:3000',
+         'http://127.0.0.1:3000',
+         'http://127.0.0.1:5000',
+         'http://localhost:5000',
+     ]
     
     # ✅ SocketIO — async only, NO cors_allowed_origins (Flask-CORS handles it)
     socketio.init_app(
