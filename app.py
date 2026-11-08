@@ -3161,7 +3161,7 @@ ALLOWED_ORIGINS = {
 def add_cors_headers(response):
     origin = request.headers.get('Origin')
     
-    # ✅ 1. Handle CORS (Keep your existing fixed code)
+    # ✅ 1. Handle CORS
     allowed = {
         'https://www.safetrackproglobal.com',
         'https://safetrackproglobal.com',
@@ -3184,24 +3184,26 @@ def add_cors_headers(response):
         )
         response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS, PATCH'
         response.headers['Vary'] = 'Origin'
-    
-    # ✅ 2. The Balanced CSP (Fixes the vulnerability without breaking HTML)
-    # We only apply the strict CSP to API routes. HTML routes get the relaxed one.
-    if request.path.startswith('/api/'):
-        # Strict for API (JSON only)
-        response.headers['Content-Security-Policy'] = "default-src 'none'; frame-ancestors 'none'; sandbox"
-    else:
-        # Relaxed for HTML (Certificates, Documents)
+
+    # ✅ 2. SMART CSP LOGIC
+    # Check if the response is actually HTML (Certificates/Documents)
+    is_html = response.content_type and 'text/html' in response.content_type
+
+    if is_html:
+        # Relaxed CSP ONLY for HTML pages
         response.headers['Content-Security-Policy'] = (
             "default-src 'self'; "
-            "script-src 'self' 'unsafe-inline'; " # Allows certificate generation scripts
-            "style-src 'self' 'unsafe-inline'; "   # Allows inline CSS for documents
-            "img-src 'self' data: https:; "        # Allows base64 images and external logos
+            "script-src 'self' 'unsafe-inline'; "
+            "style-src 'self' 'unsafe-inline'; "
+            "img-src 'self' data: https:; "
             "font-src 'self' data:; "
             "connect-src 'self'; "
             "frame-ancestors 'none';"
         )
-    
+    else:
+        # Strict CSP for ALL JSON responses (including the root / healthcheck)
+        response.headers['Content-Security-Policy'] = "default-src 'none'; frame-ancestors 'none'; sandbox"
+
     # ✅ 3. Standard Security Headers
     response.headers['X-Content-Type-Options'] = 'nosniff'
     response.headers['X-Frame-Options'] = 'DENY'
