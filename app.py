@@ -3161,8 +3161,19 @@ ALLOWED_ORIGINS = {
 def add_cors_headers(response):
     origin = request.headers.get('Origin')
     
-    # ✅ Strict matching: only whitelisted origins are allowed
-    if origin in ALLOWED_ORIGINS:
+    # ✅ 1. Handle CORS (Keep your existing fixed code)
+    allowed = {
+        'https://www.safetrackproglobal.com',
+        'https://safetrackproglobal.com',
+        'https://safetrack-pro-frontend.vercel.app',
+        'https://safetrackproglobal-backend-production.up.railway.app',
+        'http://localhost:3000',
+        'http://127.0.0.1:3000',
+        'http://127.0.0.1:5000',
+        'http://localhost:5000',
+    }
+    
+    if origin in allowed:
         response.headers['Access-Control-Allow-Origin'] = origin
         response.headers['Access-Control-Allow-Credentials'] = 'true'
         response.headers['Access-Control-Allow-Headers'] = (
@@ -3172,10 +3183,29 @@ def add_cors_headers(response):
             'X-User-Plan, X-Is-Super-Admin'
         )
         response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS, PATCH'
-        response.headers['Access-Control-Expose-Headers'] = 'Content-Range, X-Content-Range'
-        response.headers['Access-Control-Max-Age'] = '3600'
-        # ✅ Very important: prevent caching issues
         response.headers['Vary'] = 'Origin'
+    
+    # ✅ 2. The Balanced CSP (Fixes the vulnerability without breaking HTML)
+    # We only apply the strict CSP to API routes. HTML routes get the relaxed one.
+    if request.path.startswith('/api/'):
+        # Strict for API (JSON only)
+        response.headers['Content-Security-Policy'] = "default-src 'none'; frame-ancestors 'none'; sandbox"
+    else:
+        # Relaxed for HTML (Certificates, Documents)
+        response.headers['Content-Security-Policy'] = (
+            "default-src 'self'; "
+            "script-src 'self' 'unsafe-inline'; " # Allows certificate generation scripts
+            "style-src 'self' 'unsafe-inline'; "   # Allows inline CSS for documents
+            "img-src 'self' data: https:; "        # Allows base64 images and external logos
+            "font-src 'self' data:; "
+            "connect-src 'self'; "
+            "frame-ancestors 'none';"
+        )
+    
+    # ✅ 3. Standard Security Headers
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-Frame-Options'] = 'DENY'
+    response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
     
     return response
 
