@@ -59,6 +59,6 @@ CMD gunicorn app:app \
     --workers 1 \
     --timeout 900 \
     --graceful-timeout 60 \
-    --preload \
     --access-logfile - \
     --error-logfile -
+
