@@ -39809,6 +39809,51 @@ def update_company_logo_url(company_id):
             'error': str(e)
         }), 500
 
+def _log_failed_login(email, user, reason, ip, ua):
+    """
+    Log a failed login attempt to platform_activity_logs.
+    Fires even when `user` is None (hacker trying random emails).
+    """
+    try:
+        from models import PlatformActivityLog
+
+        device_info = extract_device_info(ua)
+        device_type = device_info.get('device_type', 'Desktop')
+
+        log = PlatformActivityLog(
+            user_id=user.id if user else None,
+            company_id=getattr(user, 'company_id', None) if user else None,
+            hospital_id=getattr(user, 'hospital_id', None) if user else None,
+
+            activity_type='failed_login',
+            category='security',
+            description=f'Failed login attempt ({reason}) for {email}',
+            resource_type='auth',
+            resource_name='Login Endpoint',
+
+            ip_address=ip,
+            user_agent=(ua or '')[:1000],
+            device_type=device_type,
+            request_url=request.path,
+            http_method=request.method,
+
+            status='failed',
+            severity='medium',
+            is_suspicious=True,   # ← the flag the dashboard highlights in red
+
+            extra_data={
+                'attempted_email': email,
+                'reason': reason,
+                'device_info': device_info,
+                'user_existed': user is not None,
+            }
+        )
+        db.session.add(log)
+        db.session.commit()
+    except Exception as e:
+        logger.error(f"_log_failed_login error: {e}")
+        db.session.rollback()
+
 
 @app.route('/api/auth/login', methods=['POST', 'OPTIONS'])
 @app.route('/api/login', methods=['POST', 'OPTIONS'])
@@ -39818,7 +39863,7 @@ def login():
     try:
         if request.method == 'OPTIONS':
             return jsonify({'status': 'ok'}), 200
-        
+
         data = request.get_json(silent=True) or {}
         if not data:
             return jsonify({'error': 'No JSON data provided'}), 400
@@ -39830,24 +39875,37 @@ def login():
         if not email or not password:
             return jsonify({'error': 'Email and password are required'}), 400
 
-        # Find user
+        # ---------- Find user ----------
         from sqlalchemy import func
         user = User.query.filter(func.lower(User.email) == email).first()
-        
+
         if not user:
             logger.warning(f"Failed login attempt - user not found: {email}")
+            _log_failed_login(
+                email=email,
+                user=None,
+                reason='user_not_found',
+                ip=request.remote_addr,
+                ua=request.headers.get('User-Agent', '')
+            )
             return jsonify({'error': 'Invalid credentials'}), 401
 
-        # ==================== 🆕 CHECK SUPER ADMIN FROM DATABASE ====================
         is_super_admin = getattr(user, 'is_super_admin', False)
 
-        # ✅ SUPER ADMIN FLOW (from database, not hardcoded)
+        # ==================== SUPER ADMIN FLOW ====================
         if is_super_admin:
             if not check_password_hash(user.password_hash, password):
                 logger.warning(f"Failed super admin login attempt for {user.id}")
+                _log_failed_login(
+                    email=email,
+                    user=user,
+                    reason='wrong_password_super_admin',
+                    ip=request.remote_addr,
+                    ua=request.headers.get('User-Agent', '')
+                )
                 return jsonify({'error': 'Invalid credentials'}), 401
-            
-            # Ensure super admin status is set
+
+            # Promote to super admin flags
             user.is_super_admin = True
             user.is_platform_owner = True
             user.is_active = True
@@ -39856,25 +39914,32 @@ def login():
             user.user_type = 'super_admin'
             user.role = 'Super Admin'
             user.admin_level = 'super'
-            
-            db.session.commit()
-            
-            # Update last login
             user.last_login = datetime.utcnow()
             db.session.commit()
-            
+
             # Create session
             session_id = str(uuid.uuid4())
             user_session = UserSession(
                 user_id=user.id,
                 session_id=session_id,
                 ip_address=request.remote_addr,
-                user_agent=request.headers.get('User-Agent', ''),
+                user_agent=request.headers.get('User-Agent', '')[:512],
                 expires_at=datetime.utcnow() + timedelta(hours=24),
                 is_active=True
             )
             db.session.add(user_session)
             db.session.commit()
+
+            # ✅ Forensically log the successful login
+            try:
+                track_login(
+                    user_id=user.id,
+                    ip_address=request.remote_addr,
+                    user_agent=request.headers.get('User-Agent', ''),
+                    login_type='super_admin'
+                )
+            except Exception as log_err:
+                logger.warning(f"track_login failed (non-fatal): {log_err}")
 
             # Cache user data
             user_data = {
@@ -39912,9 +39977,9 @@ def login():
                     'token_version': getattr(user, 'token_version', 1)
                 }
             )
-            
+
             logger.info(f"👑 Super Admin login successful for {email}")
-            
+
             return jsonify({
                 'success': True,
                 'message': 'Super Admin login successful',
@@ -39933,20 +39998,27 @@ def login():
                 'dashboard_config': get_dashboard_config(user, 'complete')
             }), 200
 
-        # ✅ REGULAR USER - Verify password
+        # ==================== REGULAR USER PASSWORD CHECK ====================
         if not check_password_hash(user.password_hash, password):
             logger.warning(f"Failed login attempt for user {user.id}")
+            _log_failed_login(
+                email=email,
+                user=user,
+                reason='wrong_password',
+                ip=request.remote_addr,
+                ua=request.headers.get('User-Agent', '')
+            )
             return jsonify({'error': 'Invalid credentials'}), 401
 
-        # ==================== 🆕 COMPLIANCE GATES ====================
-        
+        # ==================== COMPLIANCE GATES ====================
+
         # CHECK A: Consent re-acceptance
         needs_consent = getattr(user, 'needs_consent', False)
-        if getattr(user, 'terms_version', None) != CURRENT_TERMS_VERSION or getattr(user, 'privacy_version', None) != CURRENT_PRIVACY_VERSION:
+        if getattr(user, 'terms_version', None) != CURRENT_TERMS_VERSION or \
+           getattr(user, 'privacy_version', None) != CURRENT_PRIVACY_VERSION:
             needs_consent = True
 
         if needs_consent:
-            # Issue a limited token so they can hit /auth/accept-consent
             consent_token = create_access_token(
                 identity=str(user.id),
                 additional_claims={'user_id': user.id, 'purpose': 'consent'},
@@ -39988,7 +40060,7 @@ def login():
                 'message': 'Enter your authentication code to continue.',
             }), 200
 
-        # CHECK C: Guardian Consent (Minors)
+        # CHECK C: Guardian Consent
         if getattr(user, 'is_minor', False) and not getattr(user, 'guardian_consent_given', False):
             return jsonify({
                 'error': 'Guardian consent pending',
@@ -39998,8 +40070,7 @@ def login():
             }), 403
 
         # ==================== STANDARD CHECKS ====================
-        
-        # CHECK 1: Email verification
+
         if not user.verified:
             return jsonify({
                 'error': 'Email not verified',
@@ -40008,21 +40079,18 @@ def login():
                 'email': user.email
             }), 403
 
-        # CHECK 2: Account active status
         if not user.is_active:
             return jsonify({
                 'error': 'Account deactivated',
                 'message': 'Your account has been deactivated. Contact support.'
             }), 403
 
-        # CHECK 3: Admin approval status
         if user.user_type == 'admin' and user.approval_status != 'approved':
             status_message = {
                 'pending': 'Your admin account is pending approval. Our team will contact you soon.',
                 'rejected': 'Your admin account was rejected. Contact support for details.',
                 'suspended': 'Your admin account is suspended. Contact support.'
             }.get(user.approval_status, 'Admin account requires approval.')
-            
             return jsonify({
                 'error': 'Admin approval required',
                 'message': status_message,
@@ -40031,7 +40099,7 @@ def login():
                 'user_type': 'admin'
             }), 403
 
-        # Initialize variables
+        # ==================== STAGE DETERMINATION ====================
         stage = 'complete'
         redirect_to = '/dashboard'
         requires_payment = False
@@ -40042,15 +40110,13 @@ def login():
         company = None
         company_found = False
 
-        # ✅ ===== FETCH COMPANY =====
         if user.company_id:
             company = Company.query.get(user.company_id)
             if company:
                 company_found = True
             else:
                 print(f"⚠️ Company with ID {user.company_id} not found")
-        
-        # If company not found by ID, try by name (for legacy data)
+
         if not company_found and user.company_name:
             company = Company.query.filter_by(name=user.company_name).first()
             if company:
@@ -40058,20 +40124,21 @@ def login():
                 user.company_id = company.id
                 db.session.commit()
 
-        # ✅ ===== COMPANY USERS (Admin, Employee, Company Admin) =====
+        # Company users (admin, employee, company_admin)
         if user.user_type in ['admin', 'employee', 'company_admin']:
             if company_found and company:
-                (company_stage, company_redirect, company_requires_payment, 
-                 company_requires_plan_selection, company_payment_status, company_message) = check_company_plan_status(company)
-                
+                (company_stage, company_redirect, company_requires_payment,
+                 company_requires_plan_selection, company_payment_status, company_message) = \
+                    check_company_plan_status(company)
+
                 stage = company_stage
                 redirect_to = company_redirect
                 requires_payment = company_requires_payment
                 requires_plan_selection = company_requires_plan_selection
                 payment_status = company_payment_status
-                
+
                 sync_user_with_company(user)
-                
+
                 if stage == 'complete':
                     if user.user_type == 'admin':
                         redirect_to = '/admin/dashboard'
@@ -40087,18 +40154,13 @@ def login():
                     'user_type': user.user_type
                 }), 403
 
-        # ✅ ===== INDIVIDUAL USER =====
+        # Individual user
         elif user.user_type == 'user':
-            user_plan = getattr(user, 'subscription_plan', None)
-            subscription_status = getattr(user, 'subscription_status', None)
-
-            if not user_plan:
-                user_plan = 'free'
-                user.subscription_plan = 'free'
-                if not subscription_status:
-                    subscription_status = 'active'
-                    user.subscription_status = 'active'
-                db.session.commit()
+            user_plan = getattr(user, 'subscription_plan', None) or 'free'
+            subscription_status = getattr(user, 'subscription_status', None) or 'active'
+            user.subscription_plan = user_plan
+            user.subscription_status = subscription_status
+            db.session.commit()
 
             if user_plan == 'free':
                 stage = 'complete'
@@ -40121,7 +40183,6 @@ def login():
                 redirect_to = '/dashboard'
                 payment_status = 'completed'
 
-        # ✅ ===== PLATFORM OWNER / SAFETY PRO =====
         elif user.user_type == 'platform_owner':
             stage = 'complete'
             redirect_to = '/platform/dashboard'
@@ -40129,32 +40190,29 @@ def login():
             stage = 'complete'
             redirect_to = '/safetypro/dashboard'
 
-        # Check company setup for admin
         if user.user_type == 'admin' and not user.company_id and stage != 'needs_plan':
             stage = 'needs_company_setup'
             redirect_to = '/company-setup'
             requires_company_setup = True
 
-        # Check admin approval
         if user.user_type == 'admin' and user.approval_status == 'pending' and stage != 'needs_plan':
             stage = 'needs_approval'
             redirect_to = '/pending-approval'
             needs_approval = True
 
-        # ✅ SUCCESSFUL LOGIN - Update user statistics
+        # ==================== LOG SUCCESSFUL LOGIN ====================
         user.last_login = datetime.utcnow()
         user.login_count = (user.login_count or 0) + 1
 
-        # ✅ Get company logo if user has company
         company_logo = None
         if user.company_id:
             company = Company.query.get(user.company_id)
             if company:
                 company_logo = company.logo_url
                 user.company_logo = company_logo
-                db.session.commit()
+        db.session.commit()
 
-        # Create user session
+        # Create session
         session_id = str(uuid.uuid4())
         user_session = UserSession(
             user_id=user.id,
@@ -40167,7 +40225,18 @@ def login():
         db.session.add(user_session)
         db.session.commit()
 
-        # Get final plan
+        # ✅ Forensically log the successful login
+        try:
+            track_login(
+                user_id=user.id,
+                ip_address=request.remote_addr,
+                user_agent=request.headers.get('User-Agent', ''),
+                login_type=user.user_type or 'user'
+            )
+        except Exception as log_err:
+            logger.warning(f"track_login failed (non-fatal): {log_err}")
+
+        # ==================== CACHE + TOKEN ====================
         if user.user_type in ['admin', 'employee', 'company_admin']:
             user_plan = user.subscription_plan
             subscription_status = user.subscription_status
@@ -40175,7 +40244,6 @@ def login():
             user_plan = getattr(user, 'subscription_plan', 'free')
             subscription_status = getattr(user, 'subscription_status', 'inactive')
 
-        # Cache user data
         user_data = {
             'id': user.id,
             'email': user.email,
@@ -40202,22 +40270,17 @@ def login():
             'last_login': user.last_login.isoformat() if user.last_login else None,
             'created_at': user.created_at.isoformat() if user.created_at else None
         }
-        
         UserCache.set(user.id, user_data)
-
-        # JWT with minimal claims
-        token_claims = {
-            'user_id': user.id,
-            'session_id': session_id,
-            'token_version': getattr(user, 'token_version', 1)
-        }
 
         access_token = create_access_token(
             identity=str(user.id),
-            additional_claims=token_claims
+            additional_claims={
+                'user_id': user.id,
+                'session_id': session_id,
+                'token_version': getattr(user, 'token_version', 1)
+            }
         )
 
-        # Trial logic
         trial_active = False
         effective_plan = user_plan
         if user.user_type == 'user':
@@ -40225,10 +40288,8 @@ def login():
             effective_plan = user.trial_plan if trial_active else user_plan
 
         dashboard_config = get_dashboard_config(user, stage)
-
         logger.info(f"Login successful for {user.email} - Stage: {stage} - User type: {user.user_type} - Plan: {user_plan}")
 
-        # ✅ EXACT MATCH response, plus compliance booleans
         return jsonify({
             'success': True,
             'message': 'Login successful',
@@ -40260,7 +40321,6 @@ def login():
                 'last_login': user.last_login.isoformat() if user.last_login else None,
                 'created_at': user.created_at.isoformat() if user.created_at else None,
                 'login_count': user.login_count,
-                # 🆕 Compliance flags exposed to frontend
                 'mfa_enabled': getattr(user, 'mfa_enabled', False),
                 'terms_version': getattr(user, 'terms_version', None),
                 'privacy_version': getattr(user, 'privacy_version', None),
@@ -40456,21 +40516,43 @@ def create_login_log(user_id, session_id, ip_address, user_agent, login_type):
         return None
 
 def create_activity_log(user_id, activity_type, description, ip_address=None, metadata=None):
-    """Create activity log entry"""
+    """
+    Legacy wrapper — delegates to track_activity so it writes to the new table,
+    while also maintaining the legacy User.activity_count / last_activity fields.
+
+    Returns True if the activity was tracked successfully, else False.
+    """
+    tracked = False
     try:
-        # Update user activity count
-        user = User.query.get(user_id)
-        if user:
-            user.activity_count = (user.activity_count or 0) + 1
-            user.last_activity = datetime.utcnow()
-            db.session.add(user)
-            db.session.commit()
-        
+        # 1. Write the actual audit record to the activity table
+        result = track_activity(
+            user_id=user_id,
+            activity_type=activity_type,
+            description=description,
+            ip_address=ip_address,
+            metadata=metadata,
+        )
+        tracked = bool(result)
+
+        # 2. Best-effort update of legacy user counters (non-fatal)
+        try:
+            user = User.query.get(user_id)
+            if user:
+                user.activity_count = (user.activity_count or 0) + 1
+                user.last_activity = datetime.utcnow()
+                db.session.commit()
+        except Exception as user_err:
+            db.session.rollback()
+            logger.warning(
+                f"Activity tracked for user {user_id}, but failed to update user counters: {user_err}"
+            )
+
         logger.info(f"Activity logged: {activity_type} - {description}")
-        return True
-        
+        return tracked
+
     except Exception as e:
         logger.error(f"Failed to create activity log for user {user_id}: {e}")
+        db.session.rollback()
         return False
 
 def extract_device_info(user_agent):
@@ -40618,61 +40700,76 @@ def get_admin_avg_approval_time(admin_id):
 # ============== TRACKING HELPER FUNCTIONS ==============
 
 def track_login(user_id, ip_address, user_agent, login_type='user'):
-    """Track user login and return login log ID"""
+    """Track user login with full forensic context (uses new platform_activity_logs table)"""
     try:
-        # Create login session (using your existing UserSession model)
+        from models import PlatformActivityLog  # use the new model
+
+        # Create login session
         session_id = str(uuid.uuid4())
-        
         session = UserSession(
             user_id=user_id,
             session_id=session_id,
             ip_address=ip_address,
-            user_agent=user_agent,
+            user_agent=(user_agent or '')[:512],
             login_time=datetime.utcnow(),
             last_activity=datetime.utcnow(),
             expires_at=datetime.utcnow() + timedelta(hours=24),
             is_active=True
         )
         db.session.add(session)
-        
-        # Create activity log for login
-        activity_log = ActivityLog(
+
+        # Parse device info
+        device_info = extract_device_info(user_agent)
+        device_type = device_info.get('device_type', 'Desktop')
+
+        # Forensic activity log
+        activity_log = PlatformActivityLog(
             user_id=user_id,
             activity_type='login',
+            category='auth',
             description=f'{login_type.capitalize()} login from {ip_address}',
+            resource_type='session',
+            resource_id=None,
+            resource_name=f'{device_info.get("browser", "Unknown")} on {device_info.get("os", "Unknown")}',
             ip_address=ip_address,
-            metadata={
-                'user_agent': user_agent,
-                'session_id': session_id,
+            user_agent=(user_agent or '')[:1000],
+            device_type=device_type,
+            location=None,  # populated below if you have a geoip lookup
+            request_url=request.path if request else None,
+            http_method=request.method if request else 'POST',
+            status='success',
+            severity='low',
+            is_suspicious=False,
+            extra_data={
                 'login_type': login_type,
-                'device_info': extract_device_info(user_agent),
+                'session_id': session_id,
+                'device_info': device_info,
                 'login_time': datetime.utcnow().isoformat()
             }
         )
         db.session.add(activity_log)
-        
-        # Update user statistics
+
+        # Update user stats
         user = User.query.get(user_id)
         if user:
             user.login_count = (user.login_count or 0) + 1
             user.last_login = datetime.utcnow()
             user.last_activity = datetime.utcnow()
             db.session.add(user)
-        
+
         db.session.commit()
-        
-        logger.info(f"Login tracked for user {user_id}, session: {session_id}, activity log: {activity_log.id}")
-        
+
+        logger.info(f"Login tracked for user {user_id}, session: {session_id}, log: {activity_log.id}")
+
         return {
             'session_id': session_id,
             'activity_log_id': activity_log.id
         }
-        
+
     except Exception as e:
         logger.error(f"Failed to track login for user {user_id}: {e}")
         db.session.rollback()
         return None
-
 def track_logout(session_id, user_id):
     """Track user logout and calculate session duration"""
     try:
@@ -40730,45 +40827,55 @@ def track_logout(session_id, user_id):
         db.session.rollback()
         return None
 
-def track_activity(user_id, activity_type, description, ip_address=None, metadata=None):
-    """Track user activity with ActivityLog model"""
+def track_activity(user_id, activity_type, description, ip_address=None, metadata=None,
+                   category='general', severity='low', resource_name=None):
+    """Track user activity with forensic context (new table)"""
     try:
-        # Create activity log
-        activity_log = ActivityLog(
+        from models import PlatformActivityLog
+
+        ua = request.headers.get('User-Agent', '') if request else ''
+        device_info = extract_device_info(ua)
+
+        activity_log = PlatformActivityLog(
             user_id=user_id,
             activity_type=activity_type,
+            category=category,
             description=description,
-            ip_address=ip_address or request.remote_addr,
-            metadata=metadata or {}
+            resource_name=resource_name,
+            ip_address=ip_address or (request.remote_addr if request else None),
+            user_agent=(ua or '')[:1000],
+            device_type=device_info.get('device_type', 'Desktop'),
+            request_url=request.path if request else None,
+            http_method=request.method if request else None,
+            status='success',
+            severity=severity,
+            is_suspicious=False,
+            extra_data=metadata or {}
         )
         db.session.add(activity_log)
-        
-        # Update user activity count
+
         user = User.query.get(user_id)
         if user:
             user.activity_count = (user.activity_count or 0) + 1
             user.last_activity = datetime.utcnow()
             db.session.add(user)
-            
-            # Update last activity in active session
+
             session = UserSession.query.filter_by(
-                user_id=user_id,
-                is_active=True
+                user_id=user_id, is_active=True
             ).order_by(UserSession.login_time.desc()).first()
-            
             if session:
                 session.last_activity = datetime.utcnow()
                 db.session.add(session)
-        
+
         db.session.commit()
-        
-        # Update performance score in background
-        update_user_performance_score(user_id)
-        
-        logger.info(f"Activity tracked for user {user_id}: {activity_type} - {description}")
-        
+
+        try:
+            update_user_performance_score(user_id)
+        except Exception:
+            pass
+
         return activity_log.id
-        
+
     except Exception as e:
         logger.error(f"Failed to track activity for user {user_id}: {e}")
         db.session.rollback()
@@ -115276,7 +115383,7 @@ def get_geographic_distribution():
             PlatformActivityLog.location.isnot(None),
             PlatformActivityLog.location != ''
         ).group_by(PlatformActivityLog.location).order_by(
-            func.count(func.distinct(PlatformActivityLog.user_id)).desc()
+            func.count(func.distinct(.user_id)).desc()
         ).limit(20).all()
         
         return jsonify({
