@@ -7515,34 +7515,38 @@ class HospitalFinancialRecord(db.Model):
 
 class PlatformActivityLog(db.Model):
     """Platform-wide user activity tracking"""
-    __tablename__ = 'platform_activity_logs'
-    
+    __tablename__ = 'activity_logs'
+
     id = db.Column(db.Integer, primary_key=True)
     user_id = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
     company_id = db.Column(db.Integer, db.ForeignKey('companies.id', ondelete='SET NULL'), nullable=True)
     hospital_id = db.Column(db.Integer, db.ForeignKey('hospitals.id', ondelete='SET NULL'), nullable=True)
-    
+
     activity_type = db.Column(db.String(50), nullable=False, index=True)
     category = db.Column(db.String(50), index=True)
     description = db.Column(db.Text)
     resource_type = db.Column(db.String(50))
     resource_id = db.Column(db.Integer)
-    
+
     ip_address = db.Column(db.String(45))
     user_agent = db.Column(db.Text)
     device_type = db.Column(db.String(50))
     location = db.Column(db.String(200))
-    
+
     status = db.Column(db.String(50), default='success')
     severity = db.Column(db.String(20), default='low')
-    
-    extra_data = db.Column(db.JSON)
+
+    # Use `created_at` as the Python attribute, but accept both DB columns
     created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
-    
+    timestamp = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+
+    extra_data = db.Column(db.JSON)
+    activity_data = db.Column(db.JSON)
+
     user = db.relationship('User', foreign_keys=[user_id])
     company = db.relationship('Company', foreign_keys=[company_id])
     hospital = db.relationship('Hospital', foreign_keys=[hospital_id])
-    
+
     def to_dict(self):
         return {
             'id': self.id,
@@ -7564,8 +7568,9 @@ class PlatformActivityLog(db.Model):
             'location': self.location,
             'status': self.status,
             'severity': self.severity,
-            'extra_data': self.extra_data,
-            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'extra_data': self.extra_data or self.activity_data,
+            'created_at': (self.created_at or self.timestamp).isoformat()
+                          if (self.created_at or self.timestamp) else None,
         }
 
 
