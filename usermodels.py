@@ -1240,7 +1240,7 @@ from datetime import datetime
 
 
 class ActivityLog(db.Model):
-    __tablename__ = 'activity_logs'
+    __tablename__ = 'legacy_activity_logs'   # ← CHANGED from 'activity_logs'
     
     id = db.Column(db.Integer, primary_key=True)
     user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
@@ -1248,16 +1248,14 @@ class ActivityLog(db.Model):
     description = db.Column(db.Text)
     timestamp = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
     ip_address = db.Column(db.String(50))
-    activity_data = db.Column(db.JSON)  # CHANGED: Renamed from 'metadata' to 'activity_data'
+    activity_data = db.Column(db.JSON)
     
-    # Relationships
-    user = db.relationship('User', backref=db.backref('activity_logs', lazy=True))
+    user = db.relationship('User', backref=db.backref('legacy_activity_logs', lazy=True))
     
-    # Indexes for better query performance
     __table_args__ = (
-        db.Index('idx_activity_user_timestamp', 'user_id', 'timestamp'),
-        db.Index('idx_activity_type', 'activity_type'),
-        db.Index('idx_activity_user_type', 'user_id', 'activity_type'),
+        db.Index('idx_legacy_activity_user_timestamp', 'user_id', 'timestamp'),
+        db.Index('idx_legacy_activity_type', 'activity_type'),
+        db.Index('idx_legacy_activity_user_type', 'user_id', 'activity_type'),
     )
     
     def __repr__(self):
