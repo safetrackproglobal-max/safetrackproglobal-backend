@@ -115374,7 +115374,7 @@ def get_geographic_distribution():
             return jsonify({'success': False, 'error': 'Access denied'}), 403
         days = int(request.args.get('days', 30))
         since = datetime.utcnow() - timedelta(days=days)
-        
+
         results = db.session.query(
             PlatformActivityLog.location,
             func.count(func.distinct(PlatformActivityLog.user_id)).label('users')
@@ -115382,15 +115382,18 @@ def get_geographic_distribution():
             PlatformActivityLog.created_at >= since,
             PlatformActivityLog.location.isnot(None),
             PlatformActivityLog.location != ''
-        ).group_by(PlatformActivityLog.location).order_by(
-            func.count(func.distinct(.user_id)).desc()
+        ).group_by(
+            PlatformActivityLog.location
+        ).order_by(
+            func.count(func.distinct(PlatformActivityLog.user_id)).desc()  # ← FIXED
         ).limit(20).all()
-        
+
         return jsonify({
             'success': True,
             'data': [{'location': loc, 'users': count} for loc, count in results]
         }), 200
     except Exception as e:
+        current_app.logger.error(f"Geographic distribution error: {str(e)}")
         return jsonify({'success': False, 'error': 'Internal server error'}), 500
 
 
