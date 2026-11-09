@@ -1263,46 +1263,71 @@ class ActivityLog(db.Model):
     
 
 def create_activity_log(user_id, activity_type, description, ip_address=None, metadata=None):
-    """Create activity log entry"""
+    """
+    Universal activity logger — writes to the NEW platform_activity_logs table.
+    Auto-captures request URL, HTTP method, user agent, device type, IP.
+    Every endpoint that calls this gets upgraded automatically.
+    """
     try:
-        # Create activity log
-        activity_log = ActivityLog(
+        # Look up user for company/hospital context (optional)
+        user = User.query.get(user_id) if user_id else None
+
+        # Auto-parse device info from the request's User-Agent
+        ua = request.headers.get('User-Agent', '') if request else ''
+        device_info = extract_device_info(ua)
+        device_type = device_info.get('device_type', 'Desktop')
+
+        log = PlatformActivityLog(
             user_id=user_id,
+            company_id=getattr(user, 'company_id', None) if user else None,
+            hospital_id=getattr(user, 'hospital_id', None) if user else None,
+
             activity_type=activity_type,
+            category=(metadata or {}).get('category', 'general'),
             description=description,
-            ip_address=ip_address or request.remote_addr,
-            activity_data=metadata or {}  # CHANGED: Use 'activity_data' instead of 'metadata'
+            resource_name=(metadata or {}).get('resource_name'),
+
+            ip_address=ip_address or (request.remote_addr if request else None),
+            user_agent=(ua or '')[:1000],
+            device_type=device_type,
+            request_url=request.path if request else None,
+            http_method=request.method if request else None,
+
+            status=(metadata or {}).get('status', 'success'),
+            severity=(metadata or {}).get('severity', 'low'),
+            is_suspicious=(metadata or {}).get('is_suspicious', False),
+
+            extra_data=metadata or {}
         )
-        db.session.add(activity_log)
-        
-        # Update user activity count
-        user = User.query.get(user_id)
+        db.session.add(log)
+
+        # Update user stats
         if user:
             user.activity_count = (user.activity_count or 0) + 1
             user.last_activity = datetime.utcnow()
             db.session.add(user)
-            
-            # Update last activity in active session
+
+            # Touch the active session, if any
             session = UserSession.query.filter_by(
-                user_id=user_id,
-                is_active=True
+                user_id=user_id, is_active=True
             ).order_by(UserSession.login_time.desc()).first()
-            
             if session:
                 session.last_activity = datetime.utcnow()
                 db.session.add(session)
-        
+
         db.session.commit()
-        
-        # Update performance score in background
-        update_user_performance_score(user_id)
-        
-        logger.info(f"Activity tracked for user {user_id}: {activity_type} - {description}")
-        
-        return activity_log.id
-        
+
+        # Performance score update (best effort)
+        try:
+            update_user_performance_score(user_id)
+        except Exception:
+            pass
+
+        logger.info(f"Activity logged for user {user_id}: {activity_type} - {description}")
+        return log.id
+
     except Exception as e:
-        logger.error(f"Failed to track activity for user {user_id}: {e}")
+        logger.error(f"Failed to log activity for user {user_id}: {e}")
         db.session.rollback()
         return None
 
