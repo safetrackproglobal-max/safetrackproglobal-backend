@@ -12,7 +12,8 @@ from sqlalchemy.orm import relationship, backref
 from extensions import db
 # Optional: If you use any JSON fields
 from sqlalchemy.dialects.sqlite import JSON
-
+from datetime import datetime
+from flask import request
 from usermodels import (
     User,
     SafetyViolation,
@@ -7513,36 +7514,50 @@ class HospitalFinancialRecord(db.Model):
         }
 
 
+  
+
 class PlatformActivityLog(db.Model):
-    """Platform-wide user activity tracking"""
+    """Platform-wide user activity tracking for authenticated AND unauthenticated access"""
     __tablename__ = 'activity_logs'
 
     id = db.Column(db.Integer, primary_key=True)
+    
+    # --- WHO (Can be NULL for hackers/unauthenticated users) ---
     user_id = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
     company_id = db.Column(db.Integer, db.ForeignKey('companies.id', ondelete='SET NULL'), nullable=True)
     hospital_id = db.Column(db.Integer, db.ForeignKey('hospitals.id', ondelete='SET NULL'), nullable=True)
 
+    # --- WHAT ---
     activity_type = db.Column(db.String(50), nullable=False, index=True)
     category = db.Column(db.String(50), index=True)
     description = db.Column(db.Text)
-    resource_type = db.Column(db.String(50))
+    
+    # --- TARGET (What was accessed/attempted) ---
+    resource_type = db.Column(db.String(50), index=True)
     resource_id = db.Column(db.Integer)
+    resource_name = db.Column(db.String(255)) # NEW: e.g. "Admin_Dashboard", "User_List"
 
-    ip_address = db.Column(db.String(45))
+    # --- WHERE (Crucial for unauthenticated attacks) ---
+    ip_address = db.Column(db.String(45), index=True) # Indexed for fast lookup by IP
     user_agent = db.Column(db.Text)
     device_type = db.Column(db.String(50))
     location = db.Column(db.String(200))
+    request_url = db.Column(db.String(500))  # NEW
+    http_method = db.Column(db.String(10))   # NEW
 
+    # --- SECURITY CONTEXT ---
     status = db.Column(db.String(50), default='success')
     severity = db.Column(db.String(20), default='low')
+    is_suspicious = db.Column(db.Boolean, default=False, index=True) # NEW: Flag for alerts
 
-    # Use `created_at` as the Python attribute, but accept both DB columns
+    # --- TIMESTAMPS & DATA ---
     created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
     timestamp = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    
+    extra_data = db.Column(db.JSON)      # e.g. {"attempted_password": "123"}
+    activity_data = db.Column(db.JSON)   # Legacy fallback
 
-    extra_data = db.Column(db.JSON)
-    activity_data = db.Column(db.JSON)
-
+    # Relationships
     user = db.relationship('User', foreign_keys=[user_id])
     company = db.relationship('Company', foreign_keys=[company_id])
     hospital = db.relationship('Hospital', foreign_keys=[hospital_id])
@@ -7550,8 +7565,9 @@ class PlatformActivityLog(db.Model):
     def to_dict(self):
         return {
             'id': self.id,
+            # If no user, we explicitly show 'Anonymous / Unauthenticated'
             'user_id': self.user_id,
-            'user_name': self.user.name if self.user else 'System',
+            'user_name': self.user.name if self.user else 'Anonymous (No Auth)',
             'user_email': self.user.email if self.user else None,
             'company_id': self.company_id,
             'company_name': self.company.name if self.company else None,
@@ -7562,17 +7578,20 @@ class PlatformActivityLog(db.Model):
             'description': self.description,
             'resource_type': self.resource_type,
             'resource_id': self.resource_id,
+            'resource_name': self.resource_name,
             'ip_address': self.ip_address,
             'user_agent': self.user_agent,
             'device_type': self.device_type,
             'location': self.location,
+            'request_url': self.request_url,
+            'http_method': self.http_method,
             'status': self.status,
             'severity': self.severity,
+            'is_suspicious': self.is_suspicious,
             'extra_data': self.extra_data or self.activity_data,
             'created_at': (self.created_at or self.timestamp).isoformat()
                           if (self.created_at or self.timestamp) else None,
         }
-
 
 class PlatformSessionTracking(db.Model):
     """Track active user sessions platform-wide"""
