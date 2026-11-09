@@ -7515,7 +7515,7 @@ class HospitalFinancialRecord(db.Model):
 
 class PlatformActivityLog(db.Model):
     """Platform-wide user activity tracking"""
-    __tablename__ = 'platform_activity_log'
+    __tablename__ = 'platform_activity_logs'
     
     id = db.Column(db.Integer, primary_key=True)
     user_id = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
