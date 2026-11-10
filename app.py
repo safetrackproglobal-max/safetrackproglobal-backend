@@ -200,6 +200,8 @@ except ImportError:
 
 import sys
 import traceback
+from flask import request, g
+from datetime import datetime as _dt, timedelta as _td
 
 def _global_excepthook(exc_type, exc_value, exc_tb):
     print("\n========== UNCAUGHT EXCEPTION ==========", file=sys.stderr, flush=True)
@@ -115109,6 +115111,153 @@ def hospital_ai_analytics(hospital_id):
 
 
 
+@app.before_request
+def _mark_request_start():
+    g.request_start = _dt.utcnow()
+
+
+@app.after_request
+def _log_suspicious_requests(response):
+    """Log every request that looks like an attack attempt."""
+    try:
+        status = response.status_code
+
+        # Only log suspicious statuses
+        if status not in (401, 403, 404, 405, 500):
+            return response
+
+        path = request.path or ''
+
+        # Skip noise
+        if path in ('/api/health', '/robots.txt', '/favicon.ico'):
+            return response
+        if path.startswith('/api/admin/activity'):
+            return response
+        if request.method == 'OPTIONS':
+            return response
+
+        # Detect if a valid JWT was sent (may be absent — that's fine)
+        user_id = None
+        try:
+            from flask_jwt_extended import get_jwt_identity, verify_jwt_in_request
+            verify_jwt_in_request(optional=True)
+            identity = get_jwt_identity()
+            if identity:
+                user_id = int(identity)
+        except Exception:
+            pass
+
+        # Classify the activity type
+        activity_type = {
+            401: 'unauthorized_access',
+            403: 'forbidden_access',
+            404: 'url_scan_404',
+            405: 'method_probe_405',
+            500: 'server_error_probe'
+        }.get(status, 'suspicious_request')
+
+        # Classify severity
+        if status == 500:
+            severity = 'high'
+        elif status == 403:
+            severity = 'medium'
+        elif status == 401:
+            severity = 'medium'
+        else:
+            severity = 'low'
+
+        # Device detection
+        ua = (request.headers.get('User-Agent', '') or '')[:1000]
+        ua_l = ua.lower()
+        if any(x in ua_l for x in ('sqlmap', 'nmap', 'nikto', 'burp', 'hydra', 'wpscan', 'dirbuster', 'gobuster', 'masscan', 'zap', 'python-requests', 'curl/', 'wget/')):
+            device_type = 'Scanner/Tool'
+            severity = 'high'  # Anything from a known scanner is high severity
+        elif 'mobile' in ua_l or 'android' in ua_l or 'iphone' in ua_l:
+            device_type = 'Mobile'
+        elif 'tablet' in ua_l or 'ipad' in ua_l:
+            device_type = 'Tablet'
+        else:
+            device_type = 'Desktop'
+
+        # High-frequency detection: 20+ failures from same IP in 5min
+        from models import PlatformActivityLog, db
+        try:
+            five_min_ago = _dt.utcnow() - _td(minutes=5)
+            recent_fails = PlatformActivityLog.query.filter(
+                PlatformActivityLog.ip_address == request.remote_addr,
+                PlatformActivityLog.created_at >= five_min_ago,
+                PlatformActivityLog.status == 'failed'
+            ).count()
+            if recent_fails >= 20:
+                severity = 'high'
+        except Exception:
+            recent_fails = 0
+
+        # Create the log entry
+        log = PlatformActivityLog(
+            user_id=user_id,
+            activity_type=activity_type,
+            category='security',
+            description=f'{request.method} {path} → {status}' + (f' (recent failures from IP: {recent_fails})' if recent_fails >= 20 else ''),
+            ip_address=request.remote_addr,
+            user_agent=ua,
+            device_type=device_type,
+            request_url=path[:500],
+            http_method=request.method,
+            status='failed',
+            severity=severity,
+            is_suspicious=True,
+            extra_data={
+                'status_code': status,
+                'query_string': (request.query_string or b'').decode('utf-8', errors='replace')[:500],
+                'referer': (request.headers.get('Referer', '') or '')[:500],
+                'content_length': request.content_length,
+                'recent_failures_from_ip': recent_fails,
+            }
+        )
+        db.session.add(log)
+        db.session.commit()
+
+    except Exception as e:
+        # Logging must NEVER break the actual request
+        try:
+            from flask import current_app
+            current_app.logger.error(f"after_request security logging failed: {e}")
+        except Exception:
+            pass
+        try:
+            from models import db
+            db.session.rollback()
+        except Exception:
+            pass
+
+    return response
+
+
+# ============================================================
+# ✅ GLOBAL ERROR HANDLERS — ensures 404/405/500 still flow
+# through `_log_suspicious_requests` above
+# ============================================================
+
+@app.errorhandler(404)
+def _handle_404(error):
+    from flask import jsonify
+    return jsonify({
+        'success': False,
+        'error': 'Endpoint not found',
+        'path': request.path
+    }), 404
+
+
+@app.errorhandler(405)
+def _handle_405(error):
+    from flask import jsonify
+    return jsonify({
+        'success': False,
+        'error': 'Method not allowed',
+        'method': request.method,
+        'path': request.path
+    }), 405
 
 # ============================================
 # COMMAND CENTER ENDPOINTS
