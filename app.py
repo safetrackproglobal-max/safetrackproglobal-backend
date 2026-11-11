@@ -4179,8 +4179,8 @@ def call_gemini(prompt,
                 system_instruction=None,
                 json_mode=True,
                 temperature=0.7,
-                max_tokens=8192,
-                model_name=None, # We will default this to your env variable
+                max_tokens=16384, # Increased from 8192 to prevent truncation
+                model_name=None, 
                 feature='medical_ai',
                 use_cache=True,
                 current_user=None,         
@@ -4291,9 +4291,16 @@ def call_gemini(prompt,
         
         duration = int((time.time() - start) * 1000)
 
-        # Parse the JSON response
+        # Parse the JSON response with Auto-Repair
         if json_mode:
-            parsed = json.loads(_clean_json(text))
+            try:
+                # Try normal parsing first
+                parsed = json.loads(_clean_json(text))
+            except json.JSONDecodeError as json_err:
+                # If it fails (e.g. truncated response), use your custom recovery function
+                logging.warning(f"JSON parse failed, attempting recovery: {json_err}")
+                # Note: This assumes clean_and_parse_deepseek_response is defined in your app.py
+                parsed = clean_and_parse_deepseek_response(text)
         else:
             parsed = text
             
