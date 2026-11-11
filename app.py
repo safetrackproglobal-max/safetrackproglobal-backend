@@ -4179,7 +4179,7 @@ def call_gemini(prompt,
                 system_instruction=None,
                 json_mode=True,
                 temperature=0.7,
-                max_tokens=16384,
+                max_tokens=8192,
                 model_name=None, 
                 feature='medical_ai',
                 use_cache=True,
@@ -153590,7 +153590,6 @@ def fishbone_ai_generate(incident_id):
         industry = data.get('industry', 'general')
         depth = ai_opts.get('depth', 'comprehensive')
         language = ai_opts.get('language', 'English')
-        model_pref = ai_opts.get('model_preference', 'auto')
         temperature = float(ai_opts.get('temperature', 0.7))
         focus_areas = data.get('focusAreas') or []
 
@@ -153648,23 +153647,22 @@ Return ONLY this JSON (no markdown):
   "summary": {{ "primaryRootCause":"...","contributingFactors":["..."],"immediateActions":["..."],
                 "confidenceLevel":"medium","confidenceReasoning":"..." }},
   "methodology": {{ "frameworksApplied":["5-Why","Fishbone"] }}
-}}
-
-CRITICAL RULE: You must be extremely concise. Do NOT write long paragraphs. 
-Limit every cause description to a maximum of 10 words. 
-Your total JSON response MUST be under 6,000 characters to avoid truncation."""
+}}"""
 
         try:
             result, model_info, usage, dur = call_gemini(
                 prompt,
                 temperature=temperature,
-                max_tokens=4096, # FIXED: Lowered from 8192 to 4096 to prevent massive truncation
-                json_mode=True,  # FIXED: Ensured JSON mode is explicitly requested
+                max_tokens=8192, # Restored to 8192 so the full data can generate
+                json_mode=True,
                 feature='fishbone_full',
                 current_user=current_user,
                 company_id=company_id,
                 incident_id=incident_id,
             )
+            
+            # No crop, no fallback check here. We let call_gemini handle errors.
+
         except Exception as ai_err:
             current_app.logger.error(
                 f"fishbone_ai_generate: call_gemini failed: {ai_err}",
