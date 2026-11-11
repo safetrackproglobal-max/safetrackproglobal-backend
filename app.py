@@ -4179,7 +4179,7 @@ def call_gemini(prompt,
                 system_instruction=None,
                 json_mode=True,
                 temperature=0.7,
-                max_tokens=8192, # Increased for the full fishbone
+                max_tokens=16384, # Increased for the full fishbone
                 model_name=None,
                 feature='medical_ai',
                 use_cache=True,
@@ -153566,11 +153566,12 @@ def fishbone_ai_generate(incident_id):
         temperature = float(ai_opts.get('temperature', 0.7))
         focus_areas = data.get('focusAreas') or []
 
-        depth_cfg = {
-            'quick':         {'causes': 3, 'qs': False, 'acts': False},
-            'standard':      {'causes': 5, 'qs': True,  'acts': True},
-            'comprehensive': {'causes': 7, 'qs': True,  'acts': True},
-        }.get(depth, {'causes': 5, 'qs': True, 'acts': True})
+        # We no longer force a specific number of causes. We tell the AI to decide.
+        depth_instructions = {
+            'quick': "Provide a high-level analysis. Only list the most obvious, direct causes.",
+            'standard': "Provide a balanced analysis. List the primary causes without going into extreme detail.",
+            'comprehensive': "Provide a deep analysis. List all relevant contributing factors, but be concise in your descriptions."
+        }.get(depth, "Provide a balanced analysis.")
 
         cats_instruction = (
             "Choose the 6-8 MOST RELEVANT categories for a " + industry +
@@ -153598,16 +153599,21 @@ REQUIREMENTS
 1. Problem statement — one sentence, max 25 words.
 2. Categories: {cats_instruction}
    Assign a single-emoji icon and a distinct hex color to each.
-3. Causes — {depth_cfg['causes']}+ per category. Each cause must include:
-   - description (specific, observable, 5-20 words)
+3. Causes: {depth_instructions} 
+   Decide the number of causes based on the incident complexity. Do not force extra causes if they are not relevant.
+   Each cause must include:
+   - description (specific, observable, 5-15 words)
    - likelihood: high | medium | low
    - isRootCause: true only if systemic/underlying
    - evidence: what evidence would confirm it
-   {('- correctiveAction + controlLevel: elimination|substitution|engineering|administrative|ppe') if depth_cfg['acts'] else ''}
-   {('- investigationQuestion: one probing question') if depth_cfg['qs'] else ''}
+   - correctiveAction + controlLevel: elimination|substitution|engineering|administrative|ppe
+   - investigationQuestion: one probing question
 4. Summary object with: primaryRootCause, contributingFactors (3-5),
    immediateActions (3-5), confidenceLevel (high|medium|low), confidenceReasoning.
-5. Methodology: {{ frameworksApplied: [...] }}
+
+CRITICAL RULE FOR LENGTH: 
+Your total JSON response MUST be under 20,000 characters to avoid truncation. 
+Be extremely concise. Do not repeat information. Use short, punchy sentences.
 
 Return ONLY this JSON (no markdown):
 {{
@@ -153615,7 +153621,8 @@ Return ONLY this JSON (no markdown):
   "categories": [
     {{ "id":"slug","name":"...","icon":"emoji","color":"#hex","description":"...",
        "causes":[ {{ "id":"c1","description":"...","likelihood":"medium","isRootCause":false,
-                     "evidence":"..."{',"correctiveAction":"...","controlLevel":"administrative"' if depth_cfg['acts'] else ''}{',"investigationQuestion":"..."' if depth_cfg['qs'] else ''} }} ] }}
+                     "evidence":"...","correctiveAction":"...","controlLevel":"administrative",
+                     "investigationQuestion":"..." }} ] }}
   ],
   "summary": {{ "primaryRootCause":"...","contributingFactors":["..."],"immediateActions":["..."],
                 "confidenceLevel":"medium","confidenceReasoning":"..." }},
@@ -153626,15 +153633,13 @@ Return ONLY this JSON (no markdown):
             result, model_info, usage, dur = call_gemini(
                 prompt,
                 temperature=temperature,
-                max_tokens=8192, # Restored to 8192 so the full data can generate
+                max_tokens=16384, # Increased to 16384 to give the AI room to finish
                 json_mode=True,
                 feature='fishbone_full',
                 current_user=current_user,
                 company_id=company_id,
                 incident_id=incident_id,
             )
-            
-            # No crop, no fallback check here. We let call_gemini handle errors.
 
         except Exception as ai_err:
             current_app.logger.error(
