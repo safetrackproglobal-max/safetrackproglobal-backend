@@ -372,7 +372,7 @@ else:
 # ===== 6. DEEPSEEK CONFIGURATION =====
 deepseek_api_key = os.environ.get('DEEPSEEK_API_KEY')
 deepseek_base_url = os.environ.get('DEEPSEEK_BASE_URL', 'https://tokenhub-intl.tencentcloudmaas.com/v1')
-deepseek_model = os.environ.get('DEEPSEEK_MODEL', 'deepseek-v4-flash')
+deepseek_model = os.environ.get('DEEPSEEK_MODEL', 'deepseek-v4-pro-0813')
 WEATHER_API_KEY = os.environ.get('WEATHERAPI_KEY')
 
 # Debug: Check if API key is loaded
@@ -4202,7 +4202,7 @@ def call_gemini(prompt,
     # --- Load environment variables ---
     api_key = os.environ.get('DEEPSEEK_API_KEY')
     base_url = os.environ.get('DEEPSEEK_BASE_URL', 'https://api.deepseek.com/v1')
-    default_model = os.environ.get('DEEPSEEK_MODEL', 'deepseek-v4-flash')
+    default_model = os.environ.get('DEEPSEEK_MODEL', 'deepseek-v4-pro-0813')
     model_name = model_name or default_model
 
     if not api_key:
@@ -94414,7 +94414,7 @@ Requirements:
         # ============ TENANT CLOUD DEEPSEEK CONFIGURATION (WORKING) ============
         deepseek_api_key = os.environ.get('DEEPSEEK_API_KEY')
         deepseek_base_url = os.environ.get('DEEPSEEK_BASE_URL', 'https://tokenhub-intl.tencentcloudmaas.com/v1')
-        deepseek_model = os.environ.get('DEEPSEEK_MODEL', 'deepseek-v4-flash')
+        deepseek_model = os.environ.get('DEEPSEEK_MODEL', 'deepseek-v4-pro-0813')
         
         if not deepseek_api_key:
             return jsonify({
