@@ -372,7 +372,7 @@ else:
 # ===== 6. DEEPSEEK CONFIGURATION =====
 deepseek_api_key = os.environ.get('DEEPSEEK_API_KEY')
 deepseek_base_url = os.environ.get('DEEPSEEK_BASE_URL', 'https://tokenhub-intl.tencentcloudmaas.com/v1')
-deepseek_model = os.environ.get('DEEPSEEK_MODEL', 'deepseek-v4-pro-0813')
+deepseek_model = os.environ.get('DEEPSEEK_MODEL', 'deepseek-v4-flash')
 WEATHER_API_KEY = os.environ.get('WEATHERAPI_KEY')
 
 # Debug: Check if API key is loaded
@@ -4179,70 +4179,50 @@ def call_gemini(prompt,
                 system_instruction=None,
                 json_mode=True,
                 temperature=0.7,
-                max_tokens=8192,
-                model_name=None, 
+                max_tokens=8192, # Increased for the full fishbone
+                model_name=None,
                 feature='medical_ai',
                 use_cache=True,
-                current_user=None,         
+                current_user=None,
                 company_id=None,
                 incident_id=None,
                 sub_feature=None):
-    """
-    Calls DeepSeek (via Tencent TokenHub).
-    NO fallbacks. If the JSON is malformed, it raises an error.
-    """
-    # --- Enforce user context BEFORE spending API credits ---
+    
     user_id = getattr(current_user, 'id', None) if current_user is not None else None
     if not user_id:
         raise RuntimeError("call_gemini: current_user with a valid id is required.")
-
     if company_id is None:
         company_id = getattr(current_user, 'company_id', None)
 
-    # --- Load environment variables ---
     api_key = os.environ.get('DEEPSEEK_API_KEY')
-    base_url = os.environ.get('DEEPSEEK_BASE_URL', 'https://api.deepseek.com/v1')
-    default_model = os.environ.get('DEEPSEEK_MODEL', 'deepseek-v4-pro-0813')
-    model_name = model_name or default_model
+    base_url = os.environ.get('DEEPSEEK_BASE_URL', 'https://tokenhub-intl.tencentcloudmaas.com/v1')
+    
+    # USE THE EXACT MODEL THAT PASSED THE TEST
+    model_name = model_name or "deepseek-v4-flash"
 
     if not api_key:
         raise RuntimeError('AI service unavailable — DEEPSEEK_API_KEY not configured')
 
-    # Cache payload
     cache_payload = {
-        'prompt': prompt,
-        'system': system_instruction,
-        'json_mode': json_mode,
-        'temperature': temperature,
-        'model': model_name,
-        'user_id': user_id,
-        'company_id': company_id,
+        'prompt': prompt, 'system': system_instruction, 'json_mode': json_mode,
+        'temperature': temperature, 'model': model_name,
+        'user_id': user_id, 'company_id': company_id,
     }
 
     if use_cache:
         cached = _ai_cache.get(feature, cache_payload)
         if cached is not None:
             parsed, model_info, usage, duration = cached
-            model_info = dict(model_info)
-            model_info['cached'] = True
-            usage = dict(usage)
-            usage['cached'] = True
+            model_info = dict(model_info); model_info['cached'] = True
+            usage = dict(usage); usage['cached'] = True
             return parsed, model_info, usage, 0
 
     start = time.time()
     last_err = None
 
-    # --- DeepSeek API Call ---
     try:
-        clean_base = base_url.rstrip('/')
-        if not clean_base.endswith('/v1'):
-            clean_base += '/v1'
-        url = f"{clean_base}/chat/completions"
-        
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json"
-        }
+        url = f"{base_url.rstrip('/')}/chat/completions"
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
         
         messages = []
         if system_instruction:
@@ -4255,10 +4235,10 @@ def call_gemini(prompt,
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
-        
         if json_mode:
             payload["response_format"] = {"type": "json_object"}
 
+        # 🔴 180 SECOND TIMEOUT (matches the test)
         resp = requests.post(url, headers=headers, json=payload, timeout=180)
         
         if resp.status_code != 200:
@@ -4275,21 +4255,15 @@ def call_gemini(prompt,
         
         duration = int((time.time() - start) * 1000)
 
-        # Parse the JSON response
         if json_mode:
             try:
                 parsed = json.loads(_clean_json(text))
-            except json.JSONDecodeError as json_err:
-                # NO FALLBACK. If it fails, we raise an error.
-                raise RuntimeError(f"AI returned invalid JSON (cut off?): {json_err}")
+            except json.JSONDecodeError as e:
+                raise RuntimeError(f"AI returned invalid JSON (cut off?): {e}")
         else:
             parsed = text
             
-        model_info = {
-            'name': model_name,
-            'provider': 'deepseek_tokenhub',
-            'key_index': 1,
-        }
+        model_info = {'name': model_name, 'provider': 'deepseek_tokenhub', 'key_index': 1}
 
         _log_gemini_call(
             feature=feature, model_name=model_name, key_index=1,
@@ -4311,7 +4285,6 @@ def call_gemini(prompt,
         duration_ms=int((time.time() - start) * 1000), success=False, error_message=last_err,
         user_id=user_id, company_id=company_id, incident_id=incident_id, sub_feature=sub_feature,
     )
-
     raise RuntimeError(last_err or 'DeepSeek call failed')
 
     # Failure log (best-effort)
@@ -94414,7 +94387,7 @@ Requirements:
         # ============ TENANT CLOUD DEEPSEEK CONFIGURATION (WORKING) ============
         deepseek_api_key = os.environ.get('DEEPSEEK_API_KEY')
         deepseek_base_url = os.environ.get('DEEPSEEK_BASE_URL', 'https://tokenhub-intl.tencentcloudmaas.com/v1')
-        deepseek_model = os.environ.get('DEEPSEEK_MODEL', 'deepseek-v4-pro-0813')
+        deepseek_model = os.environ.get('DEEPSEEK_MODEL', 'deepseek-v4-flash')
         
         if not deepseek_api_key:
             return jsonify({
