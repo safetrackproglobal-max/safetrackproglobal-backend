@@ -4273,7 +4273,7 @@ def call_gemini(prompt,
             payload["response_format"] = {"type": "json_object"}
 
         # 60-second timeout prevents the 10-minute hang
-        resp = requests.post(url, headers=headers, json=payload, timeout=60)
+        resp = requests.post(url, headers=headers, json=payload, timeout=180)
         
         if resp.status_code != 200:
             raise RuntimeError(f"DeepSeek API Error {resp.status_code}: {resp.text}")
