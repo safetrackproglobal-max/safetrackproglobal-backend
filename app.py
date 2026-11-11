@@ -4179,7 +4179,7 @@ def call_gemini(prompt,
                 system_instruction=None,
                 json_mode=True,
                 temperature=0.7,
-                max_tokens=16384, # Increased from 8192 to prevent truncation
+                max_tokens=16384,
                 model_name=None, 
                 feature='medical_ai',
                 use_cache=True,
@@ -4188,32 +4188,27 @@ def call_gemini(prompt,
                 incident_id=None,
                 sub_feature=None):
     """
-    Calls DeepSeek (via Tencent TokenHub) using the same signature as the old Gemini function.
-    Keeps user validation, caching, and logging intact.
+    Calls DeepSeek (via Tencent TokenHub).
+    NO fallbacks. If the JSON is malformed, it raises an error.
     """
     # --- Enforce user context BEFORE spending API credits ---
     user_id = getattr(current_user, 'id', None) if current_user is not None else None
     if not user_id:
-        raise RuntimeError(
-            "call_gemini: current_user with a valid id is required. "
-            "AI calls must be attributable to a real user."
-        )
+        raise RuntimeError("call_gemini: current_user with a valid id is required.")
 
     if company_id is None:
         company_id = getattr(current_user, 'company_id', None)
 
-    # --- Load environment variables you set in Railway ---
+    # --- Load environment variables ---
     api_key = os.environ.get('DEEPSEEK_API_KEY')
     base_url = os.environ.get('DEEPSEEK_BASE_URL', 'https://api.deepseek.com/v1')
     default_model = os.environ.get('DEEPSEEK_MODEL', 'deepseek-v4-flash')
-    
-    # If a model wasn't explicitly passed in the function call, use the env default
     model_name = model_name or default_model
 
     if not api_key:
         raise RuntimeError('AI service unavailable — DEEPSEEK_API_KEY not configured')
 
-    # Cache key includes user_id and company_id to prevent cross-tenant leakage.
+    # Cache payload
     cache_payload = {
         'prompt': prompt,
         'system': system_instruction,
@@ -4232,20 +4227,13 @@ def call_gemini(prompt,
             model_info['cached'] = True
             usage = dict(usage)
             usage['cached'] = True
-
-            _log_gemini_call(
-                feature=feature, model_name=model_info.get('name'), key_index=None,
-                usage=usage, duration_ms=0, success=True, error_message=None,
-                user_id=user_id, company_id=company_id, incident_id=incident_id, sub_feature=sub_feature,
-            )
             return parsed, model_info, usage, 0
 
     start = time.time()
     last_err = None
 
-    # --- DeepSeek / TokenHub API Call ---
+    # --- DeepSeek API Call ---
     try:
-        # Clean up the base_url to ensure it ends with /chat/completions
         clean_base = base_url.rstrip('/')
         if not clean_base.endswith('/v1'):
             clean_base += '/v1'
@@ -4268,11 +4256,9 @@ def call_gemini(prompt,
             "max_tokens": max_tokens,
         }
         
-        # Force JSON output if requested
         if json_mode:
             payload["response_format"] = {"type": "json_object"}
 
-        # 60-second timeout prevents the 10-minute hang
         resp = requests.post(url, headers=headers, json=payload, timeout=180)
         
         if resp.status_code != 200:
@@ -4281,26 +4267,21 @@ def call_gemini(prompt,
         resp_data = resp.json()
         text = resp_data['choices'][0]['message']['content']
         
-        # Extract token usage
-        raw_usage = resp_data.get('usage', {})
         usage = {
-            'prompt_tokens': raw_usage.get('prompt_tokens', 0),
-            'completion_tokens': raw_usage.get('completion_tokens', 0),
-            'total_tokens': raw_usage.get('total_tokens', 0),
+            'prompt_tokens': resp_data.get('usage', {}).get('prompt_tokens', 0),
+            'completion_tokens': resp_data.get('usage', {}).get('completion_tokens', 0),
+            'total_tokens': resp_data.get('usage', {}).get('total_tokens', 0),
         }
         
         duration = int((time.time() - start) * 1000)
 
-        # Parse the JSON response with Auto-Repair
+        # Parse the JSON response
         if json_mode:
             try:
-                # Try normal parsing first
                 parsed = json.loads(_clean_json(text))
             except json.JSONDecodeError as json_err:
-                # If it fails (e.g. truncated response), use your custom recovery function
-                logging.warning(f"JSON parse failed, attempting recovery: {json_err}")
-                # Note: This assumes clean_and_parse_deepseek_response is defined in your app.py
-                parsed = clean_and_parse_deepseek_response(text)
+                # NO FALLBACK. If it fails, we raise an error.
+                raise RuntimeError(f"AI returned invalid JSON (cut off?): {json_err}")
         else:
             parsed = text
             
@@ -4310,7 +4291,6 @@ def call_gemini(prompt,
             'key_index': 1,
         }
 
-        # Log success to your database
         _log_gemini_call(
             feature=feature, model_name=model_name, key_index=1,
             usage=usage, duration_ms=duration, success=True, error_message=None,
@@ -4318,15 +4298,13 @@ def call_gemini(prompt,
         )
 
         if use_cache:
-            _ai_cache.set(feature, cache_payload,
-                          (parsed, dict(model_info), dict(usage), duration))
+            _ai_cache.set(feature, cache_payload, (parsed, dict(model_info), dict(usage), duration))
 
         return parsed, model_info, usage, duration
 
     except Exception as e:
         last_err = str(e)
         
-    # Log failure to your database
     _log_gemini_call(
         feature=feature, model_name=model_name, key_index=None,
         usage={'prompt_tokens': 0, 'completion_tokens': 0, 'total_tokens': 0},
@@ -153670,22 +153648,27 @@ Return ONLY this JSON (no markdown):
   "summary": {{ "primaryRootCause":"...","contributingFactors":["..."],"immediateActions":["..."],
                 "confidenceLevel":"medium","confidenceReasoning":"..." }},
   "methodology": {{ "frameworksApplied":["5-Why","Fishbone"] }}
-}}"""
+}}
+
+CRITICAL RULE: You must be extremely concise. Do NOT write long paragraphs. 
+Limit every cause description to a maximum of 10 words. 
+Your total JSON response MUST be under 6,000 characters to avoid truncation."""
 
         try:
             result, model_info, usage, dur = call_gemini(
                 prompt,
                 temperature=temperature,
-                max_tokens=8192 if depth == 'comprehensive' else 4096,
-                feature='fishbone_full',                # ✅
-                current_user=current_user,              # ✅ FIX
-                company_id=company_id,                  # ✅ FIX
-                incident_id=incident_id,                # ✅
+                max_tokens=4096, # FIXED: Lowered from 8192 to 4096 to prevent massive truncation
+                json_mode=True,  # FIXED: Ensured JSON mode is explicitly requested
+                feature='fishbone_full',
+                current_user=current_user,
+                company_id=company_id,
+                incident_id=incident_id,
             )
         except Exception as ai_err:
             current_app.logger.error(
                 f"fishbone_ai_generate: call_gemini failed: {ai_err}",
-                exc_info=True,                          # ✅ traceback
+                exc_info=True,
             )
             log_ai_call('fishbone_full', incident_id=incident_id,
                         success=False, error_message=str(ai_err),
@@ -153693,7 +153676,7 @@ Return ONLY this JSON (no markdown):
                         company_id=company_id)
             return jsonify({
                 'success': False,
-                'error': str(ai_err)[:200],             # ✅ real reason
+                'error': str(ai_err)[:200],
                 'details': str(ai_err) if current_app.debug else None,
                 'code': 'AI_UNAVAILABLE'
             }), 503
@@ -153710,7 +153693,6 @@ Return ONLY this JSON (no markdown):
     except Exception as e:
         current_app.logger.error(f"fishbone_ai_generate error: {e}", exc_info=True)
         return jsonify({'success': False, 'error': str(e)[:200], 'code': 'INTERNAL_ERROR'}), 500
-
 
 @app.route('/api/incidents/<int:incident_id>/fishbone/ai-expand-category',
            methods=['POST', 'OPTIONS'])
