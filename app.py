@@ -4180,25 +4180,18 @@ def call_gemini(prompt,
                 json_mode=True,
                 temperature=0.7,
                 max_tokens=8192,
-                model_name=None,
+                model_name=None, # We will default this to your env variable
                 feature='medical_ai',
                 use_cache=True,
-                current_user=None,         # ✅ default so the file compiles
+                current_user=None,         
                 company_id=None,
                 incident_id=None,
                 sub_feature=None):
     """
-    Call Gemini with key rotation + optional cache + best-effort logging.
-    Returns (parsed_body, model_info, usage, duration_ms).
-    Raises RuntimeError on failure — no fallback.
-
-    REQUIRES current_user (with a valid id) at call time. Passing None or
-    an object without .id raises RuntimeError before any Gemini key is used.
-    company_id is optional; if not supplied, it is taken from
-    current_user.company_id. Every row in ai_generation_logs will therefore
-    have a real user_id (DB enforces NOT NULL).
+    Calls DeepSeek (via Tencent TokenHub) using the same signature as the old Gemini function.
+    Keeps user validation, caching, and logging intact.
     """
-    # --- Enforce user context BEFORE spending a Gemini key ---
+    # --- Enforce user context BEFORE spending API credits ---
     user_id = getattr(current_user, 'id', None) if current_user is not None else None
     if not user_id:
         raise RuntimeError(
@@ -4206,25 +4199,27 @@ def call_gemini(prompt,
             "AI calls must be attributable to a real user."
         )
 
-    # If caller didn't pass company_id, fall back to the user's own company
-    # (may still be None if the user has no company — that's legal per schema).
     if company_id is None:
         company_id = getattr(current_user, 'company_id', None)
 
-    if not key_pool.available():
-        raise RuntimeError('AI service unavailable — no Gemini keys configured')
+    # --- Load environment variables you set in Railway ---
+    api_key = os.environ.get('DEEPSEEK_API_KEY')
+    base_url = os.environ.get('DEEPSEEK_BASE_URL', 'https://api.deepseek.com/v1')
+    default_model = os.environ.get('DEEPSEEK_MODEL', 'deepseek-v4-flash')
+    
+    # If a model wasn't explicitly passed in the function call, use the env default
+    model_name = model_name or default_model
 
-    pref = model_name or 'gemini-flash-latest'
-    sys_instr = system_instruction or RCA_SYSTEM_INSTRUCTION
+    if not api_key:
+        raise RuntimeError('AI service unavailable — DEEPSEEK_API_KEY not configured')
 
     # Cache key includes user_id and company_id to prevent cross-tenant leakage.
     cache_payload = {
         'prompt': prompt,
-        'system': sys_instr,
+        'system': system_instruction,
         'json_mode': json_mode,
         'temperature': temperature,
-        'max_tokens': max_tokens,
-        'model': pref,
+        'model': model_name,
         'user_id': user_id,
         'company_id': company_id,
     }
@@ -4238,96 +4233,101 @@ def call_gemini(prompt,
             usage = dict(usage)
             usage['cached'] = True
 
-            # ✅ Cache hits also produce a log row for audit + billing.
             _log_gemini_call(
-                feature=feature,
-                model_name=model_info.get('name') or pref,
-                key_index=model_info.get('key_index'),
-                usage=usage,
-                duration_ms=0,
-                success=True,
-                error_message=None,
-                user_id=user_id,
-                company_id=company_id,
-                incident_id=incident_id,
-                sub_feature=sub_feature,
+                feature=feature, model_name=model_info.get('name'), key_index=None,
+                usage=usage, duration_ms=0, success=True, error_message=None,
+                user_id=user_id, company_id=company_id, incident_id=incident_id, sub_feature=sub_feature,
             )
             return parsed, model_info, usage, 0
 
     start = time.time()
     last_err = None
 
-    for attempt in range(3):
-        key, key_idx = key_pool.get_key()
-        try:
-            genai.configure(api_key=key)
-            model = genai.GenerativeModel(
-                model_name=pref,
-                system_instruction=sys_instr,
-            )
+    # --- DeepSeek / TokenHub API Call ---
+    try:
+        # Clean up the base_url to ensure it ends with /chat/completions
+        clean_base = base_url.rstrip('/')
+        if not clean_base.endswith('/v1'):
+            clean_base += '/v1'
+        url = f"{clean_base}/chat/completions"
+        
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        }
+        
+        messages = []
+        if system_instruction:
+            messages.append({"role": "system", "content": system_instruction})
+        messages.append({"role": "user", "content": prompt})
 
-            cfg = {
-                'temperature': temperature,
-                'max_output_tokens': max_tokens,
-                'top_p': 0.95,
-                'top_k': 40,
-            }
-            if json_mode:
-                cfg['response_mime_type'] = 'application/json'
+        payload = {
+            "model": model_name,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        
+        # Force JSON output if requested
+        if json_mode:
+            payload["response_format"] = {"type": "json_object"}
 
-            resp = model.generate_content(prompt, generation_config=cfg)
-            key_pool.record_use(key)
+        # 60-second timeout prevents the 10-minute hang
+        resp = requests.post(url, headers=headers, json=payload, timeout=60)
+        
+        if resp.status_code != 200:
+            raise RuntimeError(f"DeepSeek API Error {resp.status_code}: {resp.text}")
+            
+        resp_data = resp.json()
+        text = resp_data['choices'][0]['message']['content']
+        
+        # Extract token usage
+        raw_usage = resp_data.get('usage', {})
+        usage = {
+            'prompt_tokens': raw_usage.get('prompt_tokens', 0),
+            'completion_tokens': raw_usage.get('completion_tokens', 0),
+            'total_tokens': raw_usage.get('total_tokens', 0),
+        }
+        
+        duration = int((time.time() - start) * 1000)
 
-            text = resp.text or ''
-            usage = {
-                'prompt_tokens': getattr(resp.usage_metadata, 'prompt_token_count', 0),
-                'completion_tokens': getattr(resp.usage_metadata, 'candidates_token_count', 0),
-                'total_tokens': getattr(resp.usage_metadata, 'total_token_count', 0),
-            }
-            duration = int((time.time() - start) * 1000)
+        # Parse the JSON response
+        if json_mode:
+            parsed = json.loads(_clean_json(text))
+        else:
+            parsed = text
+            
+        model_info = {
+            'name': model_name,
+            'provider': 'deepseek_tokenhub',
+            'key_index': 1,
+        }
 
-            parsed = json.loads(_clean_json(text)) if json_mode else text
-            model_info = {
-                'name': pref,
-                'provider': 'google',
-                'key_index': key_idx + 1,
-            }
+        # Log success to your database
+        _log_gemini_call(
+            feature=feature, model_name=model_name, key_index=1,
+            usage=usage, duration_ms=duration, success=True, error_message=None,
+            user_id=user_id, company_id=company_id, incident_id=incident_id, sub_feature=sub_feature,
+        )
 
-            # Best-effort log (never raises)
-            _log_gemini_call(
-                feature=feature,
-                model_name=pref,
-                key_index=key_idx + 1,
-                usage=usage,
-                duration_ms=duration,
-                success=True,
-                error_message=None,
-                user_id=user_id,           # ✅ real user
-                company_id=company_id,     # ✅ real company or None
-                incident_id=incident_id,
-                sub_feature=sub_feature,
-            )
+        if use_cache:
+            _ai_cache.set(feature, cache_payload,
+                          (parsed, dict(model_info), dict(usage), duration))
 
-            if use_cache:
-                _ai_cache.set(feature, cache_payload,
-                              (parsed, dict(model_info), dict(usage), duration))
+        return parsed, model_info, usage, duration
 
-            return parsed, model_info, usage, duration
+    except Exception as e:
+        last_err = str(e)
+        
+    # Log failure to your database
+    _log_gemini_call(
+        feature=feature, model_name=model_name, key_index=None,
+        usage={'prompt_tokens': 0, 'completion_tokens': 0, 'total_tokens': 0},
+        duration_ms=int((time.time() - start) * 1000), success=False, error_message=last_err,
+        user_id=user_id, company_id=company_id, incident_id=incident_id, sub_feature=sub_feature,
+    )
 
-        except google_exceptions.ResourceExhausted:
-            key_pool.mark_rate_limited(key, 60)
-            last_err = 'rate_limited'
-            continue
-        except json.JSONDecodeError as e:
-            last_err = f'Invalid JSON from AI: {e}'
-            continue
-        except Exception as e:
-            last_err = str(e)
-            if 'quota' in last_err.lower() or 'rate' in last_err.lower():
-                key_pool.mark_rate_limited(key, 60)
-                continue
-            if attempt >= 1:
-                break
+    raise RuntimeError(last_err or 'DeepSeek call failed')
 
     # Failure log (best-effort)
     _log_gemini_call(
