@@ -3081,7 +3081,7 @@ class ComplianceReport(db.Model):
 
 class EnvironmentalAlert(db.Model):
     __tablename__ = 'environmental_alerts'
-    
+
     id = db.Column(db.Integer, primary_key=True)
     alert_type = db.Column(db.String(50), nullable=False)
     severity = db.Column(db.String(20), nullable=False)
@@ -3089,22 +3089,64 @@ class EnvironmentalAlert(db.Model):
     suggested_action = db.Column(db.Text)
     confidence_score = db.Column(db.Float, default=0.0)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
     acknowledged = db.Column(db.Boolean, default=False)
     acknowledged_at = db.Column(db.DateTime)
     acknowledged_by = db.Column(db.String(100))
+
     category = db.Column(db.String(50))
     location = db.Column(db.String(100))
     sensor_id = db.Column(db.String(100))
     trigger_value = db.Column(db.Float)
     threshold_value = db.Column(db.Float)
     status = db.Column(db.String(20), default='active')
-    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), nullable=True, index=True)
+
+    company_id = db.Column(
+        db.Integer,
+        db.ForeignKey('companies.id'),
+        nullable=True,
+        index=True,
+    )
     site_id = db.Column(
         db.Integer,
         db.ForeignKey('environmental_sites.id', ondelete='SET NULL'),
         nullable=True,
-        index=True
+        index=True,
     )
+
+    # ✅ NEW: who this alert belongs to / who created it / who to notify
+    user_id = db.Column(
+        db.Integer,
+        db.ForeignKey('users.id', ondelete='SET NULL'),
+        nullable=True,
+        index=True,
+    )
+
+    # Relationships
+    user = db.relationship('User', foreign_keys=[user_id])
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'alert_type': self.alert_type,
+            'severity': self.severity,
+            'message': self.message,
+            'suggested_action': self.suggested_action,
+            'confidence_score': self.confidence_score,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'acknowledged': self.acknowledged,
+            'acknowledged_at': self.acknowledged_at.isoformat() if self.acknowledged_at else None,
+            'acknowledged_by': self.acknowledged_by,
+            'category': self.category,
+            'location': self.location,
+            'sensor_id': self.sensor_id,
+            'trigger_value': self.trigger_value,
+            'threshold_value': self.threshold_value,
+            'status': self.status,
+            'company_id': self.company_id,
+            'site_id': self.site_id,
+            'user_id': self.user_id,   # ← NEW
+        }
 
 class ComplianceAutomationSettings(db.Model):
     __tablename__ = 'compliance_automation_settings'
