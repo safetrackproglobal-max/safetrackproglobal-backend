@@ -73426,19 +73426,19 @@ def generate_fallback_questions(count=100):
     return questions
 
 def call_deepseek_api(prompt):
-    """Call DeepSeek API via Tencent TokenHub"""
+    """Call DeepSeek API via Tencent TokenHub with diagnostic logging"""
     import os
     import requests
+    import logging
+    
+    logger = logging.getLogger(__name__)
     
     api_key = os.environ.get('DEEPSEEK_API_KEY')
     if not api_key:
-        print("⚠️ DEEPSEEK_API_KEY not configured")
+        logger.error("⚠️ DEEPSEEK_API_KEY not configured")
         return None
     
-    # Use the Tencent gateway URL, not api.deepseek.com
     base_url = os.environ.get('DEEPSEEK_BASE_URL', 'https://tokenhub-intl.tencentcloudmaas.com/v1')
-    
-    # Use the exact model from your successful logs
     model_id = "deepseek-v4-flash"
     
     try:
@@ -73451,19 +73451,31 @@ def call_deepseek_api(prompt):
             "model": model_id,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.7,
-            "max_tokens": 8192
+            "max_tokens": 8192,
+            "response_format": {"type": "json_object"}  # 🔴 Forces pure JSON, no markdown
         }
         
+        logger.info("📡 Calling Tencent TokenHub...")
         response = requests.post(url, headers=headers, json=payload, timeout=180)
+        logger.info(f"📡 HTTP Status: {response.status_code}")
         
         if response.status_code == 200:
-            return response.json()['choices'][0]['message']['content']
+            content = response.json()['choices'][0]['message']['content']
+            
+            # 🔴 DIAGNOSTIC LOGGING - See exactly what the AI returns
+            logger.info(f"📥 RAW RESPONSE LENGTH: {len(content)} chars")
+            logger.info(f"📥 RAW RESPONSE (first 800 chars):")
+            logger.info(content[:800])
+            logger.info(f"📥 RAW RESPONSE (last 500 chars):")
+            logger.info(content[-500:])
+            
+            return content
         else:
-            print(f"DeepSeek API error: {response.status_code} - {response.text}")
+            logger.error(f"❌ DeepSeek API error: {response.status_code} - {response.text[:500]}")
             return None
             
     except Exception as e:
-        print(f"DeepSeek error: {e}")
+        logger.error(f"❌ DeepSeek exception: {e}", exc_info=True)
         return None
 
 def build_exam_prompt(topic, count, difficulty):
