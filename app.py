@@ -73436,8 +73436,8 @@ def call_deepseek_api(prompt):
             "model": model_id,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.7,
-            "max_tokens": 8192,
-            "response_format": {"type": "json_object"}  # 🔴 Forces pure JSON, no markdown
+            "max_tokens": 16384,
+            
         }
         
         logger.info("📡 Calling Tencent TokenHub...")
