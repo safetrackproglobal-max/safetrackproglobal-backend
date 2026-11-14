@@ -73216,89 +73216,74 @@ import json
 import re
 
 def clean_and_parse_deepseek_response(response_text):
-    """Clean and parse DeepSeek JSON response with error recovery"""
+    """Parse DeepSeek response, handling the {type, content} wrapper format."""
+    import json
+    import re
+    
+    if not response_text or not isinstance(response_text, str):
+        return []
+    
     try:
-        # Try direct parsing first
-        return json.loads(response_text)
-    except json.JSONDecodeError as e:
-        print(f"⚠️ JSON parse error: {e}")
-        print(f"📝 Attempting to clean response...")
+        # Step 1: Parse the outer JSON
+        outer = json.loads(response_text)
         
-        # Try to extract JSON from markdown code blocks
-        json_match = re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', response_text)
-        if json_match:
-            cleaned = json_match.group(1).strip()
+        # Step 2: Check for Tencent's {type, content} wrapper format
+        if isinstance(outer, dict) and 'content' in outer:
+            inner_content = outer['content']
+            # The content is a stringified JSON array - parse it
             try:
-                return json.loads(cleaned)
+                parsed = json.loads(inner_content)
+                if isinstance(parsed, list):
+                    print(f"✅ Unwrapped {len(parsed)} questions from content field")
+                    return parsed
+                if isinstance(parsed, dict) and 'questions' in parsed:
+                    return parsed['questions']
             except json.JSONDecodeError:
-                pass
+                # Content might be truncated - try to salvage
+                print("⚠️ Inner content truncated, salvaging...")
+                salvaged = extract_questions_from_text(inner_content)
+                if salvaged:
+                    return salvaged
         
-        # Try to find JSON array or object
-        array_match = re.search(r'\[[\s\S]*\]', response_text)
-        if array_match:
-            try:
-                return json.loads(array_match.group())
-            except json.JSONDecodeError:
-                pass
+        # Step 3: Direct array response
+        if isinstance(outer, list):
+            return outer
         
-        object_match = re.search(r'\{[\s\S]*\}', response_text)
-        if object_match:
-            try:
-                return json.loads(object_match.group())
-            except json.JSONDecodeError:
-                pass
+        # Step 4: {questions: [...]} response
+        if isinstance(outer, dict) and 'questions' in outer:
+            return outer['questions']
         
-        # If all fails, try to fix common JSON issues
-        cleaned = response_text.strip()
+        # Step 5: Fall through to raw text extraction
+        return extract_questions_from_text(response_text)
         
-        # Fix trailing commas
-        cleaned = re.sub(r',\s*}', '}', cleaned)
-        cleaned = re.sub(r',\s*]', ']', cleaned)
-        
-        # Fix missing quotes around keys
-        cleaned = re.sub(r'([{,])\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*:', r'\1"\2":', cleaned)
-        
-        # Fix single quotes
-        cleaned = cleaned.replace("'", '"')
-        
-        try:
-            return json.loads(cleaned)
-        except json.JSONDecodeError:
-            # If still failing, try to extract individual questions
-            return extract_questions_from_text(response_text)
-        
-        raise ValueError(f"Could not parse DeepSeek response after cleaning")
+    except json.JSONDecodeError:
+        # Direct JSON parse failed - try extraction
+        print(f"⚠️ JSON parse failed, attempting extraction...")
+        return extract_questions_from_text(response_text)
+
 
 def extract_questions_from_text(text):
-    """Extract questions from unstructured text as fallback"""
+    """Extract question objects from raw text when JSON parsing fails."""
+    import re
+    import json
+    
     questions = []
     
-    # Try to find question patterns
-    question_patterns = [
-        r'(?:Q(?:uestion)?\.?\s*(\d+)[.:]\s*)?([^?]+\?)\s*(?:A\)\s*([^B]*?)\s*B\)\s*([^C]*?)\s*C\)\s*([^D]*?)\s*D\)\s*([^\n]*?))(?:\n|$)',
-        r'"question_text":\s*"([^"]+)",\s*"options":\s*\[([^\]]+)\],\s*"correct_answer":\s*"([^"]+)"',
-        r'Question\s+(\d+)[.:]\s+(.+?)(?:Answer|Correct)[:\s]+([A-D])'
-    ]
+    # Pattern: find all {"question_text": "...", "options": [...], "correct_answer": "..."} objects
+    pattern = r'\{"question_text"\s*:\s*"[^"]+"\s*,\s*"options"\s*:\s*\[[^\]]+\]\s*,\s*"correct_answer"\s*:\s*"[A-D]"\}'
+    matches = re.findall(pattern, text)
     
-    for pattern in question_patterns:
-        matches = re.findall(pattern, text, re.DOTALL | re.IGNORECASE)
-        if matches:
-            for match in matches:
-                if len(match) >= 3:
-                    question = {
-                        'question_text': match[1] if len(match) > 1 else match[0],
-                        'options': ['Option A', 'Option B', 'Option C', 'Option D'],
-                        'correct_answer': match[-1] if len(match) > 2 else 'A'
-                    }
-                    questions.append(question)
+    for match in matches:
+        try:
+            q = json.loads(match)
+            questions.append(q)
+        except json.JSONDecodeError:
+            continue
     
     if questions:
-        return questions
+        print(f"✅ Extracted {len(questions)} questions from raw text")
     
-    # Ultimate fallback - generate generic questions
-    return generate_fallback_questions(100)
-
-# app.py - Add fallback question generator
+    return questions
 
 def generate_fallback_questions(count=100):
     """Generate generic safety questions as fallback"""
