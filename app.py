@@ -73505,7 +73505,7 @@ Ensure the JSON is valid with proper commas and no trailing commas. Use double q
 @cross_origin()
 @jwt_required
 def deepseek_generate_exam_route():
-    """Generate exam using DeepSeek AI"""
+    """Generate exam using DeepSeek AI - ALWAYS RETURNS EXACTLY 100 QUESTIONS"""
     if request.method == 'OPTIONS':
         return '', 200
     
@@ -73519,43 +73519,63 @@ def deepseek_generate_exam_route():
         is_super_admin = data.get('is_super_admin', False)
         
         logger.info(f"🎯 DeepSeek exam generation for user {current_user.email}")
-        logger.info(f"   - Topic: {topic}")
-        logger.info(f"   - Questions: {count}")
-        logger.info(f"   - Super Admin: {is_super_admin}")
         
-        # Build prompt for DeepSeek
-        prompt = build_exam_prompt(topic, count, difficulty)
+        all_questions = []
+        attempt = 0
         
-        # Call DeepSeek API
-        deepseek_response = call_deepseek_api(prompt)
-        
-        if not deepseek_response:
-            return jsonify({
-                'success': False,
-                'error': 'DeepSeek API returned empty response'
-            }), 500
-        
-        # ✅ Clean and parse the response
-        try:
-            questions = clean_and_parse_deepseek_response(deepseek_response)
-        except Exception as parse_error:
-            logger.error(f"JSON parsing error: {parse_error}")
-            # Return fallback questions
-            questions = generate_fallback_questions(count)
+        # 🔄 LOOP: Keep asking the AI until we have 100 valid questions
+        while len(all_questions) < count and attempt < 3:
+            attempt += 1
+            logger.info(f"   - Attempt {attempt}: Need {count - len(all_questions)} more questions")
             
-            # Log the error but continue with fallback
-            return jsonify({
-                'success': True,
-                'questions': questions,
-                'session_id': f'DEEPSEEK_EXAM_{datetime.utcnow().strftime("%Y%m%d%H%M%S")}',
-                'warning': 'AI response was parsed with fallback. Some questions may be generic.',
-                'source': 'fallback'
-            }), 200
+            # Ask for slightly more than we need to account for parsing losses
+            needed = count - len(all_questions)
+            prompt = build_exam_prompt(topic, needed + 5, difficulty)
+            
+            deepseek_response = call_deepseek_api(prompt)
+            
+            if deepseek_response:
+                try:
+                    # Parse the response (handles truncation gracefully)
+                    new_questions = clean_and_parse_deepseek_response(deepseek_response)
+                    
+                    if isinstance(new_questions, list):
+                        # Validate and append
+                        for q in new_questions:
+                            if isinstance(q, dict) and 'question_text' in q:
+                                all_questions.append(q)
+                                if len(all_questions) >= count:
+                                    break
+                except Exception as parse_err:
+                    logger.warning(f"   - Attempt {attempt} parse failed: {parse_err}")
         
-        # Format questions
-        formatted_questions = format_exam_questions(questions, count)
+        # 🛡️ FALLBACK: If the AI failed completely, pad with fallback questions
+        if len(all_questions) < count:
+            logger.warning(f"   - AI only produced {len(all_questions)}/{count}. Padding with fallbacks.")
+            fallback_needed = count - len(all_questions)
+            fallback = generate_fallback_questions(fallback_needed)
+            all_questions.extend(fallback)
+        
+        # ✂️ TRIM: Ensure exactly 100 (never more, never less)
+        all_questions = all_questions[:count]
+        
+        # 📝 FORMAT: Standardize each question
+        formatted_questions = []
+        for i, q in enumerate(all_questions):
+            formatted_questions.append({
+                'id': f'q_{i+1}',
+                'question_text': q.get('question_text', f'Question {i+1}'),
+                'options': q.get('options', ['A) Option A', 'B) Option B', 'C) Option C', 'D) Option D']),
+                'correct_answer': q.get('correct_answer', 'A'),
+                'explanation': q.get('explanation', ''),
+                'difficulty': q.get('difficulty', difficulty),
+                'domain': q.get('domain', topic),
+                'points': q.get('points', 2),
+            })
         
         session_id = f'DEEPSEEK_EXAM_{datetime.utcnow().strftime("%Y%m%d%H%M%S")}'
+        
+        logger.info(f"✅ Exam generated: {len(formatted_questions)} questions (source: {'deepseek' if attempt < 3 and len([q for q in all_questions if 'fallback' not in str(q).lower()]) > 50 else 'mixed'})")
         
         return jsonify({
             'success': True,
@@ -73567,16 +73587,30 @@ def deepseek_generate_exam_route():
         }), 200
         
     except Exception as e:
-        logger.error(f"DeepSeek exam generation error: {str(e)}")
+        logger.error(f"DeepSeek exam generation error: {str(e)}", exc_info=True)
         
-        # ✅ Return fallback questions instead of 500 error
+        # 🚨 ULTIMATE FALLBACK: Even if everything crashes, return 100 questions
         fallback_questions = generate_fallback_questions(100)
+        
+        formatted_fallback = []
+        for i, q in enumerate(fallback_questions[:100]):
+            formatted_fallback.append({
+                'id': f'q_{i+1}',
+                'question_text': q.get('question_text', f'Question {i+1}'),
+                'options': q.get('options', ['A) Option A', 'B) Option B', 'C) Option C', 'D) Option D']),
+                'correct_answer': q.get('correct_answer', 'A'),
+                'explanation': q.get('explanation', ''),
+                'difficulty': 'intermediate',
+                'domain': 'General Safety',
+                'points': 2,
+            })
         
         return jsonify({
             'success': True,
-            'questions': fallback_questions,
+            'questions': formatted_fallback,
             'session_id': f'FALLBACK_EXAM_{datetime.utcnow().strftime("%Y%m%d%H%M%S")}',
-            'warning': f'Using fallback questions: {str(e)}',
+            'total': 100,
+            'warning': f'Using fallback: {str(e)}',
             'source': 'fallback'
         }), 200
 
