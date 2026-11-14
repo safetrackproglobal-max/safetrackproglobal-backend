@@ -73426,7 +73426,7 @@ def generate_fallback_questions(count=100):
     return questions
 
 def call_deepseek_api(prompt):
-    """Call DeepSeek API - Returns None if not configured"""
+    """Call DeepSeek API via Tencent TokenHub"""
     import os
     import requests
     
@@ -73435,22 +73435,31 @@ def call_deepseek_api(prompt):
         print("⚠️ DEEPSEEK_API_KEY not configured")
         return None
     
+    # Use the Tencent gateway URL, not api.deepseek.com
+    base_url = os.environ.get('DEEPSEEK_BASE_URL', 'https://tokenhub-intl.tencentcloudmaas.com/v1')
+    
+    # Use the exact model from your successful logs
+    model_id = "deepseek-v4-flash"
+    
     try:
-        response = requests.post(
-            "https://api.deepseek.com/v1/chat/completions",
-            headers={"Authorization": f"Bearer {api_key}"},
-            json={
-                "model": "deepseek-chat",
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.7
-            },
-            timeout=30
-        )
+        url = f"{base_url.rstrip('/')}/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "model": model_id,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.7,
+            "max_tokens": 8192
+        }
+        
+        response = requests.post(url, headers=headers, json=payload, timeout=180)
         
         if response.status_code == 200:
             return response.json()['choices'][0]['message']['content']
         else:
-            print(f"DeepSeek API error: {response.status_code}")
+            print(f"DeepSeek API error: {response.status_code} - {response.text}")
             return None
             
     except Exception as e:
