@@ -73498,6 +73498,44 @@ def call_deepseek_api(prompt):
         return None
 
 # ============================================================
+# EXAM LOGGING — save every generated exam to disk for audit
+# ============================================================
+EXAM_LOG_DIR = "/app/data/exam_logs"
+
+def save_exam_to_file(session_id, user_email, topic, difficulty, questions, domain_counts, source):
+    """Save a full exam to a JSON file for audit/review. Never raises."""
+    try:
+        os.makedirs(EXAM_LOG_DIR, exist_ok=True)
+        
+        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        filename = f"exam_{timestamp}_{session_id}.json"
+        filepath = os.path.join(EXAM_LOG_DIR, filename)
+        
+        payload = {
+            "meta": {
+                "session_id": session_id,
+                "user_email": user_email,
+                "topic": topic,
+                "difficulty": difficulty,
+                "source": source,
+                "total_questions": len(questions),
+                "domain_breakdown": domain_counts,
+                "generated_at": datetime.utcnow().isoformat() + "Z",
+            },
+            "questions": questions,
+        }
+        
+        with open(filepath, 'w', encoding='utf-8') as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+        
+        logger.info(f"💾 Exam saved to file: {filepath}")
+        return filepath
+    
+    except Exception as e:
+        logger.error(f"❌ Failed to save exam to file: {e}")
+        return None
+
+# ============================================================
 # CSP DOMAIN BLUEPRINT (BCSP-aligned)
 # ============================================================
 CSP_DOMAINS = [
