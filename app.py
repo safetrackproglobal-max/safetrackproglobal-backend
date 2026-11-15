@@ -73512,7 +73512,6 @@ CSP_DOMAINS = [
     {"name": "Domain 9: Legal & Regulatory Compliance",         "weight": 0.075},
 ]
 
-
 def build_exam_prompt(topic, count, difficulty):
     """Build a rigorous, scenario-based CSP exam prompt with domain weighting."""
     
@@ -73546,11 +73545,17 @@ QUESTION QUALITY RULES:
 5. Include regulatory references (OSHA 29 CFR 1910/1926, ANSI Z10, ISO 45001) where relevant.
 6. Every question must include a brief "explanation" (1 sentence) of WHY the answer is correct.
 
+🔥 HARD MATH & CALCULATION REQUIREMENT (CRITICAL):
+You MUST include advanced calculation/math problems specifically for the Chemical, Environmental, and Fire domains. Do not just ask theory.
+- Chemical / Industrial Hygiene: Include questions requiring calculation of PELs (Permeable Exposure Limits), Time-Weighted Averages (TWA), Dilution Ventilation rates, or mixing ratios.
+- Fire Protection: Include questions requiring calculation of Fire Flow (NFF), Occupant Load, Egress width, or heat release rates.
+- Environmental: Include questions on emission calculations, waste concentration limits, or noise dose calculations.
+
 Return ONLY a valid JSON array. No markdown, no preamble, no trailing commas.
 
 Required structure for each question:
 {{
-    "question_text": "Full scenario or complex question text (2-4 sentences for scenarios)",
+    "question_text": "Full scenario or complex question text (2-4 sentences for scenarios, including math numbers where applicable)",
     "options": [
         "A) Option A text",
         "B) Option B text",
@@ -73558,7 +73563,7 @@ Required structure for each question:
         "D) Option D text"
     ],
     "correct_answer": "A",
-    "explanation": "1 sentence explaining why A is correct and why others are wrong",
+    "explanation": "1 sentence explaining why A is correct and why others are wrong (include the formula/result if math was involved)",
     "domain": "Domain 3: Risk Management"
 }}
 
@@ -73622,7 +73627,6 @@ def deepseek_generate_exam_route():
             # Validate domain — if AI returned something invalid, assign a default
             q_domain = q.get('domain', '')
             if q_domain not in valid_domains:
-                # Assign by index to keep distribution balanced
                 q_domain = CSP_DOMAINS[i % len(CSP_DOMAINS)]["name"]
             
             formatted_questions.append({
@@ -73632,7 +73636,7 @@ def deepseek_generate_exam_route():
                 'correct_answer': q.get('correct_answer', 'A'),
                 'explanation': q.get('explanation', ''),   # ✅ Keep explanation for review
                 'difficulty': q.get('difficulty', difficulty),
-                'domain': q_domain,                         # ✅ Real CSP domain, not topic
+                'domain': q_domain,                         # ✅ Real CSP domain
                 'points': 2,
             })
         
@@ -73641,17 +73645,30 @@ def deepseek_generate_exam_route():
         for q in formatted_questions:
             domain_counts[q['domain']] = domain_counts.get(q['domain'], 0) + 1
         
+        session_id = f'DEEPSEEK_CSP_{datetime.utcnow().strftime("%Y%m%d%H%M%S")}'
+        source = 'deepseek' if len([q for q in all_questions if q.get('explanation')]) > 50 else 'mixed'
+        
+        # 💾 SAVE FULL EXAM TO DISK (Requires the save_exam_to_file helper function!)
+        saved_path = save_exam_to_file(
+            session_id=session_id,
+            user_email=current_user.email,
+            topic=topic,
+            difficulty=difficulty,
+            questions=formatted_questions,
+            domain_counts=domain_counts,
+            source=source,
+        )
+        
         logger.info("=" * 60)
         logger.info(f"📋 GENERATED {len(formatted_questions)} CSP QUESTIONS")
+        logger.info(f"💾 Saved to file: {saved_path or 'FAILED - check helper function'}")
         logger.info(f"📊 Domain distribution:")
         for d in CSP_DOMAINS:
             logger.info(f"   {d['name']}: {domain_counts.get(d['name'], 0)}")
-        logger.info(f"📋 Sample questions:")
+        logger.info(f"📋 Sample (first 3):")
         for q in formatted_questions[:3]:
             logger.info(f"   [{q['id']}] [{q['domain']}] {q['question_text'][:100]}...")
         logger.info("=" * 60)
-        
-        session_id = f'DEEPSEEK_CSP_{datetime.utcnow().strftime("%Y%m%d%H%M%S")}'
         
         return jsonify({
             'success': True,
@@ -73660,8 +73677,9 @@ def deepseek_generate_exam_route():
             'topic': topic,
             'total': len(formatted_questions),
             'difficulty': difficulty,
-            'source': 'deepseek' if len([q for q in all_questions if q.get('explanation')]) > 50 else 'mixed',
+            'source': source,
             'domain_breakdown': domain_counts,
+            'saved_to': saved_path,   # ✅ Frontend can know where it lives
         }), 200
         
     except Exception as e:
