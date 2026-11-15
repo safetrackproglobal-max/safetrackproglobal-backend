@@ -73463,68 +73463,101 @@ def call_deepseek_api(prompt):
         logger.error(f"❌ DeepSeek exception: {e}", exc_info=True)
         return None
 
-def build_exam_prompt(topic, count, difficulty):
-    """Build prompt for DeepSeek API"""
-    return f"""Generate {count} multiple-choice questions for a safety exam on the topic: {topic}.
-
-The difficulty level should be {difficulty}.
-
-Each question must be in valid JSON format with the following structure:
-{{
-    "question_text": "The question text",
-    "options": ["A) Option 1", "B) Option 2", "C) Option 3", "D) Option 4"],
-    "correct_answer": "A",
-    "explanation": "Brief explanation of why this is correct",
-    "difficulty": "{difficulty}"
-}}
-
-Return ONLY a JSON array of objects, no additional text.
-
-Example:
-[
-    {{
-        "question_text": "What is the primary purpose of a Fire Alarm Control Panel?",
-        "options": [
-            "A) To detect and signal fire events",
-            "B) To extinguish fires",
-            "C) To evacuate buildings",
-            "D) To conduct fire drills"
-        ],
-        "correct_answer": "A",
-        "explanation": "The FACP receives signals from detectors and activates alarms.",
-        "difficulty": "{difficulty}"
-    }}
+# ============================================================
+# CSP DOMAIN BLUEPRINT (BCSP-aligned)
+# ============================================================
+CSP_DOMAINS = [
+    {"name": "Domain 1: Advanced Safety Concepts",              "weight": 0.10},
+    {"name": "Domain 2: Safety Management Systems",             "weight": 0.15},
+    {"name": "Domain 3: Risk Management",                       "weight": 0.15},
+    {"name": "Domain 4: Hazard Control & Prevention",           "weight": 0.15},
+    {"name": "Domain 5: Emergency Preparedness & Response",     "weight": 0.10},
+    {"name": "Domain 6: Environmental Management",              "weight": 0.10},
+    {"name": "Domain 7: Occupational Health & Industrial Hygiene", "weight": 0.10},
+    {"name": "Domain 8: Training & Education",                  "weight": 0.075},
+    {"name": "Domain 9: Legal & Regulatory Compliance",         "weight": 0.075},
 ]
 
-Ensure the JSON is valid with proper commas and no trailing commas. Use double quotes for strings."""
+
+def build_exam_prompt(topic, count, difficulty):
+    """Build a rigorous, scenario-based CSP exam prompt with domain weighting."""
+    
+    # Compute how many questions per domain
+    domain_plan = []
+    remaining = count
+    for i, d in enumerate(CSP_DOMAINS):
+        if i == len(CSP_DOMAINS) - 1:
+            n = remaining
+        else:
+            n = max(1, round(count * d["weight"]))
+            remaining -= n
+        domain_plan.append(f"- {d['name']}: {n} questions")
+
+    domain_block = "\n".join(domain_plan)
+    
+    return f"""You are a board-certified CSP exam writer for the BCSP. 
+Generate EXACTLY {count} multiple-choice questions for a rigorous Certified Safety Professional (CSP) exam.
+
+TOPIC CONTEXT: {topic}
+DIFFICULTY: {difficulty}
+
+REQUIRED DOMAIN DISTRIBUTION (MANDATORY — follow exactly):
+{domain_block}
+
+QUESTION QUALITY RULES:
+1. 70% of questions MUST be SCENARIO-BASED. Example: "A worker is observed bypassing a guard... what is the FIRST action?"
+2. NO simple definitions like "What does PPE stand for?" — those are NOT CSP-level.
+3. Test APPLICATION, ANALYSIS, and JUDGMENT (Bloom's taxonomy levels 3-5).
+4. Distractors must be plausible (common misconceptions, partial solutions, "close but wrong" answers).
+5. Include regulatory references (OSHA 29 CFR 1910/1926, ANSI Z10, ISO 45001) where relevant.
+6. Every question must include a brief "explanation" (1 sentence) of WHY the answer is correct.
+
+Return ONLY a valid JSON array. No markdown, no preamble, no trailing commas.
+
+Required structure for each question:
+{{
+    "question_text": "Full scenario or complex question text (2-4 sentences for scenarios)",
+    "options": [
+        "A) Option A text",
+        "B) Option B text",
+        "C) Option C text",
+        "D) Option D text"
+    ],
+    "correct_answer": "A",
+    "explanation": "1 sentence explaining why A is correct and why others are wrong",
+    "domain": "Domain 3: Risk Management"
+}}
+
+IMPORTANT:
+- The "domain" field must be EXACTLY one of the 9 domain names listed above.
+- Return exactly {count} questions in the array.
+- Start your response with "[" and end with "]".
+"""
+
 
 @app.route('/api/deepseek/generate-exam', methods=['POST', 'OPTIONS'])
 @cross_origin()
 @jwt_required
 def deepseek_generate_exam_route():
-    """Generate exam using DeepSeek AI - NO EXPLANATIONS, HIGH QUALITY"""
+    """Generate a rigorous CSP-level exam using DeepSeek AI with domain weighting."""
     if request.method == 'OPTIONS':
         return '', 200
     
     try:
         current_user = request.user
-        data = request.get_json()
+        data = request.get_json() or {}
         
-        topic = data.get('topic', 'safety_basics')
-        count = data.get('count', 100)
+        topic = data.get('topic', 'csp_exam')
+        count = int(data.get('count', 100))
         difficulty = data.get('difficulty', 'advanced')
         
-        logger.info(f"🎯 DeepSeek exam generation for {current_user.email} (Target: {count} questions)")
+        logger.info(f"🎯 CSP exam generation for {current_user.email} (Target: {count}, Difficulty: {difficulty})")
         
-        # Build the base prompt
         prompt = build_exam_prompt(topic, count, difficulty)
-        
-        # 🔴 Tell the AI to skip explanations to save tokens and guarantee 100 questions
-        prompt += "\n\nCRITICAL: DO NOT include an 'explanation' field in the JSON. Omit it entirely. Only include 'question_text', 'options', and 'correct_answer'."
         
         all_questions = []
         
-        logger.info(f"   - Making 1 API call to Tencent TokenHub...")
+        logger.info(f"   - Calling Tencent TokenHub...")
         deepseek_response = call_deepseek_api(prompt)
         
         if deepseek_response:
@@ -73539,38 +73572,52 @@ def deepseek_generate_exam_route():
         
         logger.info(f"   - AI returned {len(all_questions)} valid questions.")
         
-        # 🛡️ FALLBACK: Pad the rest if the AI still fell short
+        # 🛡️ Fallback if AI fell short
         if len(all_questions) < count:
             missing = count - len(all_questions)
-            logger.info(f"   - Padding {missing} missing questions with local fallback.")
+            logger.info(f"   - Padding {missing} questions with domain-aware fallback.")
             fallback = generate_fallback_questions(missing)
             all_questions.extend(fallback)
         
-        # ✂️ TRIM: Ensure exactly 100
         all_questions = all_questions[:count]
         
-        # 📝 FORMAT (No explanation field!)
+        # 📝 Format and validate domains
+        valid_domains = {d["name"] for d in CSP_DOMAINS}
         formatted_questions = []
         for i, q in enumerate(all_questions):
+            # Validate domain — if AI returned something invalid, assign a default
+            q_domain = q.get('domain', '')
+            if q_domain not in valid_domains:
+                # Assign by index to keep distribution balanced
+                q_domain = CSP_DOMAINS[i % len(CSP_DOMAINS)]["name"]
+            
             formatted_questions.append({
                 'id': f'q_{i+1}',
                 'question_text': q.get('question_text', f'Question {i+1}'),
                 'options': q.get('options', ['A) Option A', 'B) Option B', 'C) Option C', 'D) Option D']),
                 'correct_answer': q.get('correct_answer', 'A'),
+                'explanation': q.get('explanation', ''),   # ✅ Keep explanation for review
                 'difficulty': q.get('difficulty', difficulty),
-                'domain': q.get('domain', topic),
+                'domain': q_domain,                         # ✅ Real CSP domain, not topic
                 'points': 2,
             })
-            
-        # 📜 LOG EVERY SINGLE QUESTION TO RAILWAY
-        logger.info("=" * 60)
-        logger.info(f"📋 GENERATED EXAM QUESTIONS ({len(formatted_questions)} total):")
+        
+        # 📊 Log domain distribution for verification
+        domain_counts = {}
         for q in formatted_questions:
-            logger.info(f"[{q['id']}] {q['question_text']}")
-            logger.info(f"      Correct: {q['correct_answer']} | Options: {', '.join(q['options'])}")
+            domain_counts[q['domain']] = domain_counts.get(q['domain'], 0) + 1
+        
+        logger.info("=" * 60)
+        logger.info(f"📋 GENERATED {len(formatted_questions)} CSP QUESTIONS")
+        logger.info(f"📊 Domain distribution:")
+        for d in CSP_DOMAINS:
+            logger.info(f"   {d['name']}: {domain_counts.get(d['name'], 0)}")
+        logger.info(f"📋 Sample questions:")
+        for q in formatted_questions[:3]:
+            logger.info(f"   [{q['id']}] [{q['domain']}] {q['question_text'][:100]}...")
         logger.info("=" * 60)
         
-        session_id = f'DEEPSEEK_EXAM_{datetime.utcnow().strftime("%Y%m%d%H%M%S")}'
+        session_id = f'DEEPSEEK_CSP_{datetime.utcnow().strftime("%Y%m%d%H%M%S")}'
         
         return jsonify({
             'success': True,
@@ -73578,12 +73625,15 @@ def deepseek_generate_exam_route():
             'session_id': session_id,
             'topic': topic,
             'total': len(formatted_questions),
-            'source': 'deepseek' if len(all_questions) > 50 else 'mixed'
+            'difficulty': difficulty,
+            'source': 'deepseek' if len([q for q in all_questions if q.get('explanation')]) > 50 else 'mixed',
+            'domain_breakdown': domain_counts,
         }), 200
         
     except Exception as e:
-        logger.error(f"DeepSeek exam generation error: {str(e)}", exc_info=True)
+        logger.error(f"CSP exam generation error: {str(e)}", exc_info=True)
         
+        # Ultimate fallback — still domain-aware
         fallback_questions = generate_fallback_questions(100)
         formatted_fallback = []
         for i, q in enumerate(fallback_questions[:100]):
@@ -73592,23 +73642,18 @@ def deepseek_generate_exam_route():
                 'question_text': q.get('question_text', f'Question {i+1}'),
                 'options': q.get('options', []),
                 'correct_answer': q.get('correct_answer', 'A'),
+                'explanation': q.get('explanation', ''),
                 'difficulty': 'intermediate',
-                'domain': 'General Safety',
+                'domain': CSP_DOMAINS[i % len(CSP_DOMAINS)]["name"],
                 'points': 2,
             })
-            
-        logger.warning("=" * 60)
-        logger.warning(f"🚨 USING FALLBACK QUESTIONS ({len(formatted_fallback)} total):")
-        for q in formatted_fallback:
-            logger.warning(f"[{q['id']}] {q['question_text']} | Answer: {q['correct_answer']}")
-        logger.warning("=" * 60)
-            
+        
         return jsonify({
             'success': True,
             'questions': formatted_fallback,
-            'session_id': f'FALLBACK_EXAM_{datetime.utcnow().strftime("%Y%m%d%H%M%S")}',
+            'session_id': f'FALLBACK_CSP_{datetime.utcnow().strftime("%Y%m%d%H%M%S")}',
             'total': 100,
-            'source': 'fallback'
+            'source': 'fallback',
         }), 200
 
 @app.route('/api/ai/documents/templates', methods=['GET'])
