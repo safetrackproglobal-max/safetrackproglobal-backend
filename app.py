@@ -73218,71 +73218,105 @@ import re
 def clean_and_parse_deepseek_response(response_text):
     """Parse DeepSeek response, handling the {type, content} wrapper format."""
     import json
-    import re
     
     if not response_text or not isinstance(response_text, str):
         return []
     
     try:
-        # Step 1: Parse the outer JSON
         outer = json.loads(response_text)
         
-        # Step 2: Check for Tencent's {type, content} wrapper format
+        # Handle Tencent's {type, content} wrapper
         if isinstance(outer, dict) and 'content' in outer:
             inner_content = outer['content']
-            # The content is a stringified JSON array - parse it
             try:
                 parsed = json.loads(inner_content)
                 if isinstance(parsed, list):
-                    print(f"✅ Unwrapped {len(parsed)} questions from content field")
                     return parsed
                 if isinstance(parsed, dict) and 'questions' in parsed:
                     return parsed['questions']
             except json.JSONDecodeError:
-                # Content might be truncated - try to salvage
-                print("⚠️ Inner content truncated, salvaging...")
-                salvaged = extract_questions_from_text(inner_content)
-                if salvaged:
-                    return salvaged
+                # Inner content truncated — try salvage
+                return extract_questions_from_text(inner_content)
         
-        # Step 3: Direct array response
         if isinstance(outer, list):
             return outer
         
-        # Step 4: {questions: [...]} response
         if isinstance(outer, dict) and 'questions' in outer:
             return outer['questions']
         
-        # Step 5: Fall through to raw text extraction
         return extract_questions_from_text(response_text)
         
     except json.JSONDecodeError:
-        # Direct JSON parse failed - try extraction
-        print(f"⚠️ JSON parse failed, attempting extraction...")
+        # The whole response is truncated — salvage complete objects
+        print("⚠️ Outer JSON parse failed — salvaging complete questions...")
         return extract_questions_from_text(response_text)
 
 
 def extract_questions_from_text(text):
-    """Extract question objects from raw text when JSON parsing fails."""
-    import re
+    """Extract complete question objects from truncated JSON using brace matching."""
     import json
     
+    if not text or not isinstance(text, str):
+        return []
+    
     questions = []
+    i = 0
+    n = len(text)
     
-    # Pattern: find all {"question_text": "...", "options": [...], "correct_answer": "..."} objects
-    pattern = r'\{"question_text"\s*:\s*"[^"]+"\s*,\s*"options"\s*:\s*\[[^\]]+\]\s*,\s*"correct_answer"\s*:\s*"[A-D]"\}'
-    matches = re.findall(pattern, text)
-    
-    for match in matches:
+    while i < n:
+        # Find the start of a question object
+        start = text.find('{"question_text"', i)
+        if start == -1:
+            start = text.find('{ "question_text"', i)
+            if start == -1:
+                break
+        
+        # Brace-match from this start to find the matching closing brace
+        depth = 0
+        end = -1
+        in_string = False
+        escape = False
+        
+        for j in range(start, n):
+            c = text[j]
+            
+            if escape:
+                escape = False
+                continue
+            if c == '\\':
+                escape = True
+                continue
+            if c == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            
+            if c == '{':
+                depth += 1
+            elif c == '}':
+                depth -= 1
+                if depth == 0:
+                    end = j + 1
+                    break
+        
+        if end == -1:
+            # No matching brace — truncated mid-object, stop here
+            break
+        
+        # Try to parse this complete object
+        obj_str = text[start:end]
         try:
-            q = json.loads(match)
-            questions.append(q)
-        except json.JSONDecodeError:
-            continue
+            q = json.loads(obj_str)
+            if isinstance(q, dict) and 'question_text' in q:
+                questions.append(q)
+                print(f"✅ Salvaged question #{len(questions)}: {q['question_text'][:60]}...")
+        except json.JSONDecodeError as e:
+            print(f"⚠️ Could not parse question at {start}: {e}")
+        
+        i = end
     
-    if questions:
-        print(f"✅ Extracted {len(questions)} questions from raw text")
-    
+    print(f"✅ Total salvaged: {len(questions)} complete questions")
     return questions
 
 def generate_fallback_questions(count=100):
@@ -73436,7 +73470,7 @@ def call_deepseek_api(prompt):
             "model": model_id,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.7,
-            "max_tokens": 16384,
+            "max_tokens": 32768,
             
         }
         
