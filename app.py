@@ -73475,7 +73475,7 @@ def call_deepseek_api(prompt):
         }
         
         logger.info("📡 Calling Tencent TokenHub...")
-        response = requests.post(url, headers=headers, json=payload, timeout=180)
+        response = requests.post(url, headers=headers, json=payload, timeout=300)
         logger.info(f"📡 HTTP Status: {response.status_code}")
         
         if response.status_code == 200:
