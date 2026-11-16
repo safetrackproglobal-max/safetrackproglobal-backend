@@ -73616,7 +73616,7 @@ IMPORTANT:
 @cross_origin()
 @jwt_required
 def deepseek_generate_exam_route():
-    """Generate a rigorous CSP-level exam using DeepSeek AI with domain weighting."""
+    """Generate CSP exam. ALWAYS returns 200 with exactly `count` questions."""
     if request.method == 'OPTIONS':
         return '', 200
     
@@ -73628,41 +73628,44 @@ def deepseek_generate_exam_route():
         count = int(data.get('count', 100))
         difficulty = data.get('difficulty', 'advanced')
         
-        logger.info(f"🎯 CSP exam generation for {current_user.email} (Target: {count}, Difficulty: {difficulty})")
+        logger.info(f"🎯 CSP exam generation for {current_user.email} (Target: {count})")
         
         prompt = build_exam_prompt(topic, count, difficulty)
         
         all_questions = []
+        ai_succeeded = False
         
-        logger.info(f"   - Calling Tencent TokenHub...")
-        deepseek_response = call_deepseek_api(prompt)
-        
-        if deepseek_response:
-            try:
+        # Try AI first
+        try:
+            logger.info(f"   - Calling Tencent TokenHub...")
+            deepseek_response = call_deepseek_api(prompt)
+            
+            if deepseek_response:
                 new_questions = clean_and_parse_deepseek_response(deepseek_response)
                 if isinstance(new_questions, list):
                     for q in new_questions:
                         if isinstance(q, dict) and 'question_text' in q:
                             all_questions.append(q)
-            except Exception as parse_err:
-                logger.warning(f"   - Parse failed: {parse_err}")
+                    if len(all_questions) > 0:
+                        ai_succeeded = True
+                        logger.info(f"   - AI returned {len(all_questions)} questions")
+        except Exception as ai_err:
+            logger.error(f"   - AI call failed: {ai_err}")
         
-        logger.info(f"   - AI returned {len(all_questions)} valid questions.")
-        
-        # 🛡️ Fallback if AI fell short
+        # 🔴 BACKEND FALLBACK: Pad to exact count
         if len(all_questions) < count:
             missing = count - len(all_questions)
-            logger.info(f"   - Padding {missing} questions with domain-aware fallback.")
+            logger.info(f"   - Padding {missing} questions with fallback")
             fallback = generate_fallback_questions(missing)
             all_questions.extend(fallback)
         
+        # Trim if AI returned too many
         all_questions = all_questions[:count]
         
-        # 📝 Format and validate domains
+        # Format and validate domains
         valid_domains = {d["name"] for d in CSP_DOMAINS}
         formatted_questions = []
         for i, q in enumerate(all_questions):
-            # Validate domain — if AI returned something invalid, assign a default
             q_domain = q.get('domain', '')
             if q_domain not in valid_domains:
                 q_domain = CSP_DOMAINS[i % len(CSP_DOMAINS)]["name"]
@@ -73672,21 +73675,21 @@ def deepseek_generate_exam_route():
                 'question_text': q.get('question_text', f'Question {i+1}'),
                 'options': q.get('options', ['A) Option A', 'B) Option B', 'C) Option C', 'D) Option D']),
                 'correct_answer': q.get('correct_answer', 'A'),
-                'explanation': q.get('explanation', ''),   # ✅ Keep explanation for review
+                'explanation': q.get('explanation', ''),
                 'difficulty': q.get('difficulty', difficulty),
-                'domain': q_domain,                         # ✅ Real CSP domain
+                'domain': q_domain,
                 'points': 2,
             })
         
-        # 📊 Log domain distribution for verification
+        # Log domain distribution
         domain_counts = {}
         for q in formatted_questions:
             domain_counts[q['domain']] = domain_counts.get(q['domain'], 0) + 1
         
         session_id = f'DEEPSEEK_CSP_{datetime.utcnow().strftime("%Y%m%d%H%M%S")}'
-        source = 'deepseek' if len([q for q in all_questions if q.get('explanation')]) > 50 else 'mixed'
+        source = 'deepseek' if ai_succeeded and len([q for q in all_questions if q.get('explanation')]) > 50 else 'mixed'
         
-        # 💾 SAVE FULL EXAM TO DISK (Requires the save_exam_to_file helper function!)
+        # Save to file
         saved_path = save_exam_to_file(
             session_id=session_id,
             user_email=current_user.email,
@@ -73699,15 +73702,12 @@ def deepseek_generate_exam_route():
         
         logger.info("=" * 60)
         logger.info(f"📋 GENERATED {len(formatted_questions)} CSP QUESTIONS")
-        logger.info(f"💾 Saved to file: {saved_path or 'FAILED - check helper function'}")
-        logger.info(f"📊 Domain distribution:")
-        for d in CSP_DOMAINS:
-            logger.info(f"   {d['name']}: {domain_counts.get(d['name'], 0)}")
-        logger.info(f"📋 Sample (first 3):")
-        for q in formatted_questions[:3]:
-            logger.info(f"   [{q['id']}] [{q['domain']}] {q['question_text'][:100]}...")
+        logger.info(f"💾 Saved to: {saved_path or 'FAILED'}")
+        logger.info(f"📊 Source: {source}")
+        logger.info(f"📊 Domains: {domain_counts}")
         logger.info("=" * 60)
         
+        # 🔴 ALWAYS RETURN 200 WITH QUESTIONS
         return jsonify({
             'success': True,
             'questions': formatted_questions,
@@ -73717,34 +73717,42 @@ def deepseek_generate_exam_route():
             'difficulty': difficulty,
             'source': source,
             'domain_breakdown': domain_counts,
-            'saved_to': saved_path,   # ✅ Frontend can know where it lives
+            'saved_to': saved_path,
         }), 200
         
     except Exception as e:
         logger.error(f"CSP exam generation error: {str(e)}", exc_info=True)
         
-        # Ultimate fallback — still domain-aware
-        fallback_questions = generate_fallback_questions(100)
-        formatted_fallback = []
-        for i, q in enumerate(fallback_questions[:100]):
-            formatted_fallback.append({
-                'id': f'q_{i+1}',
-                'question_text': q.get('question_text', f'Question {i+1}'),
-                'options': q.get('options', []),
-                'correct_answer': q.get('correct_answer', 'A'),
-                'explanation': q.get('explanation', ''),
-                'difficulty': 'intermediate',
-                'domain': CSP_DOMAINS[i % len(CSP_DOMAINS)]["name"],
-                'points': 2,
-            })
-        
-        return jsonify({
-            'success': True,
-            'questions': formatted_fallback,
-            'session_id': f'FALLBACK_CSP_{datetime.utcnow().strftime("%Y%m%d%H%M%S")}',
-            'total': 100,
-            'source': 'fallback',
-        }), 200
+        # 🔴 EMERGENCY: Even catastrophic failure returns 100 questions
+        try:
+            fallback_questions = generate_fallback_questions(100)
+            formatted_fallback = []
+            for i, q in enumerate(fallback_questions[:100]):
+                formatted_fallback.append({
+                    'id': f'q_{i+1}',
+                    'question_text': q.get('question_text', f'Question {i+1}'),
+                    'options': q.get('options', []),
+                    'correct_answer': q.get('correct_answer', 'A'),
+                    'explanation': q.get('explanation', ''),
+                    'difficulty': 'intermediate',
+                    'domain': CSP_DOMAINS[i % len(CSP_DOMAINS)]["name"],
+                    'points': 2,
+                })
+            
+            return jsonify({
+                'success': True,
+                'questions': formatted_fallback,
+                'session_id': f'FALLBACK_{datetime.utcnow().strftime("%Y%m%d%H%M%S")}',
+                'total': 100,
+                'source': 'emergency_fallback',
+            }), 200
+        except Exception as final_err:
+            logger.error(f"EMERGENCY FALLBACK FAILED: {final_err}")
+            return jsonify({
+                'success': False,
+                'error': 'Backend completely failed',
+                'code': 'TOTAL_FAILURE',
+            }), 500
 
 @app.route('/api/ai/documents/templates', methods=['GET'])
 def get_document_templates():
