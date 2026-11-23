@@ -167342,6 +167342,94 @@ try:
 except Exception:
     pass
 
+
+# =====================================================================================================
+# AUTO MIGRATIONS (2026-11-23)
+# Railway's Data tab appends LIMIT to every query, so CREATE/ALTER statements fail there. Instead the
+# backend applies the idempotent files in sql/AUTO_MIGRATIONS once, at startup:
+#   - each file runs once; success is recorded in schema_migrations (name + sha256)
+#   - statements run one by one (autocommit) with a short lock_timeout, so a busy table can't hang a deploy
+#   - a Postgres advisory lock stops two containers running it at the same time
+#   - a failing statement is logged and the file is retried on the next start
+# Set AUTO_MIGRATE=0 on Railway to switch this off.
+# =====================================================================================================
+AUTO_MIGRATIONS = ('DEPLOY_2026-11-23_FULL.sql',)
+_MIGRATION_LOCK_KEY = 74230115
+
+
+def _split_sql(text):
+    """Split a SQL file into statements: ';' at a line end closes a statement unless inside a $$ body."""
+    out, buf = [], []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not buf and (not stripped or stripped.startswith('--')):
+            continue
+        buf.append(line)
+        joined = '\n'.join(buf)
+        if stripped.endswith(';') and joined.count('$$') % 2 == 0:
+            out.append(joined.strip())
+            buf = []
+    if buf and '\n'.join(buf).strip():
+        out.append('\n'.join(buf).strip())
+    return out
+
+
+def _run_auto_migrations():
+    if os.environ.get('AUTO_MIGRATE', '1') == '0':
+        return
+    if db.engine.dialect.name != 'postgresql':
+        return
+    sql_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'sql')
+    conn = db.engine.connect().execution_options(isolation_level='AUTOCOMMIT')
+    try:
+        conn.execute(db.text("SELECT pg_advisory_lock(:k)"), {'k': _MIGRATION_LOCK_KEY})
+        conn.execute(db.text("""CREATE TABLE IF NOT EXISTS schema_migrations (
+            name VARCHAR(200) PRIMARY KEY, sha256 VARCHAR(64) NOT NULL,
+            statements INTEGER, applied_at TIMESTAMP NOT NULL DEFAULT NOW())"""))
+        for name in AUTO_MIGRATIONS:
+            path = os.path.join(sql_dir, name)
+            if not os.path.exists(path):
+                logger.error('MIGRATION %s missing from the image (is sql/ copied in the Dockerfile?)', name)
+                continue
+            text = open(path, encoding='utf-8').read()
+            digest = hashlib.sha256(text.encode('utf-8')).hexdigest()
+            row = conn.execute(db.text("SELECT sha256 FROM schema_migrations WHERE name = :n"), {'n': name}).first()
+            if row and row[0] == digest:
+                continue
+            statements = _split_sql(text)
+            failed = 0
+            conn.execute(db.text("SET lock_timeout = '10s'"))
+            conn.execute(db.text("SET statement_timeout = '120s'"))
+            for i, stmt in enumerate(statements, 1):
+                try:
+                    conn.exec_driver_sql(stmt)
+                except Exception as e:
+                    failed += 1
+                    logger.error('MIGRATION %s statement %d/%d failed: %s | %s', name, i, len(statements),
+                                 str(e).splitlines()[0][:300], stmt.splitlines()[0][:120])
+            conn.execute(db.text("RESET lock_timeout"))
+            conn.execute(db.text("RESET statement_timeout"))
+            if failed:
+                logger.error('MIGRATION %s: %d of %d statements failed - will retry on next start', name, failed, len(statements))
+                continue
+            conn.execute(db.text("""INSERT INTO schema_migrations (name, sha256, statements) VALUES (:n, :s, :c)
+                ON CONFLICT (name) DO UPDATE SET sha256 = EXCLUDED.sha256, statements = EXCLUDED.statements, applied_at = NOW()"""),
+                         {'n': name, 's': digest, 'c': len(statements)})
+            logger.info('MIGRATION %s applied (%d statements)', name, len(statements))
+    finally:
+        try:
+            conn.execute(db.text("SELECT pg_advisory_unlock(:k)"), {'k': _MIGRATION_LOCK_KEY})
+        except Exception:
+            pass
+        conn.close()
+
+
+try:
+    with app.app_context():
+        _run_auto_migrations()
+except Exception as _mig_err:
+    logger.error('MIGRATION runner failed (app keeps running): %s', _mig_err)
+
 if __name__ == '__main__':
     print("\n" + "="*60)
     print("🚀 Starting SafetyTrack Pro Application")

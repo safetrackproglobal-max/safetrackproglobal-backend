@@ -14,6 +14,7 @@
 !permit_templates.py
 !env_documents.py
 !env_analytics.py
+!sql/
 !requirements.txt
 !debug_models.py
 !app_init_debug.py

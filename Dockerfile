@@ -44,6 +44,7 @@ COPY pdf_edit_engine.py .
 COPY permit_templates.py .
 COPY env_documents.py .
 COPY env_analytics.py .
+COPY sql/ ./sql/
 
 RUN mkdir -p uploads detection_results generated_certificates generated_documents sessions static model_cache
 
