@@ -80284,12 +80284,1071 @@ class HTMLTemplateEngineCompatibility:
                     return f.read()
             return None
 
-# ============================================================================
-# EXPORT ALL CLASSES
-# ============================================================================
-# ==================== GENERAL SAFETY CLASSES ====================
+
+def get_class(name):
+    """Get a class by name (dynamic access)"""
+    return CLASSES_MAP.get(name)
 
 
+
+import textwrap as _nt_textwrap
+
+_NT_INNER = 96  # inner width of every box / table
+
+
+def _nt_wrap(text, width):
+    text = str(text)
+    if len(text) <= width:
+        return [text]
+    return _nt_textwrap.wrap(text, width=width, break_long_words=True) or ['']
+
+
+def _nt_table(headers, rows):
+    """Render a box-drawn table; cells wrap so the table never exceeds the page width."""
+    n = len(headers)
+    cap = max(8, (_NT_INNER - (3 * n + 1)) // n)
+    widths = []
+    for i in range(n):
+        longest = max([len(str(headers[i]))] + [len(str(r[i])) for r in rows if i < len(r)])
+        widths.append(min(longest, cap))
+
+    def line(left, mid, right):
+        return left + mid.join('─' * (w + 2) for w in widths) + right
+
+    def render_row(cells):
+        wrapped = [_nt_wrap(cells[i] if i < len(cells) else '', widths[i]) for i in range(n)]
+        height = max(len(c) for c in wrapped)
+        out = []
+        for k in range(height):
+            parts = []
+            for i in range(n):
+                txt = wrapped[i][k] if k < len(wrapped[i]) else ''
+                parts.append(' ' + txt.ljust(widths[i]) + ' ')
+            out.append('│' + '│'.join(parts) + '│')
+        return out
+
+    out = [line('┌', '┬', '┐')]
+    out += render_row(headers)
+    out.append(line('├', '┼', '┤'))
+    for idx, r in enumerate(rows):
+        out += render_row(r)
+        out.append(line('├' if idx < len(rows) - 1 else '└', '┼' if idx < len(rows) - 1 else '┴',
+                        '┤' if idx < len(rows) - 1 else '┘'))
+    if not rows:
+        out[-1] = line('└', '┴', '┘')
+    return '\n'.join(out)
+
+
+def _nt_fields(pairs):
+    """Two label/value pairs per row, e.g. 'SITE: ______' | 'DATE: ______'."""
+    rows = []
+    for i in range(0, len(pairs), 2):
+        left = pairs[i]
+        right = pairs[i + 1] if i + 1 < len(pairs) else ''
+        rows.append([f"{left}: ____________________", f"{right}: ____________________" if right else ''])
+    return _nt_table(['DOCUMENT DETAILS', ''], rows).replace('│ DOCUMENT DETAILS', '│ DOCUMENT DETAILS', 1)
+
+
+def _nt_check(items):
+    out = []
+    for t in items:
+        wrapped = _nt_wrap(t, _NT_INNER - 6)
+        out.append('  □ ' + wrapped[0])
+        out += ['    ' + w for w in wrapped[1:]]
+    return '\n'.join(out)
+
+
+def _nt_lines(items):
+    out = []
+    for i, t in enumerate(items, 1):
+        wrapped = _nt_wrap(t, _NT_INNER - 6)
+        out.append(f"  {i}. {wrapped[0]}")
+        out += ['     ' + w for w in wrapped[1:]]
+    return '\n'.join(out)
+
+
+_NT_DEFAULT_SIGN = ['Prepared by', 'Reviewed by', 'Approved by']
+
+
+def _nt_build(title, icon, ref, fields, sections, sign=None):
+    bar = '═' * (_NT_INNER + 2)
+    head = [
+        '╔' + bar + '╗',
+        '║ ' + f"{icon}  {title.upper()}".ljust(_NT_INNER) + ' ║',
+        '║ ' + f"REF: {ref}-______    REVISION: 01    DATE: ____/____/________".ljust(_NT_INNER) + ' ║',
+        '╚' + bar + '╝',
+        '',
+        _nt_fields(fields),
+    ]
+    parts = ['\n'.join(head)]
+    for sec in sections:
+        kind, heading = sec[0], sec[1]
+        parts.append('')
+        parts.append(heading.upper() + ':')
+        if kind == 'table':
+            parts.append(_nt_table(sec[2], sec[3]))
+        elif kind == 'check':
+            parts.append(_nt_check(sec[2]))
+        elif kind == 'lines':
+            parts.append(_nt_lines(sec[2]))
+    parts.append('')
+    parts.append('APPROVAL & SIGN-OFF:')
+    parts.append(_nt_table(['Role', 'Name', 'Signature', 'Date'],
+                           [[r, '', '', ''] for r in (sign or _NT_DEFAULT_SIGN)]))
+    parts.append('')
+    parts.extend(_nt_wrap('This is a controlled document. Verify it is the current revision before use. '
+                          'Adapt it to local legislation and site procedures.', _NT_INNER))
+    return '\n'.join(parts) + '\n'
+
+
+class _NewTemplateBase:
+    """Shared by the classes below. DOCS maps template key -> keyword arguments of _nt_build()."""
+    DOCS = {}
+
+    def _render_all(self):
+        return {key: _nt_build(**spec) for key, spec in self.DOCS.items()}
+
+
+# Common column sets -----------------------------------------------------------------------
+_RISK_COLS = ['Hazard', 'Who / what is at risk', 'Existing controls', 'L', 'S', 'Risk', 'Additional controls / owner']
+_ACTION_COLS = ['No.', 'Action required', 'Responsible', 'Due date', 'Status']
+
+
+def _nt_risk_rows(items):
+    """items: (hazard, at risk, controls) -> row with empty rating cells to fill in."""
+    return [[h, w, c, '', '', '', ''] for h, w, c in items]
+
+
+_RISK_LEGEND = ['lines', 'Risk rating guide (L = likelihood 1-5, S = severity 1-5, Risk = L x S)',
+                ['1-4 Low: manage by routine procedures.',
+                 '5-9 Medium: add controls where reasonably practicable and monitor.',
+                 '10-16 High: do not start or continue until controls reduce the risk; senior approval needed.',
+                 '17-25 Extreme: stop work; redesign or eliminate the hazard.']]
+
+
+# =============================================================================================
+# UNIVERSAL DOCUMENTS (shown for every industry)
+# =============================================================================================
+
+class PPETemplates(_NewTemplateBase):
+    """ID: ppe_get_ppe_templates_ppe_assessment"""
+    DOCS = {
+        'ppe_assessment': dict(
+            title='PPE Hazard Assessment', icon='🦺', ref='PPE',
+            fields=['SITE / DEPARTMENT', 'TASK / JOB ROLE', 'ASSESSED BY', 'DATE', 'NUMBER OF WORKERS', 'REVIEW DATE'],
+            sections=[
+                ('table', 'Hazard assessment and PPE selection',
+                 ['Hazard category', 'Hazard present?', 'Source / task', 'PPE required', 'Standard / rating'],
+                 [['Head impact / falling objects', 'Y / N', '', 'Safety helmet', 'EN 397 / ANSI Z89.1'],
+                  ['Eye and face (dust, splash, radiation)', 'Y / N', '', 'Safety glasses, goggles, face shield', 'EN 166 / ANSI Z87.1'],
+                  ['Hearing (noise above 85 dB(A))', 'Y / N', '', 'Ear plugs / ear muffs', 'EN 352 (check SNR)'],
+                  ['Respiratory (dust, fumes, vapours)', 'Y / N', '', 'Respirator, filter type ____', 'EN 149 / EN 140'],
+                  ['Hand (cuts, chemicals, heat)', 'Y / N', '', 'Gloves, type ____', 'EN 388 / EN 374 / EN 407'],
+                  ['Foot (impact, puncture, slip)', 'Y / N', '', 'Safety footwear', 'EN ISO 20345'],
+                  ['Body (chemicals, heat, flame, visibility)', 'Y / N', '', 'Coverall, apron, hi-vis', 'EN ISO 20471 / EN 11612'],
+                  ['Fall from height', 'Y / N', '', 'Harness and lanyard', 'EN 361 / EN 355']]),
+                ('check', 'Before issuing PPE',
+                 ['Hazards that cannot be eliminated or engineered out have been identified',
+                  'PPE is compatible when worn together (e.g. glasses with respirator)',
+                  'Correct size and fit confirmed for each worker',
+                  'Workers trained in use, limits, cleaning, storage and replacement',
+                  'Inspection routine and replacement interval defined',
+                  'PPE issue recorded for each worker']),
+                ('table', 'PPE issue record',
+                 ['Worker name', 'PPE issued', 'Size', 'Date issued', 'Trained (initials)'],
+                 [['', '', '', '', ''], ['', '', '', '', ''], ['', '', '', '', '']]),
+            ]),
+    }
+
+    def get_ppe_templates(self):
+        return self._render_all()
+
+
+class EmergencyResponseEnhancedTemplates(_NewTemplateBase):
+    """Adds to the existing 'emergencyresponse' industry. ID: emergencyresponse_get_emergency_templates_emergency_contact_list"""
+    DOCS = {
+        'emergency_contact_list': dict(
+            title='Emergency Contact List', icon='📞', ref='ECL',
+            fields=['SITE / FACILITY', 'ADDRESS / GPS', 'EMERGENCY COORDINATOR', 'COORDINATOR PHONE', 'LAST VERIFIED', 'NEXT REVIEW'],
+            sections=[
+                ('table', 'External emergency services',
+                 ['Service', 'Phone / radio', 'Address or location', 'Notes'],
+                 [['Ambulance / medical', '', '', ''], ['Fire brigade', '', '', ''], ['Police / security', '', '', ''],
+                  ['Poison information centre', '', '', ''], ['Nearest hospital', '', '', 'Trauma capable? Y / N'],
+                  ['Utility emergency (gas / water / power)', '', '', ''], ['Environmental authority', '', '', ''],
+                  ['Regulator / authority notification', '', '', '']]),
+                ('table', 'Internal emergency team',
+                 ['Role', 'Name', 'Mobile', 'Alternate'],
+                 [['Site manager', '', '', ''], ['Emergency coordinator', '', '', ''], ['First aid officer', '', '', ''],
+                  ['Fire warden / evacuation lead', '', '', ''], ['HSE manager', '', '', ''], ['Maintenance / utilities isolation', '', '', '']]),
+                ('table', 'Management and key contacts',
+                 ['Contact', 'Name', 'Phone (24h)', 'Email'],
+                 [['Company director / duty executive', '', '', ''], ['Insurance / claims', '', '', ''],
+                  ['Key contractor(s)', '', '', ''], ['Next of kin process owner (HR)', '', '', '']]),
+                ('check', 'Maintenance of this list',
+                 ['Numbers tested by calling at least every 6 months', 'List posted at reception, control room and muster points',
+                  'Copy kept in site emergency box and on mobile phones of the response team',
+                  'Updated after any staffing, contractor or service change']),
+            ]),
+    }
+
+    def get_emergency_templates(self):
+        return self._render_all()
+
+
+class TrainingTemplates(_NewTemplateBase):
+    """IDs: training_get_training_templates_safety_orientation_checklist / ..._safety_training_plan"""
+    DOCS = {
+        'safety_orientation_checklist': dict(
+            title='Safety Orientation Checklist', icon='🎓', ref='ORI',
+            fields=['EMPLOYEE / VISITOR NAME', 'JOB TITLE', 'DEPARTMENT', 'START DATE', 'SUPERVISOR', 'ORIENTATION GIVEN BY'],
+            sections=[
+                ('check', 'Company and site rules',
+                 ['Health and safety policy and management commitment explained',
+                  'Site rules, restricted areas, speed limits and housekeeping expectations',
+                  'Right and duty to stop unsafe work, no-blame reporting',
+                  'Fitness for work: drugs, alcohol and fatigue rules']),
+                ('check', 'Emergency arrangements',
+                 ['Alarm sounds, evacuation routes and muster points shown',
+                  'Location of fire extinguishers, first aid kits, eyewash and AED shown',
+                  'Who to call and how to report an emergency',
+                  'Shelter / lock-down arrangements explained']),
+                ('check', 'Hazards and controls for this job',
+                 ['Main hazards of the work area and the controls in place',
+                  'Permit to work, lock-out / tag-out and isolation rules explained',
+                  'Manual handling, working at height, confined space, hot work (as applicable)',
+                  'Safety data sheets and chemical labelling shown']),
+                ('check', 'PPE and equipment',
+                 ['Required PPE issued, fitted and signed for', 'Training / competence needed before using plant or tools confirmed']),
+                ('check', 'Reporting',
+                 ['How to report incidents, near misses and unsafe conditions', 'First aid and injury reporting procedure', 'Name of safety representative / HSE contact given']),
+                ('lines', 'Declaration',
+                 ['I have received the orientation above, understood it, and have had the chance to ask questions.'])],
+            sign=['Employee / visitor', 'Orientation given by', 'Supervisor']),
+        'safety_training_plan': dict(
+            title='Safety Training Plan', icon='📚', ref='STP',
+            fields=['ORGANISATION / SITE', 'PLAN YEAR', 'PLAN OWNER', 'BUDGET', 'LAST REVIEWED', 'NEXT REVIEW'],
+            sections=[
+                ('table', 'Training needs analysis',
+                 ['Job role / group', 'Hazards of the role', 'Required training', 'Legal / standard basis', 'Refresher interval'],
+                 [['All employees', 'General workplace hazards', 'Induction, emergency response, hazard reporting', 'Local OSH law', 'Annual'],
+                  ['Supervisors', 'Directing work', 'Supervisory safety, incident investigation', 'ISO 45001 cl. 7.2', '2 years'],
+                  ['Task specific (list)', '', '', '', ''], ['Contractors', 'Site interfaces', 'Site induction, permit rules', 'Site rules', 'Per contract']]),
+                ('table', 'Training schedule',
+                 ['Course', 'Audience', 'Provider', 'Planned date', 'Hours', 'Cost', 'Status'],
+                 [['', '', '', '', '', '', ''], ['', '', '', '', '', '', ''], ['', '', '', '', '', '', '']]),
+                ('lines', 'Competence and records',
+                 ['Training is delivered by a competent trainer and recorded with date, content, trainer and attendee signature.',
+                  'Effectiveness is verified by observation, assessment or questioning after the training.',
+                  'Certificates and expiry dates are tracked, and workers do not perform tasks needing a certificate once it has expired.']),
+                ('table', 'Review of plan',
+                 ['Measure', 'Target', 'Actual', 'Comment'],
+                 [['Planned courses delivered', '100%', '', ''], ['Workers with valid required certificates', '100%', '', ''], ['Post-training assessment pass rate', '', '', '']]),
+            ]),
+    }
+
+    def get_training_templates(self):
+        return self._render_all()
+
+
+class SafetyManagementEnhancedTemplates(_NewTemplateBase):
+    """Adds to 'safetymanagement'. IDs: ..._get_management_templates_safety_meeting_agenda / ..._workplace_safety_policy"""
+    DOCS = {
+        'safety_meeting_agenda': dict(
+            title='Safety Meeting Agenda', icon='🗓️', ref='SMA',
+            fields=['MEETING TYPE (committee / toolbox / department)', 'DATE', 'TIME', 'LOCATION', 'CHAIRPERSON', 'MINUTE TAKER'],
+            sections=[
+                ('table', 'Attendees',
+                 ['Name', 'Role / department', 'Present', 'Apologies'], [['', '', '', ''], ['', '', '', ''], ['', '', '', ''], ['', '', '', '']]),
+                ('table', 'Agenda',
+                 ['Item', 'Topic', 'Lead', 'Time'],
+                 [['1', 'Welcome, attendance and declaration of conflicts', 'Chair', '2 min'],
+                  ['2', 'Review of previous minutes and open actions', 'Chair', '10 min'],
+                  ['3', 'Safety performance: incidents, near misses, injury rates, leading indicators', 'HSE', '10 min'],
+                  ['4', 'Inspection, audit and permit findings', 'HSE', '10 min'],
+                  ['5', 'Hazards, risk assessments and changes planned (new work, equipment, contractors)', 'Operations', '10 min'],
+                  ['6', 'Worker concerns and suggestions', 'All', '10 min'],
+                  ['7', 'Training, drills and communication', 'HSE', '5 min'],
+                  ['8', 'Regulatory and legal updates', 'HSE', '5 min'],
+                  ['9', 'New actions, owners and deadlines', 'Chair', '5 min'],
+                  ['10', 'Date of next meeting and close', 'Chair', '2 min']]),
+                ('table', 'Action log',
+                 _ACTION_COLS, [['', '', '', '', ''], ['', '', '', '', '']]),
+            ], sign=['Chairperson', 'Minute taker']),
+        'workplace_safety_policy': dict(
+            title='Workplace Safety Policy', icon='📜', ref='POL',
+            fields=['ORGANISATION', 'POLICY OWNER', 'EFFECTIVE DATE', 'REVIEW DATE', 'APPLIES TO', 'APPROVED BY'],
+            sections=[
+                ('lines', 'Policy statement',
+                 ['[Organisation] is committed to providing a safe and healthy workplace for all employees, contractors, visitors and anyone affected by our activities.',
+                  'We will comply with applicable health and safety laws and other requirements we subscribe to, and continually improve our safety performance.']),
+                ('lines', 'Commitments',
+                 ['Identify hazards, assess risks and apply the hierarchy of control: eliminate, substitute, engineer, administer, then PPE.',
+                  'Consult with workers and their representatives and encourage reporting of hazards, near misses and incidents without blame.',
+                  'Provide adequate resources, competent people, training, equipment and supervision.',
+                  'Investigate incidents to find root causes and prevent recurrence.',
+                  'Prepare for emergencies and test arrangements regularly.',
+                  'Set measurable safety objectives and review them at least once a year.']),
+                ('table', 'Responsibilities',
+                 ['Who', 'Responsibility'],
+                 [['Senior management', 'Provide leadership, resources and set objectives; review performance'],
+                  ['Managers and supervisors', 'Implement this policy, supervise work, correct unsafe conditions'],
+                  ['Employees', 'Follow safe procedures, use PPE, report hazards and incidents, stop unsafe work'],
+                  ['Contractors and visitors', 'Follow site rules and the instructions of the site contact'],
+                  ['HSE function', 'Advise, monitor, audit and report on safety performance']]),
+                ('check', 'Communication',
+                 ['Policy signed by the most senior manager', 'Displayed at entrances and notice boards', 'Included in induction and available to contractors on request', 'Reviewed after major change or incident']),
+            ], sign=['Chief Executive / Site Director', 'HSE Manager']),
+    }
+
+    def get_management_templates(self):
+        return self._render_all()
+
+
+class InspectionMonitoringEnhancedTemplates(_NewTemplateBase):
+    """ID: inspectionmonitoring_get_inspection_templates_inspection_report"""
+    DOCS = {
+        'inspection_report': dict(
+            title='Safety Inspection Report', icon='🔎', ref='INS',
+            fields=['SITE / AREA INSPECTED', 'INSPECTION TYPE (routine / planned / follow-up)', 'INSPECTOR', 'DATE', 'ACCOMPANIED BY', 'WEATHER / CONDITIONS'],
+            sections=[
+                ('table', 'Inspection findings',
+                 ['Area / item', 'Satisfactory (S) / Unsatisfactory (U) / N/A', 'Observation', 'Photo ref'],
+                 [['Housekeeping, walkways, storage', '', '', ''], ['Machinery guarding and equipment condition', '', '', ''],
+                  ['Electrical safety (leads, panels, RCDs)', '', '', ''], ['Fire safety (extinguishers, exits, alarms)', '', '', ''],
+                  ['Chemicals: labelling, storage, SDS available', '', '', ''], ['PPE use and condition', '', '', ''],
+                  ['Working at height and edge protection', '', '', ''], ['Lifting equipment and tags', '', '', ''],
+                  ['First aid, eyewash and spill kits', '', '', ''], ['Permits, risk assessments and signage', '', '', '']]),
+                ('table', 'Non-conformances and corrective actions',
+                 ['No.', 'Finding', 'Priority (H / M / L)', 'Corrective action', 'Owner', 'Due', 'Closed'],
+                 [['1', '', '', '', '', '', ''], ['2', '', '', '', '', '', ''], ['3', '', '', '', '', '', '']]),
+                ('lines', 'Summary',
+                 ['Overall result: Satisfactory / Needs improvement / Unacceptable.', 'Good practices observed: ______________________________',
+                  'Immediate dangers reported to the area supervisor at: ______ (time).']),
+            ], sign=['Inspector', 'Area supervisor', 'HSE manager']),
+    }
+
+    def get_inspection_templates(self):
+        return self._render_all()
+
+
+class QualityTemplates(_NewTemplateBase):
+    """ID: quality_get_quality_templates_quality_management_plan"""
+    DOCS = {
+        'quality_management_plan': dict(
+            title='Quality Management Plan', icon='✅', ref='QMP',
+            fields=['PROJECT / PROCESS', 'CLIENT / CUSTOMER', 'QUALITY MANAGER', 'STANDARD (e.g. ISO 9001)', 'ISSUE DATE', 'REVIEW DATE'],
+            sections=[
+                ('lines', 'Quality objectives',
+                 ['Objective 1: ______________________________  Measure: ____________  Target: ______',
+                  'Objective 2: ______________________________  Measure: ____________  Target: ______']),
+                ('table', 'Roles and responsibilities',
+                 ['Role', 'Name', 'Quality responsibility'],
+                 [['Project / operations manager', '', 'Overall accountability for quality and resources'],
+                  ['Quality manager', '', 'Maintain this plan, audits, non-conformance control'],
+                  ['Supervisors', '', 'Apply procedures, verify work before hand-over'],
+                  ['All staff', '', 'Follow procedures and report defects']]),
+                ('table', 'Inspection and test plan',
+                 ['Activity', 'Requirement / specification', 'Method', 'Frequency', 'Record', 'Hold point (Y/N)'],
+                 [['', '', '', '', '', ''], ['', '', '', '', '', ''], ['', '', '', '', '', '']]),
+                ('table', 'Controls',
+                 ['Control area', 'Procedure / reference', 'Owner'],
+                 [['Document and record control', '', ''], ['Supplier and material approval', '', ''], ['Calibration of measuring equipment', '', ''],
+                  ['Non-conformance and corrective action', '', ''], ['Internal audit programme', '', ''], ['Management review', '', '']]),
+            ], sign=['Quality manager', 'Project / operations manager', 'Client representative']),
+    }
+
+    def get_quality_templates(self):
+        return self._render_all()
+
+
+class ComplianceTemplates(_NewTemplateBase):
+    """ID: compliance_get_compliance_templates_hazard_communication_plan"""
+    DOCS = {
+        'hazard_communication_plan': dict(
+            title='Hazard Communication Plan', icon='⚠️', ref='HCP',
+            fields=['COMPANY / SITE', 'PROGRAM COORDINATOR', 'EFFECTIVE DATE', 'REVIEW DATE', 'APPLICABLE REGULATION (e.g. OSHA 1910.1200 / GHS)', 'APPROVED BY'],
+            sections=[
+                ('lines', 'Purpose and scope',
+                 ['This plan ensures that all hazardous chemicals used on site are identified, labelled and communicated to workers through labels, safety data sheets and training.']),
+                ('table', 'Chemical inventory',
+                 ['Product name', 'Manufacturer', 'Location / use', 'Hazard class (GHS)', 'SDS on file', 'Max quantity'],
+                 [['', '', '', '', 'Y / N', ''], ['', '', '', '', 'Y / N', ''], ['', '', '', '', 'Y / N', '']]),
+                ('check', 'Labels and safety data sheets',
+                 ['All containers carry a label with product identifier, signal word, hazard statements, pictograms, precautionary statements and supplier details',
+                  'Secondary containers are labelled with identity and hazards',
+                  'A 16-section SDS is held for every chemical and is accessible on every shift',
+                  'New or changed chemicals are approved before purchase and added to the inventory']),
+                ('check', 'Training and non-routine tasks',
+                 ['Workers trained at assignment and when a new hazard is introduced: how to read labels and SDS, hazards, protective measures, emergency steps',
+                  'Hazards of non-routine tasks and chemicals in unlabeled pipes are explained before work starts',
+                  'Contractors informed of chemical hazards and site precautions; they inform the site of their own']),
+                ('lines', 'Program review',
+                 ['The plan, inventory and training records are reviewed at least annually and after any chemical-related incident.']),
+            ], sign=['Program coordinator', 'Site manager']),
+    }
+
+    def get_compliance_templates(self):
+        return self._render_all()
+
+
+class AuditTemplates(_NewTemplateBase):
+    """ID: audit_get_audit_templates_safety_audit_checklist"""
+    DOCS = {
+        'safety_audit_checklist': dict(
+            title='Safety Audit Checklist', icon='🧾', ref='SAC',
+            fields=['ORGANISATION / SITE', 'AUDIT SCOPE', 'AUDIT STANDARD (ISO 45001 / OSHA / internal)', 'AUDITOR(S)', 'AUDIT DATE', 'AUDITEE REPRESENTATIVE'],
+            sections=[
+                ('table', 'Audit questions',
+                 ['Element', 'Question', 'Conforms (Y / N / NA)', 'Evidence seen / comment'],
+                 [['Leadership and policy', 'Is a current signed safety policy in place and communicated?', '', ''],
+                  ['Hazard identification and risk assessment', 'Are risk assessments current, task based and reviewed after change?', '', ''],
+                  ['Legal compliance', 'Is there a register of legal requirements and evidence of compliance?', '', ''],
+                  ['Consultation', 'Are workers consulted and is a safety committee active?', '', ''],
+                  ['Competence and training', 'Are training needs met and records up to date?', '', ''],
+                  ['Operational control', 'Are permits, isolation and contractor controls applied?', '', ''],
+                  ['Emergency preparedness', 'Are plans in place and drills held and recorded?', '', ''],
+                  ['Incident management', 'Are incidents investigated, root causes found and actions closed?', '', ''],
+                  ['Monitoring', 'Are inspections, health surveillance and exposure monitoring carried out?', '', ''],
+                  ['Management review', 'Is performance reviewed by top management at planned intervals?', '', '']]),
+                ('table', 'Findings',
+                 ['No.', 'Finding', 'Type (Major NC / Minor NC / Observation / Good practice)', 'Clause / requirement', 'Corrective action', 'Owner', 'Due'],
+                 [['1', '', '', '', '', '', ''], ['2', '', '', '', '', '', '']]),
+                ('lines', 'Audit conclusion',
+                 ['Overall conclusion on conformity and effectiveness: ______________________________', 'Follow-up audit required: Yes / No   Date: ____/____/________']),
+            ], sign=['Lead auditor', 'Auditee representative', 'HSE manager']),
+    }
+
+    def get_audit_templates(self):
+        return self._render_all()
+
+
+class RISKManagementTemplates(_NewTemplateBase):
+    """ID: riskmanagement_get_risk_templates_risk_management_plan
+    NOTE: the capitals in 'RISK' are intentional. The hub strips the text 'Risk' from class names,
+    so 'RiskManagement...' would become the industry 'management' instead of 'riskmanagement'."""
+    DOCS = {
+        'risk_management_plan': dict(
+            title='Risk Management Plan', icon='🎯', ref='RMP',
+            fields=['PROJECT / OPERATION', 'RISK MANAGER', 'PLAN OWNER', 'ISSUE DATE', 'REVIEW FREQUENCY', 'APPROVED BY'],
+            sections=[
+                ('lines', 'Risk criteria',
+                 ['Scope and context: ______________________________',
+                  'Risk appetite: ______________________________ (what level of risk is acceptable and who can accept it).']),
+                _RISK_LEGEND,
+                ('table', 'Risk register',
+                 ['ID', 'Risk description', 'Cause / consequence', 'Likelihood', 'Impact', 'Rating', 'Treatment (avoid / reduce / transfer / accept)', 'Owner', 'Review date'],
+                 [['R1', '', '', '', '', '', '', '', ''], ['R2', '', '', '', '', '', '', '', ''], ['R3', '', '', '', '', '', '', '', '']]),
+                ('table', 'Monitoring and communication',
+                 ['Activity', 'Frequency', 'Responsible'],
+                 [['Risk register review', 'Monthly', ''], ['Report to management', 'Quarterly', ''], ['Review after incidents or major change', 'As needed', ''], ['Consultation with workers and stakeholders', 'Ongoing', '']]),
+            ], sign=['Risk manager', 'Project / operations manager', 'Senior management']),
+    }
+
+    def get_risk_templates(self):
+        return self._render_all()
+
+
+class ChemicalSafetyTemplates(_NewTemplateBase):
+    """ID: chemicalsafety_get_chemical_templates_chemical_safety_assessment"""
+    DOCS = {
+        'chemical_safety_assessment': dict(
+            title='Chemical Safety Assessment', icon='🧪', ref='CSA',
+            fields=['CHEMICAL / PRODUCT NAME', 'SUPPLIER', 'LOCATION / PROCESS', 'ASSESSED BY', 'DATE', 'SDS DATE / VERSION'],
+            sections=[
+                ('table', 'Substance information',
+                 ['Item', 'Details (from SDS)'],
+                 [['GHS hazard classes and pictograms', ''], ['Signal word', ''], ['Exposure routes (inhalation / skin / eye / ingestion)', ''],
+                  ['Occupational exposure limits (TWA / STEL)', ''], ['Flash point / flammability', ''], ['Incompatible materials', '']]),
+                ('table', 'Task exposure assessment',
+                 ['Task', 'Quantity & duration', 'Frequency', 'Persons exposed', 'Exposure level (L / M / H)'],
+                 [['', '', '', '', ''], ['', '', '', '', '']]),
+                ('table', 'Controls',
+                 ['Control', 'In place', 'Details'],
+                 [['Elimination / substitution with a less hazardous chemical', 'Y / N', ''], ['Enclosure or local exhaust ventilation', 'Y / N', ''],
+                  ['Safe storage, segregation and bunding', 'Y / N', ''], ['Safe procedures and limiting exposure time', 'Y / N', ''],
+                  ['PPE (gloves, eye, respirator) specified', 'Y / N', ''], ['Spill kit and eyewash available', 'Y / N', ''],
+                  ['Worker training and health surveillance (if required)', 'Y / N', '']]),
+                ('table', 'Emergency measures',
+                 ['Scenario', 'Immediate action'],
+                 [['Spill', 'Isolate area, use spill kit, ventilate, report'], ['Skin or eye contact', 'Flush with water for at least 15 minutes, seek medical help'],
+                  ['Inhalation', 'Move to fresh air, seek medical help'], ['Fire', 'Raise alarm, use suitable extinguisher only if safe, evacuate']]),
+                ('lines', 'Conclusion',
+                 ['Residual risk: Low / Medium / High.  Further action needed: ______________________________  Reassess by: ____/____/________']),
+            ]),
+    }
+
+    def get_chemical_templates(self):
+        return self._render_all()
+
+
+class VentilationTemplates(_NewTemplateBase):
+    """ID: ventilation_get_vent_templates_ventilation_assessment"""
+    DOCS = {
+        'ventilation_assessment': dict(
+            title='Ventilation Assessment', icon='🌬️', ref='VNT',
+            fields=['AREA / ROOM', 'PROCESS / ACTIVITY', 'ASSESSOR', 'DATE', 'NUMBER OF OCCUPANTS', 'ROOM VOLUME (m3)'],
+            sections=[
+                ('table', 'System details',
+                 ['Item', 'Details'],
+                 [['Ventilation type (natural / mechanical / local exhaust)', ''], ['Design air flow (m3/h) and air changes per hour', ''],
+                  ['Fresh air supply rate per person', ''], ['Contaminants of concern', ''], ['Date of last maintenance / filter change', '']]),
+                ('table', 'Measurements',
+                 ['Location', 'Air velocity / flow', 'CO2 (ppm)', 'Temperature / RH', 'Contaminant reading', 'Result (OK / Not OK)'],
+                 [['', '', '', '', '', ''], ['', '', '', '', '', ''], ['', '', '', '', '', '']]),
+                ('check', 'Inspection checklist',
+                 ['Air inlets and exhaust points clear and not blocked', 'Fans, ducts and hoods in good condition, no unusual noise or vibration',
+                  'Local exhaust capture velocity verified at the source', 'Filters clean and within change interval',
+                  'No recirculation of contaminated air or short-circuiting of airflow', 'Smoke test shows airflow toward the extraction point',
+                  'Workers do not report odours, headaches, dizziness or irritation', 'Last statutory LEV / ventilation test is in date']),
+                ('table', 'Actions',
+                 _ACTION_COLS, [['1', '', '', '', ''], ['2', '', '', '', '']]),
+            ]),
+    }
+
+    def get_vent_templates(self):
+        return self._render_all()
+
+
+class LightingTemplates(_NewTemplateBase):
+    """ID: lighting_get_lighting_templates_lighting_assessment"""
+    DOCS = {
+        'lighting_assessment': dict(
+            title='Lighting Assessment', icon='💡', ref='LGT',
+            fields=['AREA / WORKSTATION', 'TASK TYPE', 'ASSESSOR', 'DATE', 'LUX METER (model / calibration date)', 'TIME OF DAY / DAYLIGHT'],
+            sections=[
+                ('table', 'Illuminance measurements',
+                 ['Location / task', 'Recommended level (lux)', 'Measured level (lux)', 'Uniformity OK', 'Result'],
+                 [['Circulation areas / corridors', '100-150', '', 'Y / N', ''], ['Stores and warehouses', '150-200', '', 'Y / N', ''],
+                  ['General workshop / assembly', '300-500', '', 'Y / N', ''], ['Office and computer work', '300-500', '', 'Y / N', ''],
+                  ['Fine or precision work', '750 or more', '', 'Y / N', ''], ['Emergency lighting (escape routes)', 'At least 1 lux', '', 'Y / N', '']]),
+                ('check', 'Quality of lighting',
+                 ['No glare from luminaires, windows or shiny surfaces', 'No flicker or stroboscopic effect on moving machinery',
+                  'No harsh shadows on the task', 'Colour rendering suitable where colours must be distinguished',
+                  'Fittings clean, no failed lamps', 'Emergency and exit lighting tested and recorded', 'Workers do not report eye strain or headaches']),
+                ('lines', 'Note',
+                 ['Recommended levels are typical values (see EN 12464-1 or local standard). Use the level required by your local regulation or standard where it differs.']),
+                ('table', 'Actions',
+                 _ACTION_COLS, [['1', '', '', '', ''], ['2', '', '', '', '']]),
+            ]),
+    }
+
+    def get_lighting_templates(self):
+        return self._render_all()
+
+
+class EnvironmentalEnhancedTemplates(_NewTemplateBase):
+    """ID: environmental_get_env_templates_environmental_management_plan"""
+    DOCS = {
+        'environmental_management_plan': dict(
+            title='Environmental Management Plan', icon='🌿', ref='EMP',
+            fields=['SITE / PROJECT', 'ENVIRONMENTAL MANAGER', 'STANDARD (ISO 14001 / local permit)', 'ISSUE DATE', 'REVIEW DATE', 'PERMIT / LICENCE NO.'],
+            sections=[
+                ('table', 'Environmental aspects and impacts',
+                 ['Activity', 'Aspect', 'Impact', 'Significance (H / M / L)', 'Control measure', 'Owner'],
+                 [['Fuel and chemical storage', 'Spills and leaks', 'Soil and water contamination', '', 'Bunding, drip trays, spill kits', ''],
+                  ['Waste generation', 'Waste', 'Land use, pollution', '', 'Segregation, licensed disposal, reduction', ''],
+                  ['Plant and vehicles', 'Air emissions, noise', 'Air quality, nuisance', '', 'Maintenance, dust suppression, noise limits', ''],
+                  ['Water use and discharge', 'Consumption and effluent', 'Resource use, water quality', '', 'Metering, treatment, discharge consent', ''],
+                  ['', '', '', '', '', '']]),
+                ('table', 'Monitoring programme',
+                 ['Parameter', 'Method / location', 'Frequency', 'Limit / target', 'Responsible'],
+                 [['Dust / air quality', '', '', '', ''], ['Noise', '', '', '', ''], ['Water discharge', '', '', '', ''], ['Waste volumes and destinations', '', '', '', '']]),
+                ('check', 'Emergency and spill response',
+                 ['Spill response procedure and equipment available at storage and loading points', 'Staff trained in spill response',
+                  'Notification contacts to the environmental authority are listed', 'Drainage covers / absorbents available to protect drains']),
+                ('lines', 'Compliance and improvement',
+                 ['Legal register is maintained and permits are tracked to expiry.', 'Incidents and complaints are recorded, investigated and closed out.',
+                  'Objectives and performance are reviewed by management at least once a year.']),
+            ], sign=['Environmental manager', 'Site manager', 'Management representative']),
+    }
+
+    def get_env_templates(self):
+        return self._render_all()
+
+
+# =============================================================================================
+# CONSTRUCTION
+# =============================================================================================
+
+class ConstructionEnhancedRiskAssessment(_NewTemplateBase):
+    """ID: construction_get_risk_assessments_underground_work"""
+    DOCS = {
+        'underground_work': dict(
+            title='Underground Work Risk Assessment', icon='🚧', ref='CUW',
+            fields=['PROJECT / LOCATION', 'WORK DESCRIPTION', 'ASSESSOR', 'DATE', 'DEPTH / EXTENT', 'SUPERVISOR'],
+            sections=[
+                ('table', 'Hazards and controls',
+                 _RISK_COLS,
+                 _nt_risk_rows([
+                     ('Collapse of ground or excavation', 'Workers underground', 'Shoring or support design, daily inspection by competent person'),
+                     ('Oxygen deficiency and toxic or flammable gas', 'Workers underground', 'Gas detection, forced ventilation, entry permit'),
+                     ('Services strike (gas, electric, water)', 'Workers, public', 'Service drawings, scanning, trial holes, hand digging near services'),
+                     ('Flooding / groundwater inflow', 'Workers underground', 'Dewatering, weather watch, escape routes'),
+                     ('Fire and explosion', 'Workers underground', 'Hot work permit, fire watch, ignition control'),
+                     ('Falls and plant interface', 'Workers, plant operators', 'Edge protection, banksman, exclusion zones'),
+                     ('Emergency rescue difficulty', 'Workers underground', 'Rescue plan, rescue team and equipment on standby, communication system')])),
+                _RISK_LEGEND,
+                ('check', 'Pre-start checks',
+                 ['Underground work method statement and rescue plan approved', 'Permit to enter issued and atmosphere tested before every entry',
+                  'Entry / exit log and head count system in place', 'Competent supervisor and trained attendant at the entry point',
+                  'Emergency communication tested', 'Workers trained in confined space entry and emergency escape']),
+            ]),
+    }
+
+    def get_risk_assessments(self):
+        return self._render_all()
+
+
+class ConstructionEnhancedSpecializedTemplates(_NewTemplateBase):
+    """ID: construction_get_construction_specialized_painting_work_safety_plan"""
+    DOCS = {
+        'painting_work_safety_plan': dict(
+            title='Painting Work Safety Plan', icon='🎨', ref='CPW',
+            fields=['PROJECT / LOCATION', 'PAINTING CONTRACTOR', 'SUPERVISOR', 'START DATE', 'PAINT TYPES (solvent / water-based / epoxy)', 'METHOD (brush / roller / spray)'],
+            sections=[
+                ('table', 'Hazards and controls',
+                 ['Hazard', 'Control measure'],
+                 [['Solvent vapours and fumes', 'Ventilation, low-VOC products, respirator with correct organic vapour filter'],
+                  ['Fire and explosion from flammable paints', 'No ignition sources, bonding, minimal quantities, flammables cabinet'],
+                  ['Spray and overspray', 'Spray booth or screens, respirator, protective coveralls'],
+                  ['Working at height', 'Platforms or scaffolds; ladders only for short tasks; harness where required'],
+                  ['Lead or old paint disturbance', 'Test first; use controlled removal methods; do not dry sand'],
+                  ['Skin and eye contact', 'Gloves, goggles, wash facilities'],
+                  ['Confined space painting', 'Permit, gas testing, forced ventilation, standby person']]),
+                ('check', 'Before starting',
+                 ['SDS available for every product and read by the team', 'Painters trained and fit-tested for respirators',
+                  'Area barriered, signs displayed, adjacent workers informed', 'Fire extinguishers placed at the work area',
+                  'Waste rags and containers stored in closed metal bins', 'Spill kit and eyewash available']),
+                ('lines', 'Housekeeping and waste',
+                 ['Paint waste and empty containers are disposed of as hazardous waste through licensed carriers.', 'Rags soaked in solvent or oil-based paint are kept in water-filled or closed metal containers.']),
+            ]),
+    }
+
+    def get_construction_specialized(self):
+        return self._render_all()
+
+
+# =============================================================================================
+# OIL & GAS
+# =============================================================================================
+
+class OilGasEnhancedSpecializedTemplates(_NewTemplateBase):
+    """IDs: oilgas_get_oilgas_specialized_gas_processing_safety_plan / well_servicing_permit / transportation_safety_plan"""
+    DOCS = {
+        'gas_processing_safety_plan': dict(
+            title='Gas Processing Safety Plan', icon='🛢️', ref='OGP',
+            fields=['FACILITY / PLANT', 'UNIT / SECTION', 'PLAN OWNER', 'ISSUE DATE', 'PROCESS SAFETY STANDARD', 'REVIEW DATE'],
+            sections=[
+                ('table', 'Major hazards and controls',
+                 ['Hazard', 'Scenario', 'Prevention', 'Mitigation'],
+                 [['Hydrocarbon release', 'Flange or seal leak, overpressure', 'Integrity management, inspection, relief devices', 'Gas detection, ESD, deluge, bunding'],
+                  ['Hydrogen sulphide (H2S)', 'Sour gas leak', 'Closed systems, monitoring, permit control', 'Personal monitors, SCBA, wind socks, muster points'],
+                  ['Fire and explosion', 'Ignition of release', 'Hazardous area equipment, hot work control', 'Fire detection, firewater, emergency response'],
+                  ['Overpressure / loss of containment', 'Blocked outlet, control failure', 'Safety instrumented systems, PSV testing', 'Depressuring, shutdown logic'],
+                  ['Cryogenic or hot surfaces', 'Contact, brittle fracture', 'Insulation, procedures', 'PPE, first aid']]),
+                ('check', 'Operating controls',
+                 ['Operating procedures current and trained', 'Management of change applied to all modifications', 'Safety critical elements identified and tested on schedule',
+                  'Permit to work and isolation (LOTO) used for all intrusive work', 'Alarms and trips are not bypassed without authorisation',
+                  'Emergency shutdown drills held and recorded', 'Gas detection and fire detection tested and calibrated']),
+                ('table', 'Emergency response',
+                 ['Scenario', 'Alarm', 'First actions', 'Responsible'],
+                 [['Gas release', '', 'Alarm, shut down, isolate, upwind evacuation', ''], ['Fire', '', 'Alarm, ESD, fire team response', ''], ['H2S alarm', '', 'Stop work, escape upwind, use SCBA', '']]),
+            ]),
+        'well_servicing_permit': dict(
+            title='Well Servicing Permit', icon='⛽', ref='WSP',
+            fields=['WELL NAME / NO.', 'FIELD / LOCATION', 'SERVICE TYPE (workover / wireline / coiled tubing)', 'CONTRACTOR', 'PERMIT VALID FROM', 'PERMIT VALID TO'],
+            sections=[
+                ('lines', 'Scope of work', ['Describe the planned operation: ______________________________']),
+                ('check', 'Pre-job conditions (all must be confirmed)',
+                 ['Well status and barriers verified (two independent barriers)', 'Pressure tests of equipment completed and recorded',
+                  'Blowout preventer (BOP) tested and operational', 'H2S and hydrocarbon gas detection active, wind direction indicators visible',
+                  'Simultaneous operations assessed and approved', 'Hot work and ignition sources controlled; hazardous area zones marked',
+                  'Emergency shutdown, muster points and escape routes confirmed', 'Toolbox talk held with all crew; roles and stop-work authority explained']),
+                ('table', 'Isolations',
+                 ['Isolation point', 'Method', 'Lock no.', 'Verified by'], [['', '', '', ''], ['', '', '', '']]),
+                ('table', 'Gas test record',
+                 ['Time', 'O2 %', 'LEL %', 'H2S ppm', 'Tested by'], [['', '', '', '', ''], ['', '', '', '', '']]),
+            ], sign=['Permit requester', 'Permit authoriser', 'Site supervisor', 'Permit closed by']),
+        'transportation_safety_plan': dict(
+            title='Oil & Gas Transportation Safety Plan', icon='🚛', ref='OGT',
+            fields=['OPERATION / ROUTE', 'TRANSPORT COMPANY', 'PRODUCT / LOAD', 'PLAN OWNER', 'ISSUE DATE', 'REVIEW DATE'],
+            sections=[
+                ('table', 'Hazards and controls',
+                 ['Hazard', 'Control'],
+                 [['Road traffic collision', 'Journey management, speed limits, no night driving where banned, in-vehicle monitoring'],
+                  ['Loss of containment during loading or transfer', 'Earthing and bonding, overfill protection, trained loaders, transfer procedure'],
+                  ['Fire and explosion from flammable product', 'No ignition sources, static control, extinguishers, driver training'],
+                  ['Driver fatigue', 'Hours of service limits, rest breaks, fatigue management'],
+                  ['H2S or toxic product exposure', 'Gas monitors, PPE, emergency card']]),
+                ('check', 'Vehicle and driver requirements',
+                 ['Vehicle and tank inspected and certified; pre-trip checklist completed', 'Driver licence, hazmat/ADR training and medical valid',
+                  'Placards, labels and transport emergency card (TREM / SDS) carried', 'Route risk assessed, including bridges, population and water crossings',
+                  'Communication and tracking operational; check-in schedule agreed', 'Spill kit and fire extinguisher on board']),
+                ('table', 'Emergency response',
+                 ['Incident', 'Driver action', 'Contact'],
+                 [['Spill or leak', 'Stop, isolate ignition, raise alarm, contain if safe', ''], ['Fire', 'Raise alarm, evacuate, use extinguisher only if safe', ''], ['Collision', 'Secure scene, call emergency services, report', '']]),
+            ]),
+    }
+
+    def get_oilgas_specialized(self):
+        return self._render_all()
+
+
+class OilGasEnhancedRiskAssessment(_NewTemplateBase):
+    """ID: oilgas_get_risk_assessments_production_operations"""
+    DOCS = {
+        'production_operations': dict(
+            title='Production Operations Risk Assessment', icon='🛢️', ref='OPO',
+            fields=['FACILITY / FIELD', 'UNIT / ACTIVITY', 'ASSESSOR', 'DATE', 'OPERATING STATE (normal / start-up / shutdown)', 'TEAM MEMBERS'],
+            sections=[
+                ('table', 'Hazards and controls',
+                 _RISK_COLS,
+                 _nt_risk_rows([
+                     ('Loss of containment (oil / gas)', 'Operators, facility', 'Inspection, leak detection, ESD, bunding'),
+                     ('H2S release', 'Operators', 'Fixed and personal detectors, SCBA, wind socks'),
+                     ('Ignition of flammable atmosphere', 'Operators, facility', 'Hazardous area equipment, permit to work'),
+                     ('Overpressure of vessels or pipework', 'Operators', 'Relief valves, SIS, operating limits'),
+                     ('Hot surfaces and noise', 'Operators', 'Insulation, PPE, noise mapping'),
+                     ('Manual handling and slips on platforms', 'Operators', 'Housekeeping, anti-slip, handling aids'),
+                     ('Simultaneous operations', 'All personnel', 'SIMOPS matrix, communication')])),
+                _RISK_LEGEND,
+                ('check', 'Operating readiness',
+                 ['Operating procedures and alarm response procedures available', 'Safety critical equipment tested and in service',
+                  'Operators competent and fit for duty', 'Emergency drills current']),
+            ]),
+    }
+
+    def get_risk_assessments(self):
+        return self._render_all()
+
+
+# =============================================================================================
+# MINING
+# =============================================================================================
+
+class MiningEnhancedRiskAssessment(_NewTemplateBase):
+    """IDs: mining_get_risk_assessments_underground_operations / surface_operations"""
+    DOCS = {
+        'underground_operations': dict(
+            title='Underground Mining Operations Risk Assessment', icon='⛏️', ref='MUG',
+            fields=['MINE / LEVEL / SECTION', 'ACTIVITY', 'ASSESSOR', 'DATE', 'SHIFT', 'TEAM MEMBERS'],
+            sections=[
+                ('table', 'Hazards and controls', _RISK_COLS,
+                 _nt_risk_rows([
+                     ('Ground fall / rock burst', 'Miners', 'Ground support design, scaling, inspection, barring down'),
+                     ('Inadequate ventilation, dust and diesel emissions', 'Miners', 'Ventilation plan, gas monitoring, dust suppression'),
+                     ('Fire and smoke underground', 'Miners', 'Fire detection, refuge chambers, self-rescuers'),
+                     ('Explosives misfire', 'Blasters, miners', 'Blasting procedure, exclusion zone, re-entry time'),
+                     ('Mobile equipment collision', 'Miners, drivers', 'Traffic management, proximity detection, lighting'),
+                     ('Water inrush / flooding', 'Miners', 'Probe drilling, pumping, escape routes'),
+                     ('Entrapment and emergency escape', 'Miners', 'Tracking system, refuge, mine rescue team')])),
+                _RISK_LEGEND,
+                ('check', 'Pre-shift checks',
+                 ['Workplace examination by a competent person completed', 'Atmosphere tested; ventilation operating', 'Ground conditions checked and supported',
+                  'Communication and tracking system working', 'Self-rescuers and personal gas detectors issued']),
+            ]),
+        'surface_operations': dict(
+            title='Surface Mining Operations Risk Assessment', icon='🚜', ref='MSF',
+            fields=['MINE / PIT / AREA', 'ACTIVITY', 'ASSESSOR', 'DATE', 'SHIFT', 'TEAM MEMBERS'],
+            sections=[
+                ('table', 'Hazards and controls', _RISK_COLS,
+                 _nt_risk_rows([
+                     ('Haul truck and light vehicle collision', 'Drivers, pedestrians', 'Traffic management plan, speed limits, berms, proximity detection'),
+                     ('Highwall or pit slope failure', 'Workers in the pit', 'Geotechnical monitoring, bench design, exclusion zones'),
+                     ('Blasting fly rock and fumes', 'Anyone near blast', 'Blast clearance, exclusion zone, warning signals'),
+                     ('Dust and silica exposure', 'Workers', 'Water sprays, enclosed cabs, respirators, monitoring'),
+                     ('Working near edge and falls from vehicles', 'Workers', 'Edge protection, three points of contact, harnesses'),
+                     ('Noise, heat and fatigue', 'Workers', 'Hearing protection, hydration, shift management'),
+                     ('Electrical hazards (overhead lines, cables)', 'Operators', 'Isolation, clearance distances, supervision')])),
+                _RISK_LEGEND,
+                ('check', 'Pre-shift checks',
+                 ['Vehicle pre-use inspection completed', 'Haul roads, berms and drainage checked', 'Blast areas cleared and secured',
+                  'Fatigue and fitness for work confirmed', 'Radio communication tested']),
+            ]),
+    }
+
+    def get_risk_assessments(self):
+        return self._render_all()
+
+
+class MiningEnhancedSpecializedTemplates(_NewTemplateBase):
+    """ID: mining_get_mining_specialized_tailings_management_plan"""
+    DOCS = {
+        'tailings_management_plan': dict(
+            title='Tailings Management Plan', icon='🏔️', ref='TMP',
+            fields=['MINE / TAILINGS STORAGE FACILITY (TSF)', 'RESPONSIBLE ENGINEER', 'FACILITY TYPE (dam / dry stack / paste)', 'CONSEQUENCE CLASSIFICATION', 'ISSUE DATE', 'REVIEW DATE'],
+            sections=[
+                ('table', 'Hazards and controls',
+                 ['Hazard', 'Control measure'],
+                 [['Embankment or dam failure', 'Design by qualified engineer, independent review, freeboard and stability monitoring'],
+                  ['Overtopping / flood', 'Spillway capacity, water balance, storm monitoring'],
+                  ['Seepage and contamination of groundwater', 'Liner, drains, monitoring bores, water treatment'],
+                  ['Dust from dry tailings surfaces', 'Dust suppression, revegetation, wind monitoring'],
+                  ['Drowning, entrapment in tailings', 'Access control, signage, rescue equipment, no solitary work'],
+                  ['Pipeline leaks and spills', 'Pipe inspection, leak detection, secondary containment']]),
+                ('table', 'Monitoring programme',
+                 ['Parameter', 'Method', 'Frequency', 'Trigger level', 'Action'],
+                 [['Pond water level and freeboard', 'Survey / gauge', 'Daily', '', ''], ['Piezometer (pore pressure) readings', 'Instruments', 'Weekly', '', ''],
+                  ['Embankment settlement and cracking', 'Visual and survey', 'Weekly', '', ''], ['Seepage and groundwater quality', 'Sampling', 'Monthly', '', '']]),
+                ('check', 'Governance',
+                 ['Responsible engineer and accountable executive appointed', 'Operations, maintenance and surveillance manual in place', 'Independent annual inspection and periodic safety review',
+                  'Emergency preparedness and response plan for dam break, tested with local community and authorities', 'Closure plan and financial provision documented']),
+            ]),
+    }
+
+    def get_mining_specialized(self):
+        return self._render_all()
+
+
+# =============================================================================================
+# AGRICULTURE  (the backend had no agriculture classes at all)
+# =============================================================================================
+
+class AgricultureRiskAssessment(_NewTemplateBase):
+    """IDs: agriculture_get_risk_assessments_machinery_safety / grain_handling_safety / harvesting_safety / barn_safety"""
+    DOCS = {
+        'machinery_safety': dict(
+            title='Farm Machinery Safety Assessment', icon='🚜', ref='AGM',
+            fields=['FARM / LOCATION', 'MACHINE / IMPLEMENT', 'OPERATOR(S)', 'ASSESSOR', 'DATE', 'TASK'],
+            sections=[
+                ('table', 'Hazards and controls', _RISK_COLS,
+                 _nt_risk_rows([
+                     ('Tractor rollover', 'Operator', 'Rollover protective structure (ROPS) and seat belt, slope limits, safe speed'),
+                     ('Entanglement in PTO shafts and moving parts', 'Operator, bystanders', 'PTO guards in place, engine off before cleaning or adjusting'),
+                     ('Crushing during hitching or under raised implements', 'Operator', 'Locks and supports, never work under unsupported load'),
+                     ('Runover and bystander injury', 'Children, workers', 'Keep people clear, rear visibility, no passengers'),
+                     ('Noise and vibration', 'Operator', 'Cab, hearing protection, maintenance'),
+                     ('Fire and fuel handling', 'Operator', 'No smoking, fire extinguisher, safe refuelling')])),
+                _RISK_LEGEND,
+                ('check', 'Daily checks',
+                 ['Guards, shields and safety devices in place', 'Brakes, steering, lights and horn work', 'ROPS and seat belt in good condition',
+                  'Hydraulic leaks and tyre condition checked', 'Operator trained and authorised for the machine', 'Lock-out of power before maintenance']),
+            ]),
+        'grain_handling_safety': dict(
+            title='Grain Handling Safety Assessment', icon='🌾', ref='AGG',
+            fields=['FARM / FACILITY', 'STORAGE TYPE (bin / silo / bunker)', 'PERSONS INVOLVED', 'ASSESSOR', 'DATE', 'TASK'],
+            sections=[
+                ('table', 'Hazards and controls', _RISK_COLS,
+                 _nt_risk_rows([
+                     ('Engulfment in flowing grain', 'Worker entering bin', 'Never enter a bin while equipment runs; lock out; lifeline and observer'),
+                     ('Grain dust explosion', 'Workers, facility', 'Dust control, housekeeping, no ignition sources, explosion venting'),
+                     ('Oxygen deficiency and toxic gas in bins', 'Worker entering bin', 'Confined space permit, gas testing, ventilation'),
+                     ('Auger and conveyor entanglement', 'Operators', 'Guarding, emergency stop, lock-out'),
+                     ('Falls from bins and ladders', 'Workers', 'Ladders in good condition, fall arrest, safe access'),
+                     ('Fungal spores and dust inhalation', 'Workers', 'Respirators, ventilation, wetting dust')])),
+                _RISK_LEGEND,
+                ('check', 'Before bin entry',
+                 ['Entry permit issued; all power locked out and tagged', 'Grain flow stopped and verified; no crusts or bridges present',
+                  'Atmosphere tested; ventilation running', 'Trained observer outside; rescue plan and equipment ready', 'Harness and lifeline worn']),
+            ]),
+        'harvesting_safety': dict(
+            title='Harvesting Safety Assessment', icon='🌽', ref='AGH',
+            fields=['FARM / FIELD', 'CROP', 'HARVEST METHOD (machine / manual)', 'TEAM SIZE', 'ASSESSOR', 'DATE'],
+            sections=[
+                ('table', 'Hazards and controls', _RISK_COLS,
+                 _nt_risk_rows([
+                     ('Combine / harvester entanglement and fire', 'Operators', 'Guards, clean chaff build-up, fire extinguisher, lock-out for blockages'),
+                     ('Heat stress and dehydration', 'All workers', 'Water, shade, rest breaks, work-hour planning'),
+                     ('Manual handling and repetitive work', 'Pickers', 'Rotation, aids, correct techniques'),
+                     ('Sharp tools and cuts', 'Pickers', 'Gloves, safe storage, training'),
+                     ('Vehicle and trailer movements in fields', 'Workers', 'Traffic plan, spotter, visibility'),
+                     ('Pesticide residues and re-entry', 'Workers', 'Respect re-entry intervals, signs, PPE'),
+                     ('Insect, snake and animal bites', 'Workers', 'Awareness, boots, first aid')])),
+                _RISK_LEGEND,
+                ('check', 'Before the shift',
+                 ['Weather forecast checked; heat plan ready', 'Equipment inspected and guards fitted', 'First aid kit and communication available in the field',
+                  'Workers briefed on hazards, emergency contact and meeting point']),
+            ]),
+        'barn_safety': dict(
+            title='Barn Safety Assessment', icon='🏚️', ref='AGB',
+            fields=['FARM / BARN', 'BARN USE (livestock / hay / equipment)', 'ASSESSOR', 'DATE', 'PERSONS WORKING IN BARN', 'LAST INSPECTION'],
+            sections=[
+                ('table', 'Hazards and controls', _RISK_COLS,
+                 _nt_risk_rows([
+                     ('Fire in hay or equipment storage', 'Workers, animals', 'No smoking, electrical inspection, extinguishers, hay moisture checks'),
+                     ('Falls from lofts and openings', 'Workers', 'Guard hay holes, secure ladders, lighting'),
+                     ('Animal handling injuries', 'Workers', 'Handling facilities, training, calm handling'),
+                     ('Manure gas (hydrogen sulphide, methane)', 'Workers', 'Ventilation, no entry to pits without precautions'),
+                     ('Electrical faults', 'Workers, animals', 'Inspection, RCDs, protected wiring'),
+                     ('Slips and trips', 'Workers', 'Drainage, lighting, clear walkways'),
+                     ('Structural collapse', 'Workers', 'Inspect roof and beams, repairs')])),
+                _RISK_LEGEND,
+                ('check', 'Safety features',
+                 ['Fire exits clear and extinguishers serviced', 'Lighting adequate', 'Ventilation working', 'Electrical panels and cables safe from rodents and moisture',
+                  'Emergency contact numbers displayed', 'Evacuation plan includes animals where safe']),
+            ]),
+    }
+
+    def get_risk_assessments(self):
+        return self._render_all()
+
+
+class AgricultureSpecializedTemplates(_NewTemplateBase):
+    """IDs: agriculture_get_agriculture_specialized_pesticide_safety_plan / livestock_safety_plan / irrigation_safety_plan / chemical_storage_safety_plan"""
+    DOCS = {
+        'pesticide_safety_plan': dict(
+            title='Pesticide Safety Plan', icon='🧴', ref='APS',
+            fields=['FARM / SITE', 'PESTICIDE APPLICATOR(S)', 'LICENCE / CERTIFICATION NO.', 'CROP / TARGET AREA', 'PLAN DATE', 'REVIEW DATE'],
+            sections=[
+                ('table', 'Product register',
+                 ['Product', 'Active ingredient', 'Hazard class / signal word', 'Re-entry interval', 'Pre-harvest interval', 'PPE required'],
+                 [['', '', '', '', '', ''], ['', '', '', '', '', '']]),
+                ('check', 'Before application',
+                 ['Label read; use only according to the label and local law', 'Applicator trained and certified; fit for respirator use',
+                  'Weather checked: avoid wind drift, rain and temperature extremes', 'Neighbours, water bodies and sensitive areas identified; buffers observed',
+                  'Equipment calibrated and checked for leaks', 'Warning signs posted; re-entry restrictions communicated']),
+                ('check', 'Mixing, application and cleaning',
+                 ['Mix in a ventilated area with PPE: gloves, goggles, respirator, coverall', 'Use closed transfer where possible; avoid spills',
+                  'Triple-rinse empty containers; use rinsate in the tank', 'Wash equipment away from water sources', 'Wash hands and shower after work; wash PPE separately']),
+                ('table', 'Emergency',
+                 ['Situation', 'Action'],
+                 [['Skin contact', 'Remove contaminated clothes, wash with soap and water for 15 minutes'], ['Eye contact', 'Rinse eyes for 15 minutes, seek medical help'],
+                  ['Inhalation or ingestion', 'Move to fresh air, do not induce vomiting unless the label says so, call poison centre'], ['Spill', 'Contain, absorb, collect for disposal, prevent entry to drains and water']]),
+                ('lines', 'Records', ['Record product, rate, area, date, weather, applicator and re-entry interval for every application, and keep records as required by law.']),
+            ]),
+        'livestock_safety_plan': dict(
+            title='Livestock Safety Plan', icon='🐄', ref='ALS',
+            fields=['FARM / LOCATION', 'ANIMAL TYPES', 'PLAN OWNER', 'NUMBER OF WORKERS', 'PLAN DATE', 'REVIEW DATE'],
+            sections=[
+                ('table', 'Hazards and controls',
+                 ['Hazard', 'Control measure'],
+                 [['Kicks, bites, crush and trampling', 'Low-stress handling, proper yards and crushes, escape routes, training'],
+                  ['Zoonotic diseases (e.g. brucellosis, Q fever, leptospirosis)', 'Hygiene, gloves, vaccination, protect open wounds, report symptoms'],
+                  ['Birthing and veterinary work', 'Restraint, PPE, sharps handling, vet instructions'],
+                  ['Manure gases and confined pits', 'Ventilation, no entry without permit and gas testing'],
+                  ['Working alone with animals', 'Check-in system, mobile communication'],
+                  ['Animal transport and loading', 'Ramps, non-slip floors, trained handlers']]),
+                ('check', 'Facilities and practices',
+                 ['Handling yards, crushes and gates in good repair', 'Non-slip flooring and good lighting', 'Clear exit routes from pens and yards',
+                  'Bulls and aggressive animals segregated and signed', 'Visitors and children kept away from animal areas', 'First aid kit and emergency numbers available']),
+            ]),
+        'irrigation_safety_plan': dict(
+            title='Irrigation Safety Plan', icon='💧', ref='AIR',
+            fields=['FARM / FIELD', 'IRRIGATION TYPE (pivot / drip / flood / pump)', 'PLAN OWNER', 'WATER SOURCE', 'PLAN DATE', 'REVIEW DATE'],
+            sections=[
+                ('table', 'Hazards and controls',
+                 ['Hazard', 'Control measure'],
+                 [['Electrocution from pumps, panels and overhead lines', 'RCD protection, qualified electrician, lock-out, keep pipes and booms clear of power lines'],
+                  ['Drowning in canals, ponds and tanks', 'Fencing, signs, rescue equipment, no solitary work'],
+                  ['Entanglement in pump shafts and drives', 'Guards and lock-out before maintenance'],
+                  ['Pressurised pipes and fittings failure', 'Pressure ratings, inspection, release pressure before repairs'],
+                  ['Fertigation and chemigation chemicals', 'Backflow prevention, labelling, PPE, interlocks'],
+                  ['Slips and unstable ground at banks and channels', 'Safe access, footwear, drainage']]),
+                ('check', 'Routine checks',
+                 ['Electrical equipment weatherproof and earthed', 'Guards fitted on pumps and drives', 'Backflow preventers tested', 'Warning signs at open water and treated areas',
+                  'Workers trained in electrical safety and emergency response', 'Lock-out of power and pressure before maintenance']),
+            ]),
+        'chemical_storage_safety_plan': dict(
+            title='Agricultural Chemical Storage Safety Plan', icon='🏭', ref='ACS',
+            fields=['FARM / STORE LOCATION', 'STORE RESPONSIBLE PERSON', 'CHEMICAL TYPES', 'MAX QUANTITY', 'PLAN DATE', 'REVIEW DATE'],
+            sections=[
+                ('check', 'Store construction and location',
+                 ['Locked, dry, ventilated store with a bunded floor to contain spills', 'Away from houses, animal housing, food, feed and water sources',
+                  'Non-combustible construction, fire extinguisher and warning signs outside', 'Shelves of non-absorbent material; heavy containers on lower shelves']),
+                ('check', 'Storage practices',
+                 ['Chemicals stored in original, labelled containers', 'Incompatible chemicals segregated (e.g. oxidisers from flammables, acids from alkalis)',
+                  'Inventory kept up to date; SDS available at the entrance', 'First in, first out; expired products disposed of through approved routes',
+                  'Fuel and fertiliser not stored with pesticides']),
+                ('table', 'Spill and emergency kit',
+                 ['Item', 'Present', 'Checked'],
+                 [['Absorbent material and shovel', 'Y / N', ''], ['Heavy-duty gloves, goggles, respirator', 'Y / N', ''], ['Waste bags and labels', 'Y / N', ''], ['Eyewash and water supply', 'Y / N', ''], ['Emergency contact numbers', 'Y / N', '']]),
+                ('lines', 'Disposal', ['Empty containers are triple-rinsed and returned to collection schemes where available; never reuse them for food, feed or water.']),
+            ]),
+    }
+
+    def get_agriculture_specialized(self):
+        return self._render_all()
+
+
+# =============================================================================================
+# AVIATION / MARITIME
+# =============================================================================================
+
+class AviationEnhancedSpecializedTemplates(_NewTemplateBase):
+    """ID: aviation_get_aviation_specialized_hangar_safety_plan"""
+    DOCS = {
+        'hangar_safety_plan': dict(
+            title='Hangar Safety Plan', icon='✈️', ref='AHG',
+            fields=['AIRPORT / HANGAR', 'OPERATOR / MRO', 'HANGAR MANAGER', 'PLAN DATE', 'AIRCRAFT TYPES', 'REVIEW DATE'],
+            sections=[
+                ('table', 'Hazards and controls',
+                 ['Hazard', 'Control measure'],
+                 [['Fire (fuel, solvents, hot work)', 'Hot work permit, fire suppression, extinguishers, fuel handling rules, no smoking'],
+                  ['Aircraft movement and towing', 'Tow plan, wing walkers, chocks, communication, speed limit'],
+                  ['Falls from height (wings, tail, docks)', 'Docks and stands, fall arrest, edge protection'],
+                  ['Hazardous materials (fuel, hydraulic fluid, solvents)', 'SDS, labelled storage, spill kits, ventilation'],
+                  ['Engine runs and noise', 'Run-up procedure, hearing protection, exhaust extraction'],
+                  ['Electrical, compressed air and ground power', 'Inspection, lock-out, cable management'],
+                  ['Foreign object damage (FOD)', 'FOD walks, tool control, housekeeping']]),
+                ('check', 'Daily hangar checks',
+                 ['Fire detection, suppression systems and extinguishers in service', 'Fuel, chemical and paint stores compliant', 'Floors clean and free of oil, FOD and trip hazards',
+                  'Tow equipment and ground support equipment inspected', 'Aircraft jacks, stands and docks inspected and tagged', 'Emergency exits and eyewash stations clear',
+                  'Tool control and calibration records up to date']),
+                ('table', 'Emergency response',
+                 ['Event', 'Initial action'],
+                 [['Fuel spill', 'Stop work, isolate ignition, contain and clean, report'], ['Fire', 'Raise alarm, activate suppression, evacuate, call fire service'], ['Personal injury', 'First aid, call emergency number, protect the scene']]),
+            ]),
+    }
+
+    def get_aviation_specialized(self):
+        return self._render_all()
+
+
+class MaritimeEnhancedRiskAssessment(_NewTemplateBase):
+    """ID: maritime_get_risk_assessments_vessel_safety"""
+    DOCS = {
+        'vessel_safety': dict(
+            title='Vessel Safety Risk Assessment', icon='🚢', ref='MVS',
+            fields=['VESSEL NAME / IMO', 'VOYAGE / LOCATION', 'ACTIVITY', 'ASSESSOR (Master / Officer)', 'DATE', 'CREW INVOLVED'],
+            sections=[
+                ('table', 'Hazards and controls', _RISK_COLS,
+                 _nt_risk_rows([
+                     ('Fire on board', 'Crew, vessel', 'Fire detection, fixed systems, drills, hot work permits'),
+                     ('Collision or grounding', 'Crew, vessel, environment', 'Navigation watch, passage plan, ECDIS and radar, COLREGS'),
+                     ('Man overboard', 'Crew', 'Lifejackets, lifebuoys, safety lines, MOB drills'),
+                     ('Enclosed space entry', 'Crew', 'Permit to enter, gas testing, ventilation, rescue plan'),
+                     ('Heavy weather and loss of stability', 'Crew, vessel', 'Weather routeing, stability calculations, securing cargo'),
+                     ('Mooring and anchoring accidents', 'Deck crew', 'Snap-back zones, trained crew, equipment inspection'),
+                     ('Fatigue', 'Crew', 'Rest hours monitored, watch schedules')])),
+                _RISK_LEGEND,
+                ('check', 'Before departure',
+                 ['Safety equipment inspected: lifeboats, liferafts, EPIRB, fire fighting', 'Muster list and emergency plans current; drills recorded',
+                  'Passage plan approved and weather reviewed', 'Crew certificates valid and rest hours compliant', 'Cargo secured and stability checked']),
+            ]),
+    }
+
+    def get_risk_assessments(self):
+        return self._render_all()
+
+
+class MaritimeEnhancedSpecializedTemplates(_NewTemplateBase):
+    """ID: maritime_get_maritime_specialized_environmental_safety_plan"""
+    DOCS = {
+        'environmental_safety_plan': dict(
+            title='Maritime Environmental Safety Plan', icon='🌊', ref='MEN',
+            fields=['VESSEL / FACILITY', 'IMO / ID', 'ENVIRONMENTAL OFFICER', 'PLAN DATE', 'FLAG / AUTHORITY', 'REVIEW DATE'],
+            sections=[
+                ('table', 'Pollution sources and controls (MARPOL)',
+                 ['Source', 'Requirement', 'Control measure'],
+                 [['Oil (bilge, fuel, oily waste) - Annex I', 'Oily water separator, oil record book', 'Never discharge outside limits; maintain equipment'],
+                  ['Garbage and plastics - Annex V', 'Garbage management plan and record book', 'Segregate, store, discharge only where permitted'],
+                  ['Sewage - Annex IV', 'Approved treatment plant or holding tank', 'Discharge only in permitted areas'],
+                  ['Air emissions (SOx, NOx) - Annex VI', 'Fuel sulphur limits, engine certificates', 'Compliant fuel, scrubber or alternative'],
+                  ['Ballast water', 'Ballast water management plan', 'Exchange or treatment as required'],
+                  ['Noxious liquid substances - Annex II', 'Procedures and arrangements manual', 'Follow cargo and tank cleaning procedures']]),
+                ('check', 'Spill prevention and response',
+                 ['Shipboard oil pollution emergency plan (SOPEP) onboard and understood', 'Spill response equipment accessible and checked',
+                  'Bunkering procedure used with checklist; scuppers plugged and drip trays used', 'Spill drills held; contacts to authorities listed',
+                  'Records kept: oil record book, garbage record book, ballast water record']),
+                ('table', 'Emergency contacts',
+                 ['Authority / contact', 'Phone / VHF channel'],
+                 [['Coastal state / port authority', ''], ['Company designated person', ''], ['Pollution response contractor', ''], ['Flag state', '']]),
+            ]),
+    }
+
+    def get_maritime_specialized(self):
+        return self._render_all()
 
 
 __all__ = [

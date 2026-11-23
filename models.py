@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 from flask import current_app
 # SQLAlchemy utilities (if needed for specific column types)
 from sqlalchemy import Text, Float, Integer, String, Boolean, DateTime, ForeignKey, Numeric, UniqueConstraint
-from sqlalchemy.orm import relationship, backref
+from sqlalchemy.orm import relationship, backref, validates
 from extensions import db
 # Optional: If you use any JSON fields
 from sqlalchemy.dialects.sqlite import JSON
@@ -3066,6 +3066,8 @@ class ComplianceReport(db.Model):
     __tablename__ = 'compliance_reports'
     
     id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), nullable=True, index=True)  # tenant (2026-11-22)
+    created_by = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=True)  # (2026-11-22)
     report_type = db.Column(db.String(100), nullable=False)
     period = db.Column(db.String(50), nullable=False)  # "January 2024", "Q1 2024", etc.
     status = db.Column(db.String(20), nullable=False)  # draft, submitted, under_review, approved, rejected
@@ -3152,6 +3154,7 @@ class ComplianceAutomationSettings(db.Model):
     __tablename__ = 'compliance_automation_settings'
     
     id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), nullable=True, index=True)  # tenant (2026-11-22)
     auto_reporting_enabled = db.Column(db.Boolean, default=True)
     ai_review_enabled = db.Column(db.Boolean, default=True)
     alert_thresholds = db.Column(db.Text)  # JSON string
@@ -3607,6 +3610,7 @@ class ThermalComfortLog(db.Model):
     __tablename__ = 'thermal_comfort_logs'
     
     id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), nullable=True, index=True)  # tenant (2026-11-22)
     location_id = db.Column(db.String(100), nullable=False)
     location_name = db.Column(db.String(200))
     building_zone = db.Column(db.String(100))
@@ -3706,6 +3710,7 @@ class UrbanHeatIslandRecord(db.Model):
     __tablename__ = 'urban_heat_island_records'
     
     id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), nullable=True, index=True)  # tenant (2026-11-22)
     location_id = db.Column(db.String(100), nullable=False)
     city_area = db.Column(db.String(200))
     
@@ -3850,6 +3855,7 @@ class ThermalAnomaly(db.Model):
     __tablename__ = 'thermal_anomalies'
     
     id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), nullable=True, index=True)  # tenant (2026-11-22)
     location_id = db.Column(db.String(100), nullable=False)
     anomaly_type = db.Column(db.String(50))  # 'extreme_heat', 'extreme_cold', 'heat_island', 'temperature_spike'
     
@@ -3902,6 +3908,7 @@ class ThermalRecommendation(db.Model):
     __tablename__ = 'thermal_recommendations'
     
     id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), nullable=True, index=True)  # tenant (2026-11-22)
     location_id = db.Column(db.String(100), nullable=False)
     
     # Recommendation details
@@ -3948,6 +3955,7 @@ class BuildingThermalProfile(db.Model):
     __tablename__ = 'building_thermal_profiles'
     
     id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), nullable=True, index=True)  # tenant (2026-11-22)
     building_id = db.Column(db.String(100), unique=True, nullable=False)
     building_name = db.Column(db.String(200))
     building_type = db.Column(db.String(50))  # 'residential', 'commercial', 'industrial', 'institutional'
@@ -5375,6 +5383,7 @@ class ThermalSensor(db.Model):
     __tablename__ = 'thermal_sensors'
     
     id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), nullable=True, index=True)  # tenant (2026-11-22)
     sensor_id = db.Column(db.String(50), unique=True, nullable=False)
     name = db.Column(db.String(100), nullable=False)
     location = db.Column(db.String(200))
@@ -5428,6 +5437,7 @@ class ThermalReading(db.Model):
     __tablename__ = 'thermal_readings'
     
     id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), nullable=True, index=True)  # tenant (2026-11-22)
     sensor_id = db.Column(db.String(50), db.ForeignKey('thermal_sensors.sensor_id'), nullable=False)
     temperature = db.Column(db.Float, nullable=False)
     humidity = db.Column(db.Float)
@@ -5452,6 +5462,7 @@ class ThermalAlert(db.Model):
     __tablename__ = 'thermal_alerts'
     
     id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), nullable=True, index=True)  # tenant (2026-11-22)
     sensor_id = db.Column(db.String(50), db.ForeignKey('thermal_sensors.sensor_id'), nullable=False)
     alert_type = db.Column(db.String(50))  # high_temp, low_temp, rapid_change, battery_low
     severity = db.Column(db.String(20))  # info, warning, critical
@@ -5483,6 +5494,7 @@ class ThermalAnalysis(db.Model):
     __tablename__ = 'thermal_analyses'
     
     id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id'), nullable=True, index=True)  # tenant (2026-11-22)
     location_id = db.Column(db.String(100))
     analysis_type = db.Column(db.String(50))  # satellite, sensor_fusion, predictive
     mean_temperature = db.Column(db.Float)
@@ -7781,6 +7793,222 @@ class ConsentRecord(db.Model):
         db.Index('ix_consent_user_doc_time', 'user_id', 'doc_type', 'accepted_at'),
     )
 
+
+class BillingNotice(db.Model):
+    """One row per billing email/notice, so each is sent exactly once per billing period.
+
+    subject_key  'user:<id>' or 'company:<id>' (never NULL, so the unique constraint works)
+    notice_type  activated | due_7 | due_3 | due_1 | due_today | expired
+    period_key   billing period end date 'YYYY-MM-DD'
+    The unique constraint also stops duplicate emails when several gunicorn workers
+    run the billing job at the same time.
+    """
+    __tablename__ = 'billing_notices'
+
+    id          = db.Column(db.Integer, primary_key=True)
+    subject_key = db.Column(db.String(40), nullable=False)
+    user_id     = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='CASCADE'), nullable=True, index=True)
+    company_id  = db.Column(db.Integer, db.ForeignKey('companies.id', ondelete='CASCADE'), nullable=True, index=True)
+    notice_type = db.Column(db.String(32), nullable=False)
+    period_key  = db.Column(db.String(32), nullable=False)
+    recipients  = db.Column(db.Text, nullable=True)
+    status      = db.Column(db.String(16), nullable=False, default='pending')   # pending | sent | failed
+    attempts    = db.Column(db.Integer, nullable=False, default=0)
+    last_error  = db.Column(db.Text, nullable=True)
+    claimed_at  = db.Column(db.DateTime, nullable=True)
+    sent_at     = db.Column(db.DateTime, nullable=True)
+    created_at  = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+    __table_args__ = (
+        db.UniqueConstraint('subject_key', 'notice_type', 'period_key', name='uq_billing_notice'),
+    )
+
+
+class AuditLog(db.Model):
+    """General audit trail (profile/password changes, uploads, subscription changes, admin actions,
+    hospital security events). Used by app.py via AuditLog(...) and AuditLog.query."""
+    __tablename__ = 'audit_logs'
+
+    id             = db.Column(db.Integer, primary_key=True)
+    user_id        = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True, index=True)
+    target_user_id = db.Column(db.Integer, nullable=True, index=True)
+    hospital_id    = db.Column(db.Integer, nullable=True, index=True)
+    action         = db.Column(db.String(100), nullable=False, index=True)
+    resource_type  = db.Column(db.String(64), nullable=True)
+    resource_id    = db.Column(db.String(255), nullable=True)
+    details        = db.Column(db.Text, nullable=True)          # JSON text
+    ip_address     = db.Column(db.String(64), nullable=True)
+    user_agent     = db.Column(db.Text, nullable=True)
+    created_at     = db.Column(db.DateTime, nullable=False, default=datetime.utcnow, index=True)
+
+    @validates('details')
+    def _coerce_details(self, key, value):
+        # Callers pass json.dumps(...) strings or plain dicts; store both as JSON text
+        if value is None or isinstance(value, str):
+            return value
+        return json.dumps(value, default=str)
+
+    @validates('resource_id')
+    def _coerce_resource_id(self, key, value):
+        return None if value is None else str(value)
+
+    def to_dict(self):
+        try:
+            details = json.loads(self.details) if self.details else None
+        except (TypeError, ValueError):
+            details = self.details
+        return {
+            'id': self.id,
+            'user_id': self.user_id,
+            'target_user_id': self.target_user_id,
+            'hospital_id': self.hospital_id,
+            'action': self.action,
+            'resource_type': self.resource_type,
+            'resource_id': self.resource_id,
+            'details': details,
+            'ip_address': self.ip_address,
+            'user_agent': self.user_agent,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+# ============================================================================
+# DOCUMENT SUBMISSION / SIGNING CYCLE (2026-11-21)
+#   contractor company -> client organisations -> invited client reviewers
+#   document -> submission -> ordered signers -> signed/stamped PDF + certificate
+# ============================================================================
+class ClientOrganization(db.Model):
+    """A client of a contractor company (e.g. QatarEnergy for SafeTrack Pro Global)."""
+    __tablename__ = 'client_organizations'
+
+    id            = db.Column(db.Integer, primary_key=True)
+    company_id    = db.Column(db.Integer, db.ForeignKey('companies.id', ondelete='CASCADE'), nullable=False, index=True)
+    name          = db.Column(db.String(255), nullable=False)
+    project_name  = db.Column(db.String(255), nullable=True)
+    contact_email = db.Column(db.String(255), nullable=True)
+    notes         = db.Column(db.Text, nullable=True)
+    is_active     = db.Column(db.Boolean, nullable=False, default=True)
+    created_by    = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    created_at    = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    updated_at    = db.Column(db.DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (db.UniqueConstraint('company_id', 'name', name='uq_client_org_company_name'),)
+
+
+class ClientMember(db.Model):
+    """A person at a client organisation who can review/sign documents sent by the contractor."""
+    __tablename__ = 'client_members'
+
+    id                = db.Column(db.Integer, primary_key=True)
+    client_org_id     = db.Column(db.Integer, db.ForeignKey('client_organizations.id', ondelete='CASCADE'), nullable=False, index=True)
+    company_id        = db.Column(db.Integer, db.ForeignKey('companies.id', ondelete='CASCADE'), nullable=False, index=True)
+    user_id           = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
+    job_title         = db.Column(db.String(128), nullable=True)
+    status            = db.Column(db.String(20), nullable=False, default='invited')   # invited | active | removed
+    invite_token_hash = db.Column(db.String(128), nullable=True, index=True)
+    invite_expires_at = db.Column(db.DateTime, nullable=True)
+    invited_by        = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    invited_at        = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    accepted_at       = db.Column(db.DateTime, nullable=True)
+
+    __table_args__ = (db.UniqueConstraint('client_org_id', 'user_id', name='uq_client_member_org_user'),)
+
+
+class DocumentSubmission(db.Model):
+    """A document sent to one or more people (in order) for review / signature / stamp."""
+    __tablename__ = 'document_submissions'
+
+    id                = db.Column(db.Integer, primary_key=True)
+    reference         = db.Column(db.String(40), nullable=False, unique=True)
+    document_id       = db.Column(db.Integer, db.ForeignKey('documents.id', ondelete='CASCADE'), nullable=False, index=True)
+    company_id        = db.Column(db.Integer, db.ForeignKey('companies.id', ondelete='CASCADE'), nullable=True, index=True)
+    client_org_id     = db.Column(db.Integer, db.ForeignKey('client_organizations.id', ondelete='SET NULL'), nullable=True)
+    title             = db.Column(db.String(255), nullable=False)
+    message           = db.Column(db.Text, nullable=True)
+    status            = db.Column(db.String(30), nullable=False, default='in_review', index=True)
+    # in_review | approved | rejected | withdrawn
+    current_order     = db.Column(db.Integer, nullable=False, default=1)
+    due_date          = db.Column(db.DateTime, nullable=True)
+    submitted_by      = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    submitted_at      = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    completed_at      = db.Column(db.DateTime, nullable=True)
+    base_version      = db.Column(db.Integer, nullable=True)
+    final_file_url    = db.Column(db.String(500), nullable=True)
+    final_file_hash   = db.Column(db.String(128), nullable=True)
+    in_approved_list  = db.Column(db.Boolean, nullable=False, default=False)
+    created_at        = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    updated_at        = db.Column(db.DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class SubmissionSigner(db.Model):
+    """One person in a submission's ordered signing list."""
+    __tablename__ = 'submission_signers'
+
+    id             = db.Column(db.Integer, primary_key=True)
+    submission_id  = db.Column(db.Integer, db.ForeignKey('document_submissions.id', ondelete='CASCADE'), nullable=False, index=True)
+    sign_order     = db.Column(db.Integer, nullable=False, default=1)
+    user_id        = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True, index=True)
+    name           = db.Column(db.String(255), nullable=False)
+    email          = db.Column(db.String(255), nullable=False)
+    organization   = db.Column(db.String(255), nullable=True)
+    signer_type    = db.Column(db.String(20), nullable=False, default='internal')   # internal | client
+    action         = db.Column(db.String(20), nullable=False, default='sign')       # sign | stamp | sign_and_stamp | review
+    status         = db.Column(db.String(20), nullable=False, default='waiting')    # waiting | pending | approved | rejected | cancelled
+    comment        = db.Column(db.Text, nullable=True)
+    notified_at    = db.Column(db.DateTime, nullable=True)
+    reminder_count = db.Column(db.Integer, nullable=False, default=0)
+    viewed_at      = db.Column(db.DateTime, nullable=True)
+    acted_at       = db.Column(db.DateTime, nullable=True)
+    ip_address     = db.Column(db.String(64), nullable=True)
+    user_agent     = db.Column(db.String(512), nullable=True)
+    signed_file_hash = db.Column(db.String(128), nullable=True)
+
+
+class WorkPermit(db.Model):
+    """Permit to work (standard international types). Structured data lives in `data` (JSON text);
+    the printable permit is a Document (document_type='permit') approved via DocumentSubmission."""
+    __tablename__ = 'work_permits'
+
+    id               = db.Column(db.Integer, primary_key=True)
+    company_id       = db.Column(db.Integer, db.ForeignKey('companies.id', ondelete='CASCADE'), nullable=True, index=True)
+    permit_number    = db.Column(db.String(40), nullable=False)
+    permit_type      = db.Column(db.String(40), nullable=False)
+    title            = db.Column(db.String(255), nullable=False)
+    location         = db.Column(db.String(255), nullable=True)
+    work_description = db.Column(db.Text, nullable=True)
+    start_at         = db.Column(db.DateTime, nullable=True)
+    end_at           = db.Column(db.DateTime, nullable=True)
+    status           = db.Column(db.String(20), nullable=False, default='draft', index=True)
+    # draft | in_approval | approved | active | suspended | closed | rejected | cancelled
+    risk_level       = db.Column(db.String(20), nullable=True)
+    data             = db.Column(db.Text, nullable=True)            # JSON: hazards, precautions, gas tests, ...
+    document_id      = db.Column(db.Integer, db.ForeignKey('documents.id', ondelete='SET NULL'), nullable=True, index=True)
+    created_by       = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    created_at       = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    updated_at       = db.Column(db.DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+    activated_at     = db.Column(db.DateTime, nullable=True)
+    closed_at        = db.Column(db.DateTime, nullable=True)
+    closed_by        = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    close_notes      = db.Column(db.Text, nullable=True)
+
+    __table_args__ = (db.UniqueConstraint('company_id', 'permit_number', name='uq_work_permit_company_number'),)
+
+
+class SigningAsset(db.Model):
+    """A user's saved signature, initials or stamp image (PNG on disk, served only to its owner)."""
+    __tablename__ = 'signing_assets'
+
+    id         = db.Column(db.Integer, primary_key=True)
+    user_id    = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
+    kind       = db.Column(db.String(20), nullable=False)        # signature | initials | stamp
+    label      = db.Column(db.String(120), nullable=True)
+    file_path  = db.Column(db.String(500), nullable=False)
+    width      = db.Column(db.Integer, nullable=True)
+    height     = db.Column(db.Integer, nullable=True)
+    is_default = db.Column(db.Boolean, nullable=False, default=False)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+
 __all__ = [
     # Core models
     'Industry',
@@ -8133,7 +8361,8 @@ __all__ = [
     'EscalationRule', 'EscalationHistory', 'IncidentCost', 'RegulatoryFiling', 'FishboneVersion', 'FishboneFiveWhys', 'AIAssistantSession', 'AIAssistantMessage', 
     'SimilarIncidentMatch', 'IncidentComparison', 'IncidentClusterAnalysis', 'PredictiveAnalyticsRun', 'PredictiveScenario', 'AIGenerationLog', 'EnvironmentalSite', 'HospitalFinancialRecord',
      'PlatformActivityLog', 'PlatformSessionTracking', 'Chemical', 'ChemicalIncident', 'VideoEvidence', 'ConsentRecord',
-    
+    'BillingNotice', 'AuditLog',
+    'ClientOrganization', 'ClientMember', 'DocumentSubmission', 'SubmissionSigner', 'SigningAsset', 'WorkPermit',
 ]
 
 print(f"✅ Models.py loaded with {len(__all__)} models")

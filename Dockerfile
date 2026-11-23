@@ -40,6 +40,10 @@ COPY safetytrack_bridge.py .
 COPY usermodels.py .
 COPY language_middleware.py .
 COPY extensions.py .
+COPY pdf_edit_engine.py .
+COPY permit_templates.py .
+COPY env_documents.py .
+COPY env_analytics.py .
 
 RUN mkdir -p uploads detection_results generated_certificates generated_documents sessions static model_cache
 
