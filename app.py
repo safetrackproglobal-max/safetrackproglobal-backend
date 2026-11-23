@@ -96573,49 +96573,46 @@ class CSPExamEngine:
 # SECTION 5: GRADING AND CERTIFICATE FUNCTIONS
 # ============================================================================
 
+_EXAM_PRACTICE_DISCLAIMER = ('This is a certificate of completion for a practice exam provided by SafeTrack Pro Global. It is not a professional certification, licence, accreditation or CEU award, and it is not affiliated with, endorsed by, or a substitute for the BCSP Certified Safety Professional (CSP®) examination.')
+
+
 def determine_credential_level(score: float) -> Dict[str, Any]:
-    """Determine credential level based on score - CSP Level aligned"""
+    """Practice-exam result band from the score (not a professional credential)."""
     credential_levels = {
         'csp_distinguished': {
             'min_score': 95,
-            'name': 'CSP Distinguished Scholar Credential',
+            'name': 'Distinguished - Safety Practice Exam',
             'validity_months': 36,
-            'ceus_awarded': 5.0,
             'color': '#B8860B'  # Dark gold
         },
         'platinum': {
             'min_score': 90,
-            'name': 'Platinum Safety Professional Credential',
+            'name': 'Platinum - Safety Practice Exam',
             'validity_months': 24,
-            'ceus_awarded': 4.0,
             'color': '#E5E4E2'
         },
         'gold': {
             'min_score': 85,
-            'name': 'Gold Safety Specialist Credential',
+            'name': 'Gold - Safety Practice Exam',
             'validity_months': 18,
-            'ceus_awarded': 3.5,
             'color': '#FFD700'
         },
         'silver': {
             'min_score': 80,
-            'name': 'Silver Safety Practitioner Credential',
+            'name': 'Silver - Safety Practice Exam',
             'validity_months': 12,
-            'ceus_awarded': 3.0,
             'color': '#C0C0C0'
         },
         'bronze': {
             'min_score': 75,
-            'name': 'Bronze Safety Technician Credential',
+            'name': 'Bronze - Safety Practice Exam',
             'validity_months': 12,
-            'ceus_awarded': 2.5,
             'color': '#CD7F32'
         },
         'competent': {
             'min_score': 70,
-            'name': 'Competent Safety Operator Credential',
+            'name': 'Pass - Safety Practice Exam',
             'validity_months': 12,
-            'ceus_awarded': 2.0,
             'color': '#1E3C72'
         }
     }
@@ -96629,10 +96626,9 @@ def determine_credential_level(score: float) -> Dict[str, Any]:
     
     # Below 70%
     return {
-        'level': 'not_certified',
-        'name': 'Not Certified',
+        'level': 'not_passed',
+        'name': 'Not passed - Safety Practice Exam',
         'validity_months': 0,
-        'ceus_awarded': 0,
         'color': '#666666'
     }
 
@@ -96642,7 +96638,7 @@ def generate_professional_certificate_html(certificate_data: Dict[str, Any]) -> 
     """
     credential_level = certificate_data.get('credential_level', 'Platinum')
     credential_color = certificate_data.get('credential_color', '#722ed1')
-    credential_name = certificate_data.get('credential_name', f"{credential_level} Safety Professional Credential")
+    credential_name = certificate_data.get('credential_name', f"{credential_level} LEVEL - Safety Practice Exam")
     
     # Get certificate ID
     certificate_id = certificate_data.get('credential_id', '') or certificate_data.get('certificate_id', '')
@@ -96999,24 +96995,24 @@ def generate_professional_certificate_html(certificate_data: Dict[str, Any]) -> 
 <body>
     <div class="certificate-container">
         <div class="certificate">
-            <div class="watermark">{credential_level} CERTIFIED</div>
+            <div class="watermark">PRACTICE EXAM</div>
             
             <div class="content">
                 <div class="header">
-                    <div class="accreditation">INTERNATIONAL SAFETY STANDARDS BOARD (ISSB)</div>
-                    <div class="iso-badge">ISO/IEC 17024:2012 ACCREDITED</div>
-                    <h1>🏆 PROFESSIONAL CERTIFICATE 🏆</h1>
-                    <div class="subtitle">International Safety Professional Credential (ISPC)</div>
+                    <div class="accreditation">SAFETRACK PRO GLOBAL</div>
+                    <div class="iso-badge">PRACTICE EXAM - NOT AN ACCREDITED CERTIFICATION</div>
+                    <h1>🏆 CERTIFICATE OF COMPLETION 🏆</h1>
+                    <div class="subtitle">Safety Professional Practice Exam (CSP-style)</div>
                 </div>
                 
                 <div class="main-content">
-                    <div class="presented-text">This official credential is awarded to</div>
+                    <div class="presented-text">This certificate of completion is presented to</div>
                     
                     <div class="recipient-name">{certificate_data.get('recipient_name', 'Professional')}</div>
                     
-                    <div class="for-text">for successful completion and demonstration of professional competency in</div>
+                    <div class="for-text">for passing the practice exam</div>
                     
-                    <div class="course-name">ISSB Professional Examination</div>
+                    <div class="course-name">Safety Professional Practice Exam</div>
                     
                     <div class="credential-badge">{credential_name}</div>
                     
@@ -97038,8 +97034,8 @@ def generate_professional_certificate_html(certificate_data: Dict[str, Any]) -> 
                         <div class="signature-box">
                             <div class="signature-image">{signature_director}</div>
                             <div class="signature-name">Dr. Adam Fusheini</div>
-                            <div class="signature-title">Certification Director</div>
-                            <div class="signature-title">International Safety Standards Board</div>
+                            <div class="signature-title">Director</div>
+                            <div class="signature-title">SafeTrack Pro Global</div>
                         </div>
                         
                         <!-- CENTER: Official Digital Seal -->
@@ -97047,24 +97043,24 @@ def generate_professional_certificate_html(certificate_data: Dict[str, Any]) -> 
                             <div class="seal-container">
                                 <span class="seal-icon">🛡️</span>
                             </div>
-                            <div class="signature-name">Official Digital Seal</div>
-                            <div class="signature-title">ISSB Certified</div>
+                            <div class="signature-name">SafeTrack Pro Global</div>
+                            <div class="signature-title">Verifiable record</div>
                         </div>
                         
                         <!-- RIGHT: Mr. Isaac Andoh -->
                         <div class="signature-box">
                             <div class="signature-image">{signature_examiner}</div>
                             <div class="signature-name">Mr. Isaac Andoh</div>
-                            <div class="signature-title">Chief Examinations Officer</div>
-                            <div class="signature-title">Professional Credentialing Authority</div>
+                            <div class="signature-title">Practice Exam Reviewer</div>
+                            <div class="signature-title">SafeTrack Pro Global</div>
                         </div>
                     </div>
                     
                     <div class="verification">
-                        This digital credential can be verified at 
-                        <a href="{certificate_data.get('verification_url', '#')}">{certificate_data.get('verification_url', 'verify.safetyplatform.org')}</a>
+                        This certificate of completion can be verified at
+                        <a href="{certificate_data.get('verification_url', '#')}">{certificate_data.get('verification_url', 'safetrackproglobal.com')}</a>
                         <br/>
-                        QR Code verification ensures authenticity.
+                        This is a certificate of completion for a practice exam provided by SafeTrack Pro Global. It is not a professional certification, licence, accreditation or CEU award, and it is not affiliated with, endorsed by, or a substitute for the BCSP Certified Safety Professional (CSP®) examination.
                     </div>
                 </div>
             </div>
@@ -97107,34 +97103,28 @@ def generate_professional_certificate_knowledge(session: Dict[str, Any],
         if score >= 90:
             credential_level = 'Platinum'
             credential_color = '#722ed1'
-            ceus = 4.0
         elif score >= 85:
             credential_level = 'Gold'
             credential_color = '#fa8c16'
-            ceus = 3.5
         elif score >= 80:
             credential_level = 'Silver'
             credential_color = '#8c8c8c'
-            ceus = 3.0
         elif score >= 75:
             credential_level = 'Bronze'
             credential_color = '#d48806'
-            ceus = 2.5
         elif score >= 70:
             credential_level = 'Competent'
             credential_color = '#389e0d'
-            ceus = 2.0
         else:
-            credential_level = 'Certified'
+            credential_level = 'Completed'
             credential_color = '#1890ff'
-            ceus = 0
         
         # Generate credential ID
-        credential_id = f"CSP-{credential_level[:3].upper()}-{uuid.uuid4().hex[:12].upper()}"
+        credential_id = f"STP-{credential_level[:3].upper()}-{uuid.uuid4().hex[:12].upper()}"
         
         certificate_data = {
             'credential_id': credential_id,
-            'credential_name': f"{credential_level} Safety Professional Credential",
+            'credential_name': f"{credential_level} LEVEL - Safety Practice Exam",
             'credential_level': credential_level,
             'credential_color': credential_color,
             'recipient_name': user_name,
@@ -97144,9 +97134,7 @@ def generate_professional_certificate_knowledge(session: Dict[str, Any],
             'exam_score': round(score, 2),
             'correct_count': grading_result.get('correct_answers', 0),
             'total_count': grading_result.get('total_questions', 0),
-            'ceus_awarded': ceus,
-            'accreditation_body': 'CSP Knowledge Examination System',
-            'standard_compliance': 'ISO/IEC 17024:2012',
+            'certificate_type': 'Practice exam - certificate of completion',
             'verification_url': f"{base_url}/verify/{credential_id}",
             'signature1_url': signature1_url if signature1_exists else '',
             'signature2_url': signature2_url if signature2_exists else '',
@@ -97371,25 +97359,23 @@ def grade_csp_exam_knowledge_with_answers(session: Dict[str, Any], user_answers:
             'total_points_earned': total_points_earned,
             'total_points_possible': total_points_possible,
             'credential': credential,
-            'credential_level': credential['level'] if credential else 'Not Certified',
-            'credential_name': credential['name'] if credential else 'No Credential',
-            'ceus_awarded': credential['ceus_awarded'] if credential else 0,
+            'credential_level': credential['level'] if credential else 'Not passed',
+            'credential_name': credential['name'] if credential else 'Not passed',
             'domain_scores': domain_scores,
             'cognitive_scores': cognitive_scores,
             'professional_metrics': professional_metrics,
             'detailed_results': detailed_results,
             'graded_at': datetime.now().isoformat(),
-            'exam_type': 'CSP Professional Examination - Advanced',
+            'exam_type': 'Safety Professional Practice Exam (CSP-style, advanced)',
             'knowledge_base_verified': True,
             'csp_blueprint_aligned': exam_data.get('csp_blueprint_aligned', False)
         }
         
         # Enhanced professional analysis
         professional_analysis = {
-            'credential_level': credential['level'] if credential else 'Not Certified',
-            'credential_name': credential['name'] if credential else 'No Credential',
-            'ceus_awarded': credential['ceus_awarded'] if credential else 0,
-            'standards_compliance': 'ISO/IEC 17024, ANSI/IACET, ISO 9001, BCSP Blueprint',
+            'credential_level': credential['level'] if credential else 'Not passed',
+            'credential_name': credential['name'] if credential else 'Not passed',
+            'standards_compliance': 'Practice assessment only - not accredited, no CEUs. Topics follow the publicly published CSP exam outline.',
             'strong_domains': [d for d, s in domain_scores.items() if s['percentage'] >= 80],
             'weak_domains': [d for d, s in domain_scores.items() if s['percentage'] < 70],
             'cognitive_analysis': {
@@ -100072,9 +100058,8 @@ def get_exam_results():
         # Add professional info
         professional_analysis = grading_result.get('professional_analysis', {})
         response['professional_analysis'] = professional_analysis
-        response['exam_type'] = 'CSP Professional Examination - Knowledge Based'
+        response['exam_type'] = 'Safety Professional Practice Exam (CSP-style)'
         response['credential_level'] = professional_analysis.get('credential_level', '')
-        response['ceus_awarded'] = professional_analysis.get('ceus_awarded', 0)
         response['domain_scores'] = grading_result.get('domain_scores', {})
         response['knowledge_base_verified'] = True
         
@@ -100151,30 +100136,24 @@ def generate_exam_certificate():
         if score >= 90:
             credential_level = 'Platinum'
             credential_color = '#722ed1'
-            ceus = 4.0
         elif score >= 85:
             credential_level = 'Gold'
             credential_color = '#fa8c16'
-            ceus = 3.5
         elif score >= 80:
             credential_level = 'Silver'
             credential_color = '#8c8c8c'
-            ceus = 3.0
         elif score >= 75:
             credential_level = 'Bronze'
             credential_color = '#d48806'
-            ceus = 2.5
         elif score >= 70:
             credential_level = 'Competent'
             credential_color = '#389e0d'
-            ceus = 2.0
         else:
-            credential_level = 'Certified'
+            credential_level = 'Completed'
             credential_color = '#1890ff'
-            ceus = 0
         
         # Generate unique certificate ID
-        certificate_id = f"CSP-{credential_level[:3].upper()}-{uuid.uuid4().hex[:12].upper()}"
+        certificate_id = f"STP-{credential_level[:3].upper()}-{uuid.uuid4().hex[:12].upper()}"
         
         # Get base URL
         base_url = request.host_url.rstrip('/')
@@ -100187,19 +100166,17 @@ def generate_exam_certificate():
         certificate_data = {
             'credential_id': certificate_id,  # This is the key used in HTML
             'certificate_id': certificate_id, 
-            'credential_name': f"{credential_level} Safety Professional Credential",
+            'credential_name': f"{credential_level} LEVEL - Safety Practice Exam",
             'credential_level': credential_level,
             'credential_color': credential_color,
             'recipient_name': user_name,
-            'course_name': 'ISSB Professional Examination ',
+            'course_name': 'Safety Professional Practice Exam (CSP-style)',
             'exam_domain': session.get('domain', 'Safety Management Systems'),
             'issue_date': datetime.now().strftime('%Y-%m-%d'),
             'exam_score': round(score, 2),
             'correct_count': grading_result.get('correct_answers', 0),
             'total_count': grading_result.get('total_questions', 0),
-            'ceus_awarded': ceus,
-            'accreditation_body': 'CSP Knowledge Examination System',
-            'standard_compliance': 'ISO/IEC 17024:2012',
+            'certificate_type': 'Practice exam - certificate of completion',
             'verification_url': f"{base_url}/verify/{certificate_id}",
             'signature1_url': signature1_url_local,
             'signature2_url': signature2_url_local,
@@ -100349,7 +100326,7 @@ def verify_certificate(certificate_id):
                 # Extract credential level from HTML
                 import re
                 level_match = re.search(r'credential-badge.*?>(.*?)LEVEL', cert_record.certificate_html, re.DOTALL)
-                credential_level = level_match.group(1).strip() if level_match else 'Certified'
+                credential_level = level_match.group(1).strip() if level_match else 'Completed'
                 
                 # Set expiry based on credential level
                 if 'Platinum' in credential_level:
@@ -100406,6 +100383,8 @@ def verify_certificate(certificate_id):
             'status': 'expired' if is_expired else 'active',
             'exam_score': exam_score,
             'credential_level': credential_level,
+            'certificate_type': 'Practice exam - certificate of completion',
+            'disclaimer': _EXAM_PRACTICE_DISCLAIMER,
             'verification_url': f"{request.host_url.rstrip('/')}/verify/{certificate_id}",
             'verified_at': datetime.now().isoformat()
         }
@@ -100423,7 +100402,7 @@ def verify_certificate(certificate_id):
             'success': True,
             'valid': True,
             'certificate': certificate_data,
-            'message': 'Certificate is valid and verified',
+            'message': 'This is a genuine SafeTrack Pro Global practice-exam certificate of completion',
             'timestamp': datetime.now().isoformat()
         }), 200
         
@@ -100592,12 +100571,11 @@ def get_exam_session_status():
         
         # Add CSP-specific info
         response['exam_type'] = 'CSP Knowledge Based Examination'
-        response['difficulty'] = 'Advanced (CSP Level)'
+        response['difficulty'] = 'Advanced (CSP-style practice)'
         
         if session.get('grading_result'):
             grading_result = session['grading_result']
             response['credential_level'] = grading_result.get('professional_analysis', {}).get('credential_level', '')
-            response['ceus_awarded'] = grading_result.get('professional_analysis', {}).get('ceus_awarded', 0)
             response['score'] = grading_result.get('percentage', 0)
         
         return jsonify(response)
@@ -100902,8 +100880,9 @@ def get_certificate_by_id(certificate_id):
             'recipient_name': cert.recipient,  # ← FIX: Use 'recipient' not 'recipient_name'
             'download_url': cert.certificate_pdf_path,
             'issue_date': cert.completion_date if hasattr(cert, 'completion_date') else cert.generated_at.strftime('%Y-%m-%d'),
-            'credential_level': 'Platinum',
-            'credential_name': 'Platinum Safety Professional Credential'
+            'certificate_type': 'Practice exam - certificate of completion',
+            'credential_name': 'Safety Professional Practice Exam - Certificate of Completion',
+            'disclaimer': _EXAM_PRACTICE_DISCLAIMER
         })
         
     except Exception as e:
@@ -167252,9 +167231,56 @@ _HARDEN_BLOCKED_PATHS = frozenset({
     '/api/camera/yolov8/test', '/api/camera/test/yolov8', '/api/camera/test-simple', '/api/camera/debug/detection',
     '/api/camera/test-detection', '/api/safety/search/test', '/api/safety/search/cache/clear',
 })
-# public AI search costs money per call: limit anonymous/abusive bursts per IP (single gevent worker -> in-memory is fine)
-_HARDEN_AI_LIMITS = {'/api/safety/search': (30, 600), '/api/safety/search/batch': (5, 600), '/api/safety/search/analyze': (30, 600)}
-_HARDEN_AI_HITS = {}
+# Per-IP rate limits for public, costly (AI) or guessable endpoints that had none.
+# (method, 'exact' | 'prefix', path, max requests, window seconds). First matching rule wins; a request may also
+# hit the AI backstop below. Single gevent worker -> in-memory counters are enough.
+_HARDEN_RULES = (
+    ('POST', 'exact', '/api/safety/search', 30, 600),
+    ('POST', 'exact', '/api/safety/search/batch', 5, 600),
+    ('POST', 'exact', '/api/safety/search/analyze', 30, 600),
+    ('POST', 'exact', '/api/contact', 5, 600),
+    ('POST', 'exact', '/api/auth/resend-verification', 3, 600),
+    ('POST', 'exact', '/api/resend-verification', 3, 600),
+    ('POST', 'exact', '/api/auth/doctor/login', 5, 60),
+    ('POST', 'prefix', '/api/auth/doctor/', 10, 600),
+    ('POST', 'exact', '/api/ai/exam/flow/start', 5, 600),
+    ('POST', 'exact', '/api/ai/exam/flow/generate', 5, 600),
+    ('POST', 'exact', '/api/ai/certificates/verify/bulk', 5, 600),
+    ('GET', 'prefix', '/api/ai/certificates/verify/', 30, 600),
+    ('POST', 'exact', '/api/payment/paypal/create/public', 10, 600),
+    ('POST', 'exact', '/api/payment/paystack/initialize/public', 10, 600),
+    ('POST', 'exact', '/api/payment/record/public', 10, 600),
+    ('POST', 'exact', '/api/toolbox-talks/generate', 20, 3600),
+    ('GET', 'exact', '/api/voice/public/directory', 60, 60),
+    ('GET', 'prefix', '/api/voice/public/track/', 30, 600),
+    ('POST', 'prefix', '/api/voice/public/track/', 10, 600),
+    ('POST', 'exact', '/api/voice/public/rewards/me', 10, 600),
+    ('GET', 'prefix', '/api/voice/public/c/', 120, 60),
+)
+# Backstop for every AI call (DeepSeek costs money per request), on top of plan limits.
+_HARDEN_AI_BACKSTOP = ('POST', '/api/ai/', 120, 600)   # ~60 chat messages (each also saves history) per 10 min
+_HARDEN_HITS = {}
+
+
+def _harden_rule_for(method, path):
+    for m, kind, p, max_hits, window in _HARDEN_RULES:
+        if m == method and ((kind == 'exact' and path == p) or (kind == 'prefix' and path.startswith(p))):
+            return f'{m} {p}', max_hits, window
+    return None
+
+
+def _harden_over_limit(ip, key, max_hits, window):
+    now = time.time()
+    bucket = _HARDEN_HITS.setdefault(ip, {})
+    hits = [t for t in bucket.get(key, []) if now - t < window]
+    if len(hits) >= max_hits:
+        bucket[key] = hits
+        return max(1, int(window - (now - hits[0])))
+    hits.append(now)
+    bucket[key] = hits
+    if len(_HARDEN_HITS) > 20000:   # keep memory bounded
+        _HARDEN_HITS.clear()
+    return 0
 
 
 def _harden_maintenance_allowed():
@@ -167277,21 +167303,31 @@ def _harden_block_maintenance_routes():
         except Exception:
             pass
         return jsonify({'success': False, 'error': 'Not found'}), 404
-    limit = _HARDEN_AI_LIMITS.get(path)
-    if limit and request.method == 'POST':
-        max_hits, window = limit
-        try:
-            ip = _sec_ip()
-        except Exception:
-            ip = request.remote_addr or 'unknown'
-        now = time.time()
-        hits = [t for t in _HARDEN_AI_HITS.get(ip, {}).get(path, []) if now - t < window]
-        if len(hits) >= max_hits:
-            return jsonify({'success': False, 'error': 'Too many searches. Please wait a few minutes.', 'code': 'RATE_LIMITED'}), 429
-        hits.append(now)
-        _HARDEN_AI_HITS.setdefault(ip, {})[path] = hits
-        if len(_HARDEN_AI_HITS) > 5000:   # keep memory bounded
-            _HARDEN_AI_HITS.clear()
+    method = request.method
+    if method == 'OPTIONS':
+        return None
+    checks = []
+    rule = _harden_rule_for(method, path)
+    if rule:
+        checks.append(rule)
+    bm, bprefix, bmax, bwin = _HARDEN_AI_BACKSTOP
+    if method == bm and path.startswith(bprefix):
+        checks.append(('ai-backstop', bmax, bwin))
+    if not checks:
+        return None
+    try:
+        ip = _sec_ip()
+    except Exception:
+        ip = request.remote_addr or 'unknown'
+    for key, max_hits, window in checks:
+        wait = _harden_over_limit(ip, key, max_hits, window)
+        if wait:
+            minutes = max(1, round(wait / 60))
+            resp = jsonify({'success': False, 'code': 'RATE_LIMITED',
+                            'error': f'Too many requests. Please wait about {minutes} minute{"s" if minutes != 1 else ""} and try again.',
+                            'retry_after': wait})
+            resp.headers['Retry-After'] = str(wait)
+            return resp, 429
     return None
 
 
