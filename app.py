@@ -100297,12 +100297,8 @@ def verify_certificate(certificate_id):
             certificate_id=certificate_id
         ).first()
         
-        # If not found by certificate_id, try by credential_id (fallback)
-        if not cert_record:
-            cert_record = AICertificateGeneration.query.filter_by(
-                credential_id=certificate_id
-            ).first()
-        
+        # (The old fallback filtered on a 'credential_id' column that does not exist and crashed every
+        #  lookup of an unknown ID with a 500. The certificate ID is stored in certificate_id only.)
         if not cert_record:
             print(f"❌ Certificate not found: {certificate_id}")
             return jsonify({
