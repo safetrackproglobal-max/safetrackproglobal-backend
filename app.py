@@ -60247,8 +60247,6 @@ def analyze_with_image():
         logger.info(f"🔍 DEBUG: user_id={user_id}")
         
         data = request.get_json()
-        logger.info(f"🔍 DEBUG: Request data: {data}")
-        
         lat = data.get('lat')
         lng = data.get('lng')
         zoom = data.get('zoom', 15)
@@ -166137,6 +166135,9 @@ def wv_public_submit(slug):
         ip_hash=iph, net_hash=net_hash, fingerprint=fingerprint, ai_status='pending', assigned_user_ids='[]', timeline='[]')
     _wv_apply_risk(report, WV_DEFAULT_RISK.get(category) or WV_DEFAULT_RISK.get(group) or 'medium')
     _wv_add_timeline(report, 'status', 'Your report was received.', public=True, by='system', status='received')
+    notice = re.sub(r'[^0-9-]', '', str(form.get('notice_version') or ''))[:10]
+    if notice:
+        _wv_add_timeline(report, 'note', f'Reporter accepted the data and AI notice ({notice}).', public=False, by='system')
     reward_out, reward_error = None, None
     try:
         db.session.add(report)
@@ -167192,6 +167193,51 @@ def wv_platform_reports():
 
 
 # =====================================================================================================
+# FEATURE NOTICES (2026-11-24): AI / camera / health / upload notices accepted in the app are logged here.
+# Uses the existing consent_records table (append only). Keep the versions equal to consentService.js.
+# =====================================================================================================
+_FEATURE_NOTICE_VERSION = '2026-11-24'
+_FEATURE_NOTICES = ('policy', 'ai', 'camera', 'health', 'upload')
+
+
+@app.route('/api/consent/feature', methods=['GET'])
+@jwt_required
+def feature_notices_get():
+    """Newest accepted version per notice for the logged-in user."""
+    rows = (ConsentRecord.query.filter(ConsentRecord.user_id == request.user.id,
+                                       ConsentRecord.doc_type.in_([f'notice_{f}' for f in _FEATURE_NOTICES]))
+            .order_by(ConsentRecord.accepted_at.asc()).all())
+    return jsonify({'success': True, 'current': _FEATURE_NOTICE_VERSION,
+                    'accepted': {r.doc_type[7:]: r.version for r in rows if r.accepted}}), 200
+
+
+@app.route('/api/consent/feature', methods=['POST'])
+@jwt_required
+def feature_notice_accept():
+    data = request.get_json(silent=True)
+    data = data if isinstance(data, dict) else {}
+    feature = data.get('feature')
+    if feature not in _FEATURE_NOTICES:
+        return jsonify({'success': False, 'error': 'Unknown notice'}), 400
+    if data.get('version') != _FEATURE_NOTICE_VERSION:
+        return jsonify({'success': False, 'error': 'Please reload the page to see the current notice.',
+                        'expected': _FEATURE_NOTICE_VERSION}), 409
+    uid = request.user.id
+    try:
+        seen = ConsentRecord.query.filter_by(user_id=uid, doc_type=f'notice_{feature}', version=_FEATURE_NOTICE_VERSION).first()
+        if not seen:
+            db.session.add(ConsentRecord(user_id=uid, doc_type=f'notice_{feature}', version=_FEATURE_NOTICE_VERSION, accepted=True,
+                                         accepted_at=datetime.utcnow(), ip_address=str(_sec_ip() or '')[:64],
+                                         user_agent=(request.headers.get('User-Agent') or '')[:512], source='app'))
+            db.session.commit()
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f"feature notice save failed: {e}")
+        return jsonify({'success': False, 'error': 'Could not save'}), 500
+    return jsonify({'success': True}), 200
+
+
+# =====================================================================================================
 # DEPLOY HARDENING (2026-11-23)
 # Debug / test / database-reset routes were reachable without login (e.g. /api/system/force-init runs
 # db.drop_all()). They are now hidden (404) in every environment. For a one-off maintenance task set
@@ -167215,6 +167261,7 @@ _HARDEN_RULES = (
     ('POST', 'exact', '/api/public/doc-pdf', 5, 86400),
     ('POST', 'exact', '/api/doc-library/pdf', 40, 3600),
     ('POST', 'exact', '/api/contact', 5, 600),
+    ('POST', 'exact', '/api/consent/feature', 40, 600),
     ('POST', 'exact', '/api/auth/resend-verification', 3, 600),
     ('POST', 'exact', '/api/resend-verification', 3, 600),
     ('POST', 'exact', '/api/auth/doctor/login', 5, 60),
