@@ -3461,20 +3461,13 @@ with app.app_context():
 
 @app.route('/api/version', methods=['GET'])
 def version_check():
-    import hashlib, os as _os
+    """Build fingerprint only (no file paths or sizes)."""
     try:
-        with open(_os.path.abspath(__file__), 'rb') as f:
-            file_hash = hashlib.sha256(f.read()).hexdigest()[:12]
-    except Exception as e:
-        file_hash = f'error: {e}'
-    return jsonify({
-        'deployed_file_hash': file_hash,
-        'has_init_everything': 'admin_init_everything' in globals(),
-        'has_create_tables': 'admin_create_tables' in globals(),
-        'app_py_size_bytes': _os.path.getsize(_os.path.abspath(__file__)),
-        'cwd': _os.getcwd(),
-        'python_file': _os.path.abspath(__file__),
-    })
+        with open(os.path.abspath(__file__), 'rb') as f:
+            return jsonify({'deployed_file_hash': hashlib.sha256(f.read()).hexdigest()[:12]})
+    except Exception:
+        return jsonify({'deployed_file_hash': 'unknown'})
+
 # ===== LOCAL IMPORTS =====
 
 class BackblazeB2Manager:
@@ -7036,66 +7029,17 @@ def jwt_required(f):
 # ==================== KEEP YOUR EXACT SAFETYPRO DECORATOR ====================
 
 def safetypro_required(f):
-    """
-    JWT authentication for SafetyPro system administrators only
-    WITH DEBUG - KEEPING YOUR EXACT IMPLEMENTATION
-    """
-    print(f"\n🎯 DEBUG: Creating safetypro_required decorator for {f.__name__}")
-    
+    """Platform (SafetyPro) team only. The permission check runs BEFORE the route body.
+    (The old version executed the route first and only replaced the response with a 403.)"""
     @wraps(f)
-    def inner_wrapper(*args, **kwargs):
-        print(f"\n🎯 DEBUG: safetypro_required wrapper called for {f.__name__}")
-        print(f"🎯 Path: {request.path}")
-        print(f"🎯 Method: {request.method}")
-        
-        # Apply jwt_required to this specific call
-        @wraps(f)
-        def jwt_wrapped_function(*inner_args, **inner_kwargs):
-            print(f"\n🎯 DEBUG: Inside jwt_wrapped_function for {f.__name__}")
-            
-            # First authenticate with jwt_required
-            print(f"🎯 Applying jwt_required authentication...")
-            
-            # Call jwt_required on our function
-            jwt_decorated = jwt_required(f)
-            result = jwt_decorated(*inner_args, **inner_kwargs)
-            
-            # If authentication failed, return the error
-            if isinstance(result, tuple) and len(result) > 1 and result[1] == 401:
-                print(f"🎯 ❌ JWT authentication failed")
-                return result
-            
-            print(f"🎯 ✅ JWT authentication successful")
-            
-            # Now check if user is SafetyPro team
-            print(f"\n🎯 CHECKING SAFETYPRO ACCESS:")
-            print(f"  request.is_system_team = {getattr(request, 'is_system_team', 'NOT SET')}")
-            print(f"  request.user_type = {getattr(request.user, 'user_type', 'NOT SET') if hasattr(request, 'user') else 'NO USER'}")
-            
-            if not getattr(request, 'is_system_team', False):
-                print(f"🎯 ❌ ACCESS DENIED: Not SafetyPro team")
-                return jsonify({
-                    'success': False,
-                    'error': 'Access restricted to SafetyPro system administrators',
-                    'code': 'ACCESS_DENIED',
-                    'debug_info': {
-                        'user_type': getattr(request.user, 'user_type', 'unknown'),
-                        'admin_role': getattr(request.user, 'admin_role', None),
-                        'admin_level': getattr(request.user, 'admin_level', None),
-                        'is_system_team': getattr(request, 'is_system_team', False),
-                        'endpoint': request.path
-                    }
-                }), 403
-            
-            print(f"🎯 ✅ ACCESS GRANTED: User is SafetyPro team member")
-            return result
-        
-        # Call the jwt-wrapped function
-        print(f"🎯 Executing jwt_wrapped_function...")
-        return jwt_wrapped_function(*args, **kwargs)
-    
-    print(f"🎯 DEBUG: Returning wrapper for {f.__name__}")
-    return inner_wrapper
+    @jwt_required
+    def guarded(*args, **kwargs):
+        if request.method != 'OPTIONS' and not getattr(request, 'is_system_team', False):
+            return jsonify({'success': False, 'error': 'Access restricted to SafetyPro system administrators',
+                            'code': 'ACCESS_DENIED'}), 403
+        return f(*args, **kwargs)
+    return guarded
+
 
 # ==================== ENHANCED CHECK FEATURE ACCESS ====================
 
@@ -17464,7 +17408,7 @@ def manage_sustainability_goals():
         try:
             logger.info(f"User {user.email} accessing sustainability goals")
             
-            goals = SustainabilityGoal.query.order_by(SustainabilityGoal.deadline.asc()).all()
+            goals = _env_scoped(SustainabilityGoal).order_by(SustainabilityGoal.deadline.asc()).all()
             
             goals_data = []
             for goal in goals:
@@ -22831,7 +22775,17 @@ def create_notification_route():
         action_url = data.get('action_url', '')
         user_id = data.get('user_id', current_user.id)
         company_id = data.get('company_id', current_user.company_id)
-        
+        # Nobody may push messages (or links) into another company's accounts
+        if str(user_id) != str(current_user.id) and not getattr(request, 'is_system_team', False):
+            target = db.session.get(User, int(user_id)) if str(user_id).isdigit() else None
+            is_admin_ = (getattr(current_user, 'user_type', '') or '') in ('admin', 'company_admin')
+            if not (target and is_admin_ and current_user.company_id and target.company_id == current_user.company_id):
+                return jsonify({'success': False, 'error': 'You cannot notify this user', 'code': 'FORBIDDEN'}), 403
+        title, message = str(title)[:200], str(message)[:2000]
+        action_url = str(action_url or '')[:300]
+        if action_url and (not action_url.startswith('/') or action_url.startswith('//') or chr(92) in action_url):
+            action_url = ''   # in-app links only
+
         # ✅ Use the helper function
         notification = create_notification(
             user_id=user_id,
@@ -29446,7 +29400,7 @@ def handle_leave_user_room(data):
     logger.info(f'User {user_id} left their room')
 
 # In your SocketIO setup
-@socketio.on('join_progress_channel')
+# not registered: it trusted a user_id sent by the client
 def handle_join_progress_channel(data):
     """Join a progress channel for real-time updates"""
     export_id = data.get('export_id')
@@ -70059,7 +70013,7 @@ def handle_connect():
 def handle_disconnect():
     logger.info(f"Client disconnected: {request.sid}")
 
-@socketio.on('camera_frame')
+# not registered: it ran AI detection for anyone without login, and no page uses it
 def handle_camera_frame(data):
     """Handle camera frame from client"""
     try:
@@ -72602,9 +72556,15 @@ def deepseek_generate_exam_route():
         current_user = request.user
         data = request.get_json() or {}
         
-        topic = data.get('topic', 'csp_exam')
-        count = int(data.get('count', 100))
-        difficulty = data.get('difficulty', 'advanced')
+        topic = str(data.get('topic') or 'csp_exam')[:60]
+        try:
+            count = max(5, min(100, int(data.get('count') or 100)))
+        except (TypeError, ValueError):
+            count = 100
+        difficulty = str(data.get('difficulty') or 'advanced')[:20]
+        _quota = _exam_quota_error(current_user)
+        if _quota:
+            return _quota
         
         logger.info(f"🎯 CSP exam generation for {current_user.email} (Target: {count})")
         
@@ -72664,7 +72624,8 @@ def deepseek_generate_exam_route():
         for q in formatted_questions:
             domain_counts[q['domain']] = domain_counts.get(q['domain'], 0) + 1
         
-        session_id = f'DEEPSEEK_CSP_{datetime.utcnow().strftime("%Y%m%d%H%M%S")}'
+        session_id = f'DEEPSEEK_CSP_{uuid.uuid4().hex}'
+        _exam_register(session_id, current_user, data, topic, difficulty, formatted_questions)
         source = 'deepseek' if ai_succeeded and len([q for q in all_questions if q.get('explanation')]) > 50 else 'mixed'
         
         # Save to file
@@ -72688,14 +72649,13 @@ def deepseek_generate_exam_route():
         # 🔴 ALWAYS RETURN 200 WITH QUESTIONS
         return jsonify({
             'success': True,
-            'questions': formatted_questions,
+            'questions': _exam_hide_answers(formatted_questions),
             'session_id': session_id,
             'topic': topic,
             'total': len(formatted_questions),
             'difficulty': difficulty,
             'source': source,
             'domain_breakdown': domain_counts,
-            'saved_to': saved_path,
         }), 200
         
     except Exception as e:
@@ -72717,10 +72677,12 @@ def deepseek_generate_exam_route():
                     'points': 2,
                 })
             
+            session_id = f'FALLBACK_{uuid.uuid4().hex}'
+            _exam_register(session_id, request.user, {}, 'csp_exam', 'intermediate', formatted_fallback)
             return jsonify({
                 'success': True,
-                'questions': formatted_fallback,
-                'session_id': f'FALLBACK_{datetime.utcnow().strftime("%Y%m%d%H%M%S")}',
+                'questions': _exam_hide_answers(formatted_fallback),
+                'session_id': session_id,
                 'total': 100,
                 'source': 'emergency_fallback',
             }), 200
@@ -99484,14 +99446,20 @@ def start_exam_flow():
                 'timestamp': datetime.now().isoformat()
             }), 400
             
-        user_id = data.get('user_id')
-        user_name = data.get('user_name')
-        user_email = data.get('user_email', '')
-        course = data.get('course', 'CSP Professional Certification Preparation')
+        user_id = request.user.id            # never trust an ID from the browser
+        user_name = str(data.get('user_name') or getattr(request.user, 'name', '') or '')[:120]
+        user_email = getattr(request.user, 'email', '')
+        course = str(data.get('course') or 'CSP Exam Preparation (practice)')[:150]
         topic = data.get('topic', 'safety_management')
         difficulty = data.get('difficulty', 'advanced')
-        num_questions = data.get('num_questions', 100)  # Full CSP exam - 100 questions
-        user_plan = data.get('user_plan', 'free')
+        try:
+            num_questions = max(5, min(100, int(data.get('num_questions') or 100)))
+        except (TypeError, ValueError):
+            num_questions = 100
+        user_plan = resolve_effective_plan(request.user)['plan']
+        _quota = _exam_quota_error(request.user)
+        if _quota:
+            return _quota
         
         if not user_id or not user_name:
             return jsonify({
@@ -99628,7 +99596,7 @@ def generate_exam_for_flow():
             }), 400
         
         # Get session
-        session = exam_sessions.get(session_id)
+        session = _exam_session_for(session_id)
         
         if not session:
             return jsonify({
@@ -99734,7 +99702,7 @@ def generate_exam_for_flow():
             'exam_data': {
                 'exam_id': exam_id,
                 'exam_type': 'CSP_FULL_EXAM',
-                'questions': questions,
+                'questions': _exam_hide_answers(questions),
                 'total_questions': len(questions),
                 'total_points': sum(q.get('points', 1) for q in questions),
                 'time_limit_minutes': session.get('time_limit_minutes', 240),
@@ -99760,7 +99728,7 @@ def generate_exam_for_flow():
                 'cognitive_demand': 'Questions require analysis, synthesis, and evaluation.',
                 'scenario_based': 'Complex scenarios requiring professional judgment.',
                 'time_management': '4 hours (240 minutes) for 100 questions.',
-                'passing_benefits': 'Passing scores qualify for professional credentials.'
+                'passing_benefits': 'Practice exam only: passing gives a certificate of completion.'
             },
             'next_action': 'answer_questions',
             'timestamp': datetime.now().isoformat()
@@ -99805,7 +99773,7 @@ def submit_exam_answer():
             }), 400
         
         # Get session
-        session = exam_sessions.get(session_id)
+        session = _exam_session_for(session_id)
         
         if not session:
             return jsonify({
@@ -99928,7 +99896,7 @@ def submit_exam_for_grading():
         print(f"📝 Received answers for grading: {user_answers}")
         
         # Get session
-        session = exam_sessions.get(session_id)
+        session = _exam_session_for(session_id)
         
         if not session:
             return jsonify({
@@ -100025,7 +99993,7 @@ def get_exam_results():
             }), 400
         
         # Get session
-        session = exam_sessions.get(session_id)
+        session = _exam_session_for(session_id)
         
         if not session:
             return jsonify({
@@ -100095,7 +100063,7 @@ def generate_exam_certificate():
             return jsonify({'success': False, 'error': 'Session ID is required'}), 400
         
         # Get session
-        session = exam_sessions.get(session_id)
+        session = _exam_session_for(session_id)
         
         if not session:
             return jsonify({'success': False, 'error': 'Session not found'}), 404
@@ -100104,6 +100072,11 @@ def generate_exam_certificate():
         if not grading_result:
             return jsonify({'success': False, 'error': 'Grading results not found'}), 404
         
+        # The practice exam is free with an account; the certificate needs a paid plan
+        if not _exam_paid(request.user):
+            return jsonify({'success': False, 'code': 'UPGRADE_REQUIRED', 'score': grading_result.get('percentage', 0),
+                            'error': 'Upgrade to any paid plan to download the certificate of completion.'}), 402
+
         # Check if exam was passed
         if not grading_result.get('passed', False):
             return jsonify({
@@ -100520,7 +100493,7 @@ def get_exam_session_status():
             }), 400
         
         # Get session
-        session = exam_sessions.get(session_id)
+        session = _exam_session_for(session_id)
         
         if not session:
             return jsonify({
@@ -100596,7 +100569,7 @@ def debug_exam_session_full(session_id):
         print(f"{'='*60}")
         
         # Get session
-        session = exam_sessions.get(session_id)
+        session = _exam_session_for(session_id)
         
         if not session:
             print(f"❌ Session not found: {session_id}")
@@ -100752,7 +100725,7 @@ def reset_exam_session():
             }), 400
         
         # Get session
-        session = exam_sessions.get(session_id)
+        session = _exam_session_for(session_id)
         
         if not session:
             return jsonify({
@@ -108425,9 +108398,13 @@ def get_all_doctors():
         
         # ✅ Build query from users table
         query = User.query.filter(User.user_type == 'doctor')
-        
-        # Filter by hospital
+
+        # Filter by hospital (only the platform team may choose another hospital)
         hospital_id = request.args.get('hospital_id')
+        if not is_super_admin:
+            hospital_id = user.hospital_id
+            if not hospital_id:
+                query = query.filter(User.company_id == (user.company_id or -1))
         if hospital_id:
             query = query.filter_by(hospital_id=hospital_id)
         elif not is_super_admin and user.hospital_id:
@@ -108459,6 +108436,8 @@ def get_all_doctors():
         
         # ✅ Also get doctors from doctors table
         doctor_records = Doctor.query
+        if not is_super_admin and not hospital_id:
+            doctor_records = doctor_records.filter(Doctor.id < 0)   # no hospital -> no hospital records
         if hospital_id:
             doctor_records = doctor_records.filter_by(hospital_id=hospital_id)
         elif not is_super_admin and user.hospital_id:
@@ -146122,7 +146101,7 @@ def dm_apply_watermark(document_id):
             return jsonify({'success': False, 'error': 'Not authenticated'}), 401
 
         document = Document.query.get(document_id)
-        if not document:
+        if not document or not _user_can_access_document(user, document, check_super_admin()):
             return jsonify({'success': False, 'error': 'Document not found'}), 404
 
         data = request.get_json() or {}
@@ -146157,7 +146136,7 @@ def dm_generate_watermark_preview(document_id):
             return jsonify({'success': False, 'error': 'Not authenticated'}), 401
 
         document = Document.query.get(document_id)
-        if not document:
+        if not document or not _user_can_access_document(user, document, check_super_admin()):
             return jsonify({'success': False, 'error': 'Document not found'}), 404
 
         # TODO: Generate actual preview image. Placeholder SVG.
@@ -167219,12 +167198,12 @@ def wv_platform_reports():
 # ENABLE_MAINTENANCE_ROUTES=1 and ADMIN_SECRET (24+ chars) on Railway, call with header X-Admin-Secret,
 # then remove ENABLE_MAINTENANCE_ROUTES again.
 # =====================================================================================================
-_HARDEN_BLOCKED_PREFIXES = ('/api/debug/', '/debug/', '/api/test/')
+_HARDEN_BLOCKED_PREFIXES = ('/api/debug/', '/debug/', '/api/test/', '/api/ai/exam/flow/debug-session/')
 _HARDEN_BLOCKED_PATHS = frozenset({
     '/api/system/force-init', '/api/system/init-db-safe', '/api/system/create-ai-tables', '/api/fix-database-schema',
     '/api/admin/init-everything', '/api/admin/nuke-and-rebuild', '/api/ai/debug_pool',
     '/api/camera/yolov8/test', '/api/camera/test/yolov8', '/api/camera/test-simple', '/api/camera/debug/detection',
-    '/api/camera/test-detection', '/api/safety/search/test', '/api/safety/search/cache/clear',
+    '/api/camera/test-detection', '/api/admin/users/model-fields', '/api/safety/search/stats', '/api/safety/search/test', '/api/safety/search/cache/clear',
 })
 # Per-IP rate limits for public, costly (AI) or guessable endpoints that had none.
 # (method, 'exact' | 'prefix', path, max requests, window seconds). First matching rule wins; a request may also
@@ -167238,6 +167217,8 @@ _HARDEN_RULES = (
     ('POST', 'exact', '/api/resend-verification', 3, 600),
     ('POST', 'exact', '/api/auth/doctor/login', 5, 60),
     ('POST', 'prefix', '/api/auth/doctor/', 10, 600),
+    ('POST', 'exact', '/api/deepseek/generate-exam', 5, 600),
+    ('POST', 'exact', '/api/notifications/create', 30, 600),
     ('POST', 'exact', '/api/ai/exam/flow/start', 5, 600),
     ('POST', 'exact', '/api/ai/exam/flow/generate', 5, 600),
     ('POST', 'exact', '/api/ai/certificates/verify/bulk', 5, 600),
@@ -167340,6 +167321,114 @@ try:
     _harden_startup_checks()
 except Exception:
     pass
+
+
+# =====================================================================================================
+# ATTACK-TEST FIXES (2026-11-24)
+# =====================================================================================================
+_EXAM_FREE_STARTS = {}
+
+
+def _exam_paid(user):
+    if getattr(request, 'is_system_team', False):
+        return True
+    return (resolve_effective_plan(user) or {}).get('plan', 'free') not in ('free', '', None)
+
+
+def _exam_quota_error(user):
+    """Free accounts: one full practice exam per 24 hours (each one costs an AI call)."""
+    if _exam_paid(user):
+        return None
+    now = time.time()
+    since = now - _EXAM_FREE_STARTS.get(user.id, 0)
+    if since >= 86400:
+        _EXAM_FREE_STARTS[user.id] = now
+        return None
+    if since <= 900:      # retries right after a start are allowed
+        return None
+    return jsonify({'success': False, 'code': 'UPGRADE_REQUIRED',
+                    'error': 'Free accounts include one full practice exam per day. Upgrade for unlimited exams and certificates.'}), 402
+
+
+def _exam_session_for(session_id):
+    """The exam session, only for the account that started it."""
+    sess = exam_sessions.get(session_id) if isinstance(session_id, str) else None
+    if not sess:
+        return None
+    uid = getattr(getattr(request, 'user', None), 'id', None)
+    return sess if uid is not None and str(sess.get('user_id')) == str(uid) else None
+
+
+def _exam_hide_answers(questions):
+    hidden = {'correct_answer', 'correctAnswer', 'answer', 'correct_option', 'correct_index', 'explanation', 'rationale',
+              'correct_answer_letter'}
+    return [{k: v for k, v in q.items() if k not in hidden} if isinstance(q, dict) else q for q in (questions or [])]
+
+
+def _exam_register(session_id, user, data, topic, difficulty, questions):
+    """Keep a generated exam on the server so it is graded here (the browser never gets the key)."""
+    while len(exam_sessions) > 2000:
+        exam_sessions.pop(next(iter(exam_sessions)), None)
+    qs = []
+    for q in questions:
+        q = dict(q)
+        opts = q.get('options') or []
+        if opts and isinstance(opts, list) and isinstance(opts[0], str):
+            q['options'] = [{'id': chr(65 + i), 'letter': chr(65 + i), 'text': o} for i, o in enumerate(opts)]
+        m = re.match(r'\s*([A-Da-d])', str(q.get('correct_answer') or 'A'))
+        q['correct_answer'] = m.group(1).upper() if m else 'A'
+        qs.append(q)
+    exam_sessions[session_id] = {
+        'session_id': session_id, 'user_id': user.id, 'user_name': str(data.get('user_name') or user.name or '')[:120],
+        'user_email': user.email, 'course': str(data.get('course') or 'CSP Exam Preparation (practice)')[:150],
+        'topic': topic, 'domain': 'Domain 2', 'difficulty': difficulty, 'num_questions': len(qs), 'status': 'active',
+        'current_step': 'taking_exam', 'answers': {}, 'created_at': datetime.now().isoformat(),
+        'start_time': datetime.now().isoformat(), 'end_time': None, 'time_limit_minutes': 240, 'passing_score': 75,
+        'progress': {'answered': 0, 'total': len(qs), 'percentage': 0}, 'metadata': {}, 'exam_id': session_id,
+        'exam_data': {'exam_id': session_id, 'questions': qs, 'total_questions': len(qs), 'passing_score': 75},
+    }
+
+
+def _platform_only(view):
+    @wraps(view)
+    def guarded(*args, **kwargs):
+        if request.method != 'OPTIONS' and not _sec_require_platform():
+            return jsonify({'success': False, 'error': 'Access denied', 'code': 'ACCESS_DENIED'}), 403
+        return view(*args, **kwargs)
+    return jwt_required(guarded)
+
+
+# platform-wide statistics / user lists that any logged-in account could open
+_PLATFORM_ONLY_PATHS = {'/api/admin/analytics/plan-distribution', '/api/admin/analytics/recent-activity',
+                        '/api/admin/analytics/user-type-distribution', '/api/admin/analytics/growth',
+                        '/api/admin/analytics/platform', '/api/admin/system/health', '/api/admin/activity/recent'}
+for _ep in {r.endpoint for r in app.url_map.iter_rules() if r.rule in _PLATFORM_ONLY_PATHS}:
+    app.view_functions[_ep] = _platform_only(app.view_functions[_ep])
+
+_INTERNAL_ERR = re.compile(r"psycopg|sqlalchemy|sqlite3|Traceback|has no attribute|is not defined|\[SQL:|relation \""
+                           r"|object is not|unexpected keyword|positional argument|No module named|/app/|site-packages|NoneType", re.I)
+
+
+@app.after_request
+def _hide_internal_errors(response):
+    """5xx answers must not reveal SQL, code or file paths."""
+    try:
+        if response.status_code >= 500 and response.is_json and not response.direct_passthrough:
+            body = response.get_json(silent=True)
+            if isinstance(body, dict):
+                dirty = False
+                for k in ('debug_info', 'traceback', 'trace', 'stack', 'exception'):
+                    dirty = body.pop(k, None) is not None or dirty
+                for k in ('error', 'message', 'details', 'detail'):
+                    if isinstance(body.get(k), str) and _INTERNAL_ERR.search(body[k]):
+                        logger.error('hidden error on %s: %s', request.path, body[k][:500])
+                        body[k] = 'Something went wrong on our side. Please try again.'
+                        dirty = True
+                if dirty:
+                    response.set_data(json.dumps(body))
+    except Exception:
+        pass
+    return response
 
 
 # =====================================================================================================
