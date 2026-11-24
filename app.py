@@ -39237,10 +39237,6 @@ def _mfa_challenge_response(user):
     }), 200
 
 
-@app.route('/api/auth/login', methods=['POST', 'OPTIONS'])
-@app.route('/api/login', methods=['POST', 'OPTIONS'])
-@limiter.limit("5 per minute")
-
 def _login_stage_for(user):
     """Post-authentication gates shared by password login and MFA login.
 
@@ -39392,6 +39388,9 @@ def _login_stage_for(user):
     }
 
 
+@app.route('/api/auth/login', methods=['POST', 'OPTIONS'])
+@app.route('/api/login', methods=['POST', 'OPTIONS'])
+@limiter.limit("5 per minute")
 def login():
     """Unified login endpoint with compliance, payment status check, and dashboard redirection"""
     try:
