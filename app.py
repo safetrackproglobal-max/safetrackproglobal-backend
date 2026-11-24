@@ -48997,57 +48997,10 @@ def get_impact_scorecard():
 @app.route('/api/environmental/alerts/smart', methods=['GET'])
 @jwt_required
 def get_smart_alerts():
-    """Intelligent alert system"""
+    """Open environmental alerts of the user's company."""
     try:
-        # Super admin detection
-        is_super_admin = check_super_admin()
-        
-        alerts = [
-            {
-                'id': 1,
-                'type': 'predictive',
-                'severity': 'medium',
-                'message': 'Water pH levels trending toward non-compliance',
-                'suggested_action': 'Adjust chemical dosing in cooling towers',
-                'confidence': 87,
-                'timestamp': datetime.utcnow().isoformat(),
-                'acknowledged': False
-            },
-            {
-                'id': 2,
-                'type': 'anomaly', 
-                'severity': 'high',
-                'message': 'Unusual PM2.5 spike detected in Zone B',
-                'suggested_action': 'Check air filtration systems immediately',
-                'confidence': 92,
-                'timestamp': datetime.utcnow().isoformat(),
-                'acknowledged': False
-            }
-        ]
-        
-        # Add system alerts for super admin
-        if is_super_admin:
-            alerts.append({
-                'id': 3,
-                'type': 'system',
-                'severity': 'info',
-                'message': 'Model retraining completed successfully',
-                'suggested_action': 'Review new model performance metrics',
-                'confidence': 100,
-                'timestamp': datetime.utcnow().isoformat(),
-                'acknowledged': False,
-                'system_metric': 'model_accuracy: 94.2%'
-            })
-        
-        return jsonify({
-            'success': True,
-            'alerts': alerts,
-            'unacknowledged_count': len([a for a in alerts if not a['acknowledged']]),
-            'access_level': 'super_admin' if is_super_admin else 'regular'
-        }), 200
-        
+        return _env_alerts_response()
     except Exception as e:
-        current_app.logger.error(f"Smart alerts error: {str(e)}")
         return _env_fail(e)
 
 
@@ -51222,141 +51175,53 @@ def thermal_uhi_records():
 @app.route('/api/environmental/intelligence/advanced-dashboard', methods=['GET'])
 @jwt_required
 def get_advanced_environmental_intelligence():
-    """Advanced real-time environmental intelligence data with AI integration"""
+    """Environmental indicators calculated from the company's own records (last 90 days).
+    A value is null when there are no records for it. Nothing is estimated or invented."""
     try:
-        # Super admin detection
-        is_super_admin = check_super_admin()
-        current_app.logger.info(f"Advanced intelligence dashboard - User: {request.user.email}, Super admin: {is_super_admin}")
-        
-        # Get AI service for stats and predictions
-        ai_service = get_environmental_ai_service()
-        model_stats = ai_service.get_model_stats()
-        
-        # SUPER ADMIN: BYPASS ALL CHECKS
-        if is_super_admin:
-            current_app.logger.info(f"🔓 SUPER ADMIN - Advanced intelligence dashboard for {request.user.email}")
-            
-            # Enhanced data with AI insights for super admin
-            intelligence_data = {
-                'environmental_health_score': 87,
-                'carbon_footprint': 1245,
-                'sustainability_index': 92,
-                'predictive_alerts': [
-                    {
-                        'type': 'air_quality',
-                        'message': 'PM2.5 levels expected to rise by 15% in next 6 hours',
-                        'severity': 'warning',
-                        'suggested_action': 'Increase ventilation in manufacturing areas',
-                        'confidence': 85,
-                        'ai_confidence': 0.92,
-                        'model_used': 'air_quality_v2.3',
-                        'timestamp': (datetime.utcnow() + timedelta(hours=1)).isoformat(),
-                        'affected_zones': ['Zone A', 'Zone B']
-                    },
-                    {
-                        'type': 'water_quality',
-                        'message': 'pH levels trending acidic in cooling system',
-                        'severity': 'medium', 
-                        'suggested_action': 'Check chemical dosing pumps',
-                        'confidence': 78,
-                        'ai_confidence': 0.88,
-                        'model_used': 'water_quality_v2.1',
-                        'timestamp': (datetime.utcnow() + timedelta(hours=3)).isoformat(),
-                        'affected_zones': ['Cooling Tower 1', 'Cooling Tower 2']
-                    }
-                ],
-                'live_metrics': {
-                    'air_quality_compliance': 94,
-                    'water_quality_compliance': 88,
-                    'waste_reduction': 65,
-                    'energy_efficiency': 78,
-                    'carbon_reduction': 42,
-                    'biodiversity_index': 76
-                },
-                'trends': {
-                    'air_quality_trend': 'improving',
-                    'water_quality_trend': 'stable',
-                    'energy_trend': 'improving',
-                    'waste_trend': 'declining'
-                },
-                'recommendations': [
-                    'Optimize HVAC systems during peak hours',
-                    'Schedule water quality testing for Zone B',
-                    'Review waste segregation protocols'
-                ],
-                'ai_insights': {
-                    'model_accuracy': model_stats.get('satellite_analysis', {}).get('avg_inference_time_ms', 0) > 0,
-                    'total_predictions': model_stats.get('satellite_analysis', {}).get('total_inferences', 0),
-                    'cache_hit_rate': calculate_cache_hit_rate(ai_service),
-                    'models_available': list(ai_service.downloaded_models.keys())
-                }
-            }
-            
-            return jsonify({
-                'success': True,
-                'intelligence': intelligence_data,
-                'access_level': 'super_admin',
-                'metadata': {
-                    'timestamp': datetime.utcnow().isoformat(),
-                    'data_source': 'ai_enhanced'
-                }
-            }), 200
-        
-        # ===== REGULAR USER FLOW =====
-        # Check feature access
-        if not has_feature_access('advanced_dashboard'):
-            return jsonify({
-                'success': False,
-                'error': 'Advanced dashboard requires Business or Enterprise plan',
-                'code': 'FEATURE_NOT_AVAILABLE'
-            }), 403
-        
-        # Standard data with AI integration for regular users
-        intelligence_data = {
-            'environmental_health_score': 87,
-            'carbon_footprint': 1245,
-            'sustainability_index': 92,
-            'predictive_alerts': [
-                {
-                    'type': 'air_quality',
-                    'message': 'PM2.5 levels expected to rise by 15% in next 6 hours',
-                    'severity': 'warning',
-                    'suggested_action': 'Increase ventilation in manufacturing areas',
-                    'confidence': 85
-                },
-                {
-                    'type': 'water_quality',
-                    'message': 'pH levels trending acidic in cooling system',
-                    'severity': 'medium', 
-                    'suggested_action': 'Check chemical dosing pumps',
-                    'confidence': 78
-                }
-            ],
-            'live_metrics': {
-                'air_quality_compliance': 94,
-                'water_quality_compliance': 88,
-                'waste_reduction': 65,
-                'energy_efficiency': 78,
-                'carbon_reduction': 42,
-                'biodiversity_index': 76
-            },
-            'trends': {
-                'air_quality_trend': 'improving',
-                'water_quality_trend': 'stable',
-                'energy_trend': 'improving',
-                'waste_trend': 'declining'
-            },
-            'recommendations': generate_recommendations(94, 88, 30)
-        }
-        
-        return jsonify({
-            'success': True,
-            'intelligence': intelligence_data
-        }), 200
-        
+        if not check_super_admin() and not has_feature_access('advanced_dashboard'):
+            return jsonify({'success': False, 'error': 'Advanced dashboard requires Business or Enterprise plan',
+                            'code': 'FEATURE_NOT_AVAILABLE'}), 403
+        ctx = _env_ai_ctx(request.user, 90)
+        ind = env_analytics.indicators(ctx)
+        measured = [v for v in (ind['air_compliance'], ind['water_compliance']) if v is not None]
+        metrics = {k: round(v) for k, v in (('air_quality_compliance', ind['air_compliance'] if ind['air_readings'] else None),
+                                            ('water_quality_compliance', ind['water_compliance'] if ind['water_samples'] else None),
+                                            ('goal_progress', ind['goal_progress'] if ind['goals'] else None)) if v is not None}
+        todo = []
+        if ind['severe_open']:
+            todo.append(f"{ind['severe_open']} high or critical incident(s) are still open")
+        if ind['overdue_reports']:
+            todo.append(f"{ind['overdue_reports']} compliance report(s) are past their date")
+        todo += [f'Goal behind schedule: {g}' for g in ind['behind_list']]
+        return jsonify({'success': True, 'intelligence': {
+            'environmental_health_score': round(sum(measured) / len(measured)) if measured and (ind['air_readings'] or ind['water_samples']) else None,
+            'carbon_footprint': None,
+            'sustainability_index': round(ind['goal_progress']) if ind['goals'] and ind['goal_progress'] is not None else None,
+            'live_sensors': ind['sensors_active'],
+            'predictive_alerts': [_env_alert_dict(a) for a in _env_open_alerts(10)],
+            'live_metrics': metrics, 'trends': {}, 'recommendations': todo, 'period_days': 90, 'data_source': 'records'}}), 200
     except Exception as e:
-        current_app.logger.error(f"Advanced intelligence dashboard error: {str(e)}")
         return _env_fail(e)
+
+
+def _env_open_alerts(limit=50):
+    return (_env_scoped(EnvironmentalAlert).filter_by(status='active')
+            .order_by(EnvironmentalAlert.created_at.desc()).limit(limit).all())
+
+
+def _env_alert_dict(a):
+    return {'id': a.id, 'type': a.alert_type, 'severity': a.severity, 'message': a.message, 'suggested_action': a.suggested_action,
+            'confidence': a.confidence_score, 'timestamp': a.created_at.isoformat() if a.created_at else None,
+            'acknowledged': bool(a.acknowledged), 'category': a.category, 'location': a.location, 'sensor_id': a.sensor_id,
+            'trigger_value': a.trigger_value, 'threshold_value': a.threshold_value}
+
+
+def _env_alerts_response():
+    alerts = [_env_alert_dict(a) for a in _env_open_alerts()]
+    return jsonify({'success': True, 'alerts': alerts, 'total_alerts': len(alerts),
+                    'unacknowledged_count': sum(1 for a in alerts if not a['acknowledged']),
+                    'critical_count': sum(1 for a in alerts if a['severity'] == 'critical'),
+                    'last_updated': datetime.utcnow().isoformat(), 'data_source': 'records'}), 200
 
 
 # ============================================================================
@@ -51458,7 +51323,7 @@ def get_advanced_predictive_analytics():
                 data = {
                     'forecast': forecast,
                     'trend': trend,
-                    'confidence': scores.ai_confidence if scores else 85,
+                    'confidence': scores.ai_confidence if scores else 0,
                     'recommendations': recommendations,
                     'risk_level': 'high' if max_value > 90 else 'medium' if max_value > 70 else 'low',
                     'impact_areas': [m.location for m in metrics[:3] if m.location] or ['all_locations'],
@@ -51470,20 +51335,6 @@ def get_advanced_predictive_analytics():
                     },
                     'data_source': 'database'
                 }
-                
-                # ✅ Add AI insights for enterprise/super admin
-                if is_super_admin or (current_user.subscription_plan and current_user.subscription_plan.lower() in ['enterprise', 'custom']):
-                    try:
-                        model_stats = ai_service.get_model_stats()
-                        data['ai_model_details'] = {
-                            'model_version': 'analytics_v1.0.0',
-                            'training_date': '2026-01-15',
-                            'accuracy': 0.92,
-                            'features_used': ['historical_data', 'trend_analysis', 'seasonal_patterns'],
-                            'inference_count': ai_service.inference_stats.get('satellite_analysis', {}).get('count', 0)
-                        }
-                    except Exception as ai_error:
-                        data['ai_model_details'] = {'message': 'AI insights currently unavailable'}
                 
                 return jsonify({
                     'success': True,
@@ -52056,160 +51907,11 @@ def get_ai_prediction(category, score, trend):
 @limiter.limit("30 per minute")
 @jwt_required
 def get_advanced_smart_alerts():
-    """Get advanced smart environmental alerts with AI integration"""
+    """Open environmental alerts of the user's company."""
     try:
-        # Super admin detection
-        is_super_admin = check_super_admin()
-        
-        # Get AI service for insights
-        ai_service = get_environmental_ai_service()
-        
-        # Try to get alerts from database first
-        try:
-            alerts = EnvironmentalAlert.query.filter_by(
-                status='active'
-            ).order_by(EnvironmentalAlert.created_at.desc()).limit(50).all()
-            
-            alerts_data = []
-            for alert in alerts:
-                alert_dict = {
-                    'id': alert.id,
-                    'type': alert.alert_type,
-                    'severity': alert.severity,
-                    'message': alert.message,
-                    'suggested_action': alert.suggested_action,
-                    'confidence': alert.confidence_score,
-                    'timestamp': alert.created_at.isoformat() if alert.created_at else datetime.utcnow().isoformat(),
-                    'acknowledged': alert.acknowledged,
-                    'category': alert.category,
-                    'location': alert.location,
-                    'sensor_id': alert.sensor_id,
-                    'trigger_value': alert.trigger_value,
-                    'threshold_value': alert.threshold_value,
-                    'escalation_level': get_escalation_level(alert.severity)
-                }
-                
-                # Add AI insights for super admin
-                if is_super_admin:
-                    alert_dict['ai_analysis'] = {
-                        'predicted_duration': '2-4 hours',
-                        'recommended_actions': [
-                            'Immediate inspection required',
-                            'Notify environmental team'
-                        ],
-                        'similar_incidents': 3,
-                        'confidence_trend': 'increasing'
-                    }
-                
-                alerts_data.append(alert_dict)
-            
-            # Calculate statistics
-            unacknowledged_count = EnvironmentalAlert.query.filter_by(
-                status='active', acknowledged=False
-            ).count()
-            
-            critical_count = EnvironmentalAlert.query.filter_by(
-                status='active', severity='critical'
-            ).count()
-            
-            data_source = 'database'
-            
-        except Exception as db_error:
-            current_app.logger.warning(f"Database query failed, using fallback data: {str(db_error)}")
-            # Fallback to mock data if database query fails
-            alerts_data = [
-                {
-                    'id': 1,
-                    'type': 'predictive',
-                    'severity': 'medium',
-                    'message': 'Water pH levels trending toward non-compliance',
-                    'suggested_action': 'Adjust chemical dosing in cooling towers',
-                    'confidence': 87,
-                    'timestamp': datetime.utcnow().isoformat(),
-                    'acknowledged': False,
-                    'category': 'water_quality',
-                    'location': 'Cooling Tower A',
-                    'sensor_id': 'sensor_water_001',
-                    'trigger_value': 8.2,
-                    'threshold_value': 8.5,
-                    'escalation_level': 2
-                },
-                {
-                    'id': 2,
-                    'type': 'anomaly', 
-                    'severity': 'high',
-                    'message': 'Unusual PM2.5 spike detected in Zone B',
-                    'suggested_action': 'Check air filtration systems immediately',
-                    'confidence': 92,
-                    'timestamp': datetime.utcnow().isoformat(),
-                    'acknowledged': False,
-                    'category': 'air_quality',
-                    'location': 'Manufacturing Zone B',
-                    'sensor_id': 'sensor_air_005',
-                    'trigger_value': 85,
-                    'threshold_value': 75,
-                    'escalation_level': 3
-                },
-                {
-                    'id': 3,
-                    'type': 'compliance',
-                    'severity': 'low',
-                    'message': 'Upcoming regulatory reporting deadline',
-                    'suggested_action': 'Prepare quarterly compliance report',
-                    'confidence': 95,
-                    'timestamp': datetime.utcnow().isoformat(),
-                    'acknowledged': True,
-                    'category': 'regulatory',
-                    'location': 'All Facilities',
-                    'sensor_id': None,
-                    'trigger_value': None,
-                    'threshold_value': None,
-                    'escalation_level': 1
-                }
-            ]
-            
-            # Add AI insights for super admin even in fallback
-            if is_super_admin:
-                for alert in alerts_data:
-                    alert['ai_analysis'] = {
-                        'predicted_duration': '2-4 hours' if alert['severity'] != 'low' else '1 day',
-                        'recommended_actions': ['Immediate action required'] if alert['severity'] == 'high' else ['Monitor situation'],
-                        'confidence_trend': 'stable'
-                    }
-            
-            unacknowledged_count = len([a for a in alerts_data if not a['acknowledged']])
-            critical_count = len([a for a in alerts_data if a['severity'] == 'critical'])
-            data_source = 'fallback'
-        
-        # Prepare response
-        response = {
-            'success': True,
-            'alerts': alerts_data,
-            'total_alerts': len(alerts_data),
-            'unacknowledged_count': unacknowledged_count,
-            'critical_count': critical_count,
-            'last_updated': datetime.utcnow().isoformat(),
-            'data_source': data_source
-        }
-        
-        # Add AI metadata for super admin
-        if is_super_admin:
-            response['ai_metadata'] = {
-                'models_active': len(ai_service.downloaded_models),
-                'prediction_accuracy': '94.2%',
-                'cache_hits': ai_service.inference_stats.get('cache', {}).get('cache_hits', 0),
-                'system_health': 'optimal'
-            }
-            response['access_level'] = 'super_admin'
-        
-        return jsonify(response), 200
-        
+        return _env_alerts_response()
     except Exception as e:
-        current_app.logger.error(f"Advanced smart alerts error: {str(e)}")
-        return jsonify({
-            'success': False,
-            'error': 'Failed to fetch smart alerts'
-        }), 500
+        return _env_fail(e)
 
 
 # ============================================================================
@@ -52260,18 +51962,7 @@ def acknowledge_advanced_smart_alert(alert_id):
                 }), 404
                 
         except Exception as db_error:
-            current_app.logger.error(f"Database update failed: {db_error}")
-            db.session.rollback()
-            
-            # Even if database fails, return success for UX with warning
-            return jsonify({
-                'success': True,
-                'message': 'Alert acknowledged (database sync pending)',
-                'alert_id': alert_id,
-                'acknowledged_at': datetime.utcnow().isoformat(),
-                'acknowledged_by': request.user.email,
-                'warning': 'Database sync failed, but acknowledgment recorded'
-            }), 200
+            return _env_fail(db_error, 'The alert could not be saved. Please try again.')
             
     except Exception as e:
         current_app.logger.error(f"Acknowledge advanced alert error: {str(e)}")
