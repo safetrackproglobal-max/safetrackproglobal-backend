@@ -8657,6 +8657,9 @@ def _resolve_server_price(user, plan, duration):
     """
     if duration not in ('1_month', '6_month', '1_year'):
         return None, None, (jsonify({'error': 'Invalid billing duration'}), 400)
+    company = _billing_company(user)
+    if company is not None:
+        return _company_price(company, plan, duration)
     plan_pricing = get_pricing(getattr(user, 'country', None) or 'default').get(plan)
     if not plan_pricing:
         return None, None, (jsonify({'error': 'Invalid plan'}), 400)
@@ -8709,6 +8712,12 @@ def _expected_payment_amount(payment):
             SimpleNamespace(country=_normalize_country_name(country)), payment.plan, payment.duration)
         if err is None and price and (currency or '').upper() == (payment.currency or '').upper():
             expected = max(expected, float(price))
+        # company plans: an old checkout link must not undercut the price agreed now
+        company = _billing_company(User.query.get(payment.user_id)) if payment.user_id else None
+        quote = _active_quote(company.id) if company is not None else None
+        if quote and quote.plan == payment.plan and quote.billing_cycle == payment.duration \
+                and quote.currency.upper() == (payment.currency or '').upper():
+            expected = max(expected, float(quote.amount))
     except Exception as e:
         logging.warning(f"Could not resolve expected amount for payment {getattr(payment, 'id', '?')}: {e}")
     return expected
@@ -31611,6 +31620,11 @@ def confirm_manual_payment():
         except (TypeError, ValueError):
             return jsonify({'error': 'Invalid amount'}), 400
 
+        if _billing_company(current_user) is not None:
+            price_problem = _resolve_server_price(current_user, plan, duration)[2]
+            if price_problem:
+                return price_problem
+
         # 🔒 Flag (for the verifying admin) any amount below the real plan price
         expected_amount, expected_currency, _price_error = _resolve_server_price(current_user, plan, duration)
         if expected_amount and (amount + 0.01 < expected_amount or (expected_currency or '').upper() != currency):
@@ -31688,12 +31702,9 @@ def confirm_manual_payment():
 def notify_admins_manual_payment(user, payment):
     """Send notification to all admins about manual payment"""
     try:
-        # Get all admin users
-        admins = User.query.filter(
-            User.user_type.in_(['admin', 'super_admin', 'platform_owner']),
-            User.is_active == True
-        ).all()
-        
+        # Platform team only: 'admin' users are customers' company admins and must not see other customers' payments
+        admins = _platform_team()
+
         payment_method_display = {
             'bank_transfer': 'Bank Transfer',
             'mobile_money': 'Mobile Money'
@@ -33645,63 +33656,11 @@ def verify_manual_payment(payment_id):
         # ✅ Get user
         user = payment.user
         if user:
-            # Get duration
-            duration = getattr(payment, 'duration', '1_month')
-            expiry_date = calculate_expiry_date_from_duration(duration)
+            duration = getattr(payment, 'duration', None) or '1_month'
             plan = payment.plan
-            
-            # ✅ UPDATE USER'S PLAN
-            user.subscription_plan = plan
-            user.subscription_status = 'active'
-            user.billing_cycle = duration
-            user.subscription_ends_at = expiry_date
-            user.last_payment_date = datetime.utcnow()
+            _activate_paid_plan(user, plan, duration, payment.payment_method)
             user.is_active = True
-            
-            # ✅ UPDATE COMPANY'S PLAN (if user has a company)
-            if user.company_id:
-                company = Company.query.get(user.company_id)
-                if company:
-                    # ✅ Update company plan to match the payment
-                    company.plan = plan
-                    company.subscription_status = 'active'
-                    company.billing_cycle = duration
-                    company.subscription_ends_at = expiry_date
-                    company.updated_at = datetime.utcnow()
-                    app.logger.info(f"✅ Updated company {company.name} plan to {plan}")
-                    
-                    # ✅ Also sync ALL other users in the company
-                    other_users = User.query.filter(
-                        User.company_id == user.company_id,
-                        User.id != user.id
-                    ).all()
-                    
-                    for other_user in other_users:
-                        other_user.subscription_plan = plan
-                        other_user.subscription_status = 'active'
-                        other_user.billing_cycle = duration
-                        other_user.subscription_ends_at = expiry_date
-                    
-                    app.logger.info(f"✅ Synced {len(other_users)} other users to {plan} plan")
-            
-            # Create or update subscription record
-            existing_sub = Subscription.query.filter_by(user_id=user.id).first()
-            if existing_sub:
-                existing_sub.plan = plan
-                existing_sub.status = 'active'
-                existing_sub.end_date = expiry_date
-                existing_sub.payment_method = payment.payment_method
-            else:
-                new_sub = Subscription(
-                    user_id=user.id,
-                    plan=plan,
-                    status='active',
-                    start_date=datetime.utcnow(),
-                    end_date=expiry_date,
-                    payment_method=payment.payment_method
-                )
-                db.session.add(new_sub)
-            
+
             # Create payment history record
             payment_history = PaymentHistory(
                 user_id=user.id,
@@ -33853,14 +33812,7 @@ def bulk_verify_payments():
                     
                     # Update user subscription
                     if payment.user:
-                        duration = getattr(payment, 'duration', '1_month')
-                        expiry_date = calculate_expiry_date_from_duration(duration)
-                        
-                        payment.user.subscription_plan = payment.plan
-                        payment.user.subscription_status = 'active'
-                        payment.user.billing_cycle = duration
-                        payment.user.subscription_ends_at = expiry_date
-                        payment.user.last_payment_date = datetime.utcnow()
+                        _activate_paid_plan(payment.user, payment.plan, getattr(payment, 'duration', None) or '1_month', payment.payment_method)
                         payment.user.is_active = True
                     
                     verified_count += 1
@@ -39230,7 +39182,8 @@ def _login_stage_for(user):
         else:
             print(f"⚠️ Company with ID {user.company_id} not found")
 
-    if not company_found and user.company_name:
+    # Individuals can type any company name in their profile, so a name alone never links them to a company.
+    if not company_found and user.company_name and user.user_type == 'employee':
         company = Company.query.filter_by(name=user.company_name).first()
         if company:
             company_found = True
@@ -136247,7 +136200,7 @@ def create_paypal_payment():
         transaction_id = f"PAYPAL-{user_id}-{int(time.time())}-{uuid.uuid4().hex[:8].upper()}"
         
         # Get frontend URL for redirects
-        frontend_url = app.config.get('FRONTEND_URL', 'http://safetrackproglobal.com')
+        frontend_url = _pay_frontend()
         
         # ✅ FIX: Shorten the custom data - keep it under 256 characters
         # Store only essential data in the custom field
@@ -136396,7 +136349,7 @@ def execute_paypal_payment():
         payment_id = request.args.get('paymentId')
         payer_id = request.args.get('PayerID')
         
-        frontend_url = app.config.get('FRONTEND_URL', 'http://safetrackproglobal.com')
+        frontend_url = _pay_frontend()
         
         if not payment_id or not payer_id:
             return redirect(f"{frontend_url}/payment-failed?error=missing_params")
@@ -136419,87 +136372,10 @@ def execute_paypal_payment():
             original_currency = custom_data.get('c') or custom_data.get('original_currency')
             original_amount = custom_data.get('a') or custom_data.get('original_amount')
             
-            # Update payment record
-            db_payment = Payment.query.filter_by(transaction_id=transaction_id).first()
+            db_payment = _find_payment(transaction_id)
             if db_payment:
-                db_payment.status = 'completed'
-                db_payment.completed_at = datetime.utcnow()
-                db_payment.payment_details = json.dumps({
-                    **(json.loads(db_payment.payment_details) if db_payment.payment_details else {}),
-                    'paypal_payment_id': payment_id,
-                    'payer_id': payer_id,
-                    'executed': True
-                })
-                db.session.commit()
-                
-                # Update payment history
-                payment_history = PaymentHistory.query.filter_by(payment_id=transaction_id).first()
-                if payment_history:
-                    payment_history.status = 'completed'
-                    payment_history.paid_at = datetime.utcnow()
-                    payment_history.gateway_response = {'paypal_payment_id': payment_id}
-                    db.session.commit()
-                
-                # Update user's subscription
-                user = User.query.get(db_payment.user_id)
-                if user:
-                    user.subscription_plan = db_payment.plan
-                    user.subscription_status = 'active'
-                    user.billing_cycle = db_payment.duration
-                    user.last_payment_date = datetime.utcnow()
-                    
-                    # Calculate expiry
-                    if db_payment.duration == '1_month':
-                        user.subscription_ends_at = datetime.utcnow() + timedelta(days=30)
-                    elif db_payment.duration == '6_month':
-                        user.subscription_ends_at = datetime.utcnow() + timedelta(days=180)
-                    elif db_payment.duration == '1_year':
-                        user.subscription_ends_at = datetime.utcnow() + timedelta(days=365)
-                    
-                    db.session.commit()
-                    
-                    # Create or update subscription record
-                    existing_sub = Subscription.query.filter_by(user_id=user.id).first()
-                    if existing_sub:
-                        existing_sub.plan = db_payment.plan
-                        existing_sub.status = 'active'
-                        existing_sub.end_date = user.subscription_ends_at
-                        existing_sub.last_payment_date = datetime.utcnow()
-                        existing_sub.next_payment_date = user.subscription_ends_at
-                        existing_sub.payment_method = 'paypal'
-                    else:
-                        new_sub = Subscription(
-                            user_id=user.id,
-                            plan=db_payment.plan,
-                            status='active',
-                            start_date=datetime.utcnow(),
-                            end_date=user.subscription_ends_at,
-                            auto_renew=True,
-                            payment_method='paypal',
-                            last_payment_date=datetime.utcnow(),
-                            next_payment_date=user.subscription_ends_at
-                        )
-                        db.session.add(new_sub)
-                    db.session.commit()
-                    
-                    # Record subscription history
-                    sub_history = SubscriptionHistory(
-                        user_id=user.id,
-                        old_plan='free',
-                        new_plan=db_payment.plan,
-                        billing_cycle=db_payment.duration,
-                        country=user.country or 'default',
-                        currency=db_payment.currency,
-                        amount=db_payment.amount,
-                        change_type='upgrade',
-                        change_reason='Payment completed via PayPal',
-                        effective_date=datetime.utcnow()
-                    )
-                    db.session.add(sub_history)
-                    db.session.commit()
-                    
-                    logging.info(f"✅ User {user.email} upgraded to {db_payment.plan} via PayPal")
-            
+                _complete_gateway_payment(db_payment, {'paypal_payment_id': payment_id, 'payer_id': payer_id, 'executed': True}, 'paypal')
+
             return redirect(f"{frontend_url}/payment-success?reference={transaction_id}")
         else:
             # Payment execution failed
@@ -136510,7 +136386,7 @@ def execute_paypal_payment():
         logging.error(f"❌ PayPal execute error: {e}")
         import traceback
         traceback.print_exc()
-        frontend_url = app.config.get('FRONTEND_URL', 'http://safetrackproglobal.com')
+        frontend_url = _pay_frontend()
         return redirect(f"{frontend_url}/payment-failed?error=execute_error")
 
 @app.route('/api/payment/paypal/webhook', methods=['POST'])
@@ -136544,19 +136420,11 @@ def paypal_webhook():
             transaction_id = custom_data.get('transaction_id') or custom_data.get('t')
             
             if transaction_id:
-                # Update payment status
-                payment = Payment.query.filter_by(transaction_id=transaction_id).first()
+                payment = _find_payment(transaction_id)
                 if payment and payment.status != 'completed':
-                    payment.status = 'completed'
-                    payment.completed_at = datetime.utcnow()
-                    payment.payment_details = json.dumps({
-                        **(json.loads(payment.payment_details) if payment.payment_details else {}),
-                        'webhook_event': event
-                    })
-                    db.session.commit()
-                    
-                    logging.info(f"✅ PayPal webhook: Payment completed for {transaction_id}")
-        
+                    _complete_gateway_payment(payment, {'webhook_event': event}, 'paypal')
+                    logging.info(f"PayPal webhook: payment completed for {transaction_id}")
+
         elif event_type == 'PAYMENT.SALE.DENIED':
             # Handle denied payment
             resource = event.get('resource', {})
@@ -136565,7 +136433,7 @@ def paypal_webhook():
             
             if transaction_id:
                 payment = Payment.query.filter_by(transaction_id=transaction_id).first()
-                if payment:
+                if payment and payment.status == 'pending':
                     payment.status = 'failed'
                     payment.failure_reason = 'Payment denied'
                     db.session.commit()
@@ -136694,7 +136562,7 @@ def create_paypal_payment_public():
         transaction_id = f"PAYPAL-SIGNUP-{int(time.time())}-{uuid.uuid4().hex[:8].upper()}"
         
         # Get frontend URL for redirects
-        frontend_url = app.config.get('FRONTEND_URL', 'http://safetrackproglobal.com')
+        frontend_url = _pay_frontend()
         
         # Store data in shortened format for custom field
         custom_data = {
@@ -136848,7 +136716,7 @@ def execute_paypal_payment_public():
         payment_id = request.args.get('paymentId')
         payer_id = request.args.get('PayerID')
         
-        frontend_url = app.config.get('FRONTEND_URL', 'http://safetrackproglobal.com')
+        frontend_url = _pay_frontend()
         
         if not payment_id or not payer_id:
             return redirect(f"{frontend_url}/payment-failed?error=missing_params")
@@ -136910,7 +136778,7 @@ def execute_paypal_payment_public():
         logging.error(f"❌ PayPal execute error: {e}")
         import traceback
         traceback.print_exc()
-        frontend_url = app.config.get('FRONTEND_URL', 'http://safetrackproglobal.com')
+        frontend_url = _pay_frontend()
         return redirect(f"{frontend_url}/payment-failed?error=execute_error")
 
 @app.route('/api/payment/paystack/initialize', methods=['POST'])
@@ -136958,7 +136826,7 @@ def initialize_paystack_payment():
             'country': data.get('country', user.country or 'Ghana'),
             'current_plan': request.effective_plan,
             'payment_method': 'paystack',
-            'callback_url': data.get('callback_url', f"{request.host_url.rstrip('/')}/api/payment/paystack/callback"),
+            'callback_url': _safe_payment_callback(data.get('callback_url')),
             'custom_fields': [
                 {
                     'display_name': "Plan",
@@ -137007,7 +136875,7 @@ def initialize_paystack_payment():
             
             return jsonify({
                 'success': True,
-                'authorization_url': f"{app.config.get('FRONTEND_URL', 'http://safetrackproglobal.com')}/mock-payment?reference={reference}",
+                'authorization_url': f"{_pay_frontend()}/mock-payment?reference={reference}",
                 'reference': reference,
                 'access_code': f"mock_access_{reference}",
                 'mock': True,
@@ -137031,7 +136899,7 @@ def initialize_paystack_payment():
         
         try:
             # Convert amount to kobo/cents (Paystack uses smallest currency unit)
-            amount_in_kobo = int(amount * 100)
+            amount_in_kobo = int(round(amount * 100))
             
             # Initialize transaction with Paystack
             response = paystack.transaction.initialize(
@@ -137118,150 +136986,26 @@ def initialize_paystack_payment():
 
 @app.route('/api/payment/paystack/public-callback', methods=['GET'])
 def paystack_public_callback():
-    """Handle Paystack payment callback"""
+    """Browser return from Paystack. The plan starts only if Paystack itself confirms the charge."""
+    base = _pay_frontend()
+    reference = (request.args.get('reference') or '').strip()
+    if not reference:
+        return redirect(f"{base}/payment-failed?error=no_reference")
     try:
-        reference = request.args.get('reference')
-        
-        if not reference:
-            return redirect(f"{app.config.get('FRONTEND_URL', 'http://safetrackproglobal.com')}/payment-failed?error=no_reference")
-        
-        # Find payment in your database
-        payment = Payment.query.filter_by(transaction_id=reference).first()
-        
+        ref = quote_plus(reference)
+        payment = _find_payment(reference)
         if not payment:
-            # Try finding by paystack_reference
-            payment = Payment.query.filter_by(paystack_reference=reference).first()
-        
-        if not payment:
-            logger.error(f"Payment not found for reference: {reference}")
-            return redirect(f"{app.config.get('FRONTEND_URL', 'http://safetrackproglobal.com')}/payment-failed?error=payment_not_found")
-        
-        # Verify transaction with Paystack
-        if PAYSTACK_AVAILABLE and paystack:
-            try:
-                response = paystack.transaction.verify(reference=reference)
-                
-                if response['status'] and response['data']['status'] == 'success':
-                    # Update payment record
-                    if payment.status == 'pending' and not _paystack_amount_ok(payment, response['data']):
-                        _flag_payment_mismatch(payment, response['data'])
-                        return redirect(f"{app.config.get('FRONTEND_URL', 'http://safetrackproglobal.com')}/payment-failed?reference={reference}&error=amount_mismatch")
-                    if payment.status == 'pending':
-                        payment.status = 'completed'
-                        payment.completed_at = datetime.utcnow()
-                        payment.payment_details = json.dumps({
-                            **(json.loads(payment.payment_details) if payment.payment_details else {}),
-                            'verification_response': response['data']
-                        })
-                        db.session.commit()
-                        
-                        # Update payment history
-                        payment_history = PaymentHistory.query.filter_by(payment_id=reference).first()
-                        if payment_history:
-                            payment_history.status = 'completed'
-                            payment_history.paid_at = datetime.utcnow()
-                            payment_history.gateway_response = response['data']
-                            db.session.commit()
-                        
-                        # Update user's plan
-                        user = User.query.get(payment.user_id)
-                        if user:
-                            # Update user subscription
-                            user.subscription_plan = payment.plan
-                            user.subscription_status = 'active'
-                            user.billing_cycle = payment.duration
-                            user.last_payment_date = datetime.utcnow()
-                            
-                            # Calculate expiry date
-                            if payment.duration == '1_month':
-                                user.subscription_ends_at = datetime.utcnow() + timedelta(days=30)
-                            elif payment.duration == '6_month':
-                                user.subscription_ends_at = datetime.utcnow() + timedelta(days=180)
-                            elif payment.duration == '1_year':
-                                user.subscription_ends_at = datetime.utcnow() + timedelta(days=365)
-                            
-                            db.session.commit()
-                            
-                            # Create or update subscription record
-                            existing_sub = Subscription.query.filter_by(user_id=user.id).first()
-                            if existing_sub:
-                                existing_sub.plan = payment.plan
-                                existing_sub.status = 'active'
-                                existing_sub.end_date = user.subscription_ends_at
-                                existing_sub.last_payment_date = datetime.utcnow()
-                                existing_sub.next_payment_date = user.subscription_ends_at
-                                existing_sub.payment_method = 'paystack'
-                            else:
-                                new_sub = Subscription(
-                                    user_id=user.id,
-                                    plan=payment.plan,
-                                    status='active',
-                                    start_date=datetime.utcnow(),
-                                    end_date=user.subscription_ends_at,
-                                    auto_renew=True,
-                                    payment_method='paystack',
-                                    last_payment_date=datetime.utcnow(),
-                                    next_payment_date=user.subscription_ends_at
-                                )
-                                db.session.add(new_sub)
-                            
-                            db.session.commit()
-                            
-                            # Record subscription history
-                            sub_history = SubscriptionHistory(
-                                user_id=user.id,
-                                old_plan='free',  # You might want to get the actual old plan
-                                new_plan=payment.plan,
-                                billing_cycle=payment.duration,
-                                country=user.country or 'default',
-                                currency=payment.currency,
-                                amount=payment.amount,
-                                change_type='upgrade',
-                                change_reason='Payment completed via Paystack',
-                                effective_date=datetime.utcnow()
-                            )
-                            db.session.add(sub_history)
-                            db.session.commit()
-                            
-                            logger.info(f"Paystack payment successful: {reference} - User: {user.email} - Plan: {payment.plan}")
-                            
-                            # Send confirmation email (if you have this function)
-                            send_payment_confirmation_email(user, payment)
-                    
-                    return redirect(f"{app.config.get('FRONTEND_URL', 'http://safetrackproglobal.com')}/payment-success?reference={reference}")
-                else:
-                    # Payment verification failed
-                    payment.status = 'failed'
-                    payment.failure_reason = response.get('message', 'Verification failed')
-                    payment.payment_details = json.dumps({
-                        **(json.loads(payment.payment_details) if payment.payment_details else {}),
-                        'verification_failed': response
-                    })
-                    db.session.commit()
-                    
-                    # Update payment history
-                    payment_history = PaymentHistory.query.filter_by(payment_id=reference).first()
-                    if payment_history:
-                        payment_history.status = 'failed'
-                        payment_history.gateway_response = response
-                        db.session.commit()
-                    
-                    logger.warning(f"Paystack verification failed: {reference} - {response.get('message')}")
-                    return redirect(f"{app.config.get('FRONTEND_URL', 'http://safetrackproglobal.com')}/payment-failed?reference={reference}&error=verification_failed")
-                    
-            except Exception as e:
-                logger.error(f"Paystack verification error: {e}")
-                return redirect(f"{app.config.get('FRONTEND_URL', 'http://safetrackproglobal.com')}/payment-failed?reference={reference}&error=verification_error")
-        else:
-            # 🔒 No live Paystack verification available -> never activate a plan from a URL.
-            logger.error(f"Paystack callback for {reference} received but Paystack is not configured; payment left pending")
-            return redirect(f"{app.config.get('FRONTEND_URL', 'http://safetrackproglobal.com')}/payment-waiting?reference={reference}")
-            
+            return redirect(f"{base}/payment-failed?error=payment_not_found")
+        _check_paystack(payment)
+        if payment.status == 'completed':
+            return redirect(f"{base}/payment-success?reference={ref}")
+        if payment.status == 'failed':
+            return redirect(f"{base}/payment-failed?reference={ref}&error={quote_plus(payment.failure_reason or 'failed')[:60]}")
+        return redirect(f"{base}/payment-callback?reference={ref}&checked=1")
     except Exception as e:
+        db.session.rollback()
         logger.error(f"Paystack callback error: {e}")
-        import traceback
-        traceback.print_exc()
-        return redirect(f"{app.config.get('FRONTEND_URL', 'http://safetrackproglobal.com')}/payment-failed?error=callback_error")
+        return redirect(f"{base}/payment-failed?error=callback_error")
 
 
 @app.route('/api/payment/paystack/webhook', methods=['POST'])
@@ -137288,67 +137032,10 @@ def paystack_webhook():
             data = event['data']
             reference = data['reference']
             
-            # Find payment
-            payment = Payment.query.filter_by(transaction_id=reference).first()
-            if not payment:
-                payment = Payment.query.filter_by(paystack_reference=reference).first()
-            
-            if payment and payment.status == 'pending' and not _paystack_amount_ok(payment, data):
-                _flag_payment_mismatch(payment, data)
-            elif payment and payment.status == 'pending':
-                # Update payment
-                payment.status = 'completed'
-                payment.completed_at = datetime.utcnow()
-                payment.payment_details = json.dumps({
-                    **(json.loads(payment.payment_details) if payment.payment_details else {}),
-                    'webhook_response': data
-                })
-                db.session.commit()
-                
-                # Update payment history
-                payment_history = PaymentHistory.query.filter_by(payment_id=reference).first()
-                if payment_history:
-                    payment_history.status = 'completed'
-                    payment_history.paid_at = datetime.utcnow()
-                    payment_history.gateway_response = data
-                    db.session.commit()
-                
-                # Update user plan
-                user = User.query.get(payment.user_id)
-                if user:
-                    user.subscription_plan = payment.plan
-                    user.subscription_status = 'active'
-                    user.billing_cycle = payment.duration
-                    user.last_payment_date = datetime.utcnow()
-                    
-                    if payment.duration == '1_month':
-                        user.subscription_ends_at = datetime.utcnow() + timedelta(days=30)
-                    elif payment.duration == '6_month':
-                        user.subscription_ends_at = datetime.utcnow() + timedelta(days=180)
-                    elif payment.duration == '1_year':
-                        user.subscription_ends_at = datetime.utcnow() + timedelta(days=365)
-                    
-                    db.session.commit()
-                    
-                    # Create subscription record
-                    existing_sub = Subscription.query.filter_by(user_id=user.id).first()
-                    if not existing_sub:
-                        new_sub = Subscription(
-                            user_id=user.id,
-                            plan=payment.plan,
-                            status='active',
-                            start_date=datetime.utcnow(),
-                            end_date=user.subscription_ends_at,
-                            auto_renew=True,
-                            payment_method='paystack',
-                            last_payment_date=datetime.utcnow(),
-                            next_payment_date=user.subscription_ends_at
-                        )
-                        db.session.add(new_sub)
-                        db.session.commit()
-                    
-                    logger.info(f"Paystack webhook: Payment completed for user {user.email}")
-            
+            payment = _find_payment(reference)
+            if payment and payment.status != 'completed':
+                _complete_gateway_payment(payment, data, 'paystack')
+
         elif event['event'] == 'charge.failed':
             data = event['data']
             reference = data['reference']
@@ -137357,7 +137044,7 @@ def paystack_webhook():
             if not payment:
                 payment = Payment.query.filter_by(paystack_reference=reference).first()
             
-            if payment:
+            if payment and payment.status == 'pending':
                 payment.status = 'failed'
                 payment.failure_reason = data.get('gateway_response', 'Payment failed')
                 payment.payment_details = json.dumps({
@@ -137395,103 +137082,21 @@ def paystack_webhook():
 @app.route('/api/payment/paystack/verify/<reference>', methods=['GET'])
 @jwt_required
 def verify_paystack_payment(reference):
-    """Verify Paystack payment status"""
+    """Status of the caller's own payment; asks Paystack when it is not settled yet."""
     try:
-        user = request.user
-        
-        # Find payment
-        payment = Payment.query.filter_by(transaction_id=reference).first()
-        if not payment:
-            payment = Payment.query.filter_by(paystack_reference=reference).first()
-        
-        if not payment:
-            return jsonify({'error': 'Payment not found'}), 404
-        
-        # Check ownership
-        if payment.user_id != user.id:
-            return jsonify({'error': 'Unauthorized'}), 403
-        
-        # If already completed, return success
-        if payment.status == 'completed':
-            return jsonify({
-                'success': True,
-                'status': 'completed',
-                'payment': {
-                    'reference': payment.transaction_id,
-                    'plan': payment.plan,
-                    'amount': payment.amount,
-                    'currency': payment.currency,
-                    'completed_at': payment.completed_at.isoformat() if payment.completed_at else None
-                }
-            }), 200
-        
-        # Verify with Paystack if not completed
-        if PAYSTACK_AVAILABLE and paystack and payment.payment_method != 'paystack_mock':
-            try:
-                response = paystack.transaction.verify(reference=reference)
-                
-                if response['status']:
-                    paystack_status = response['data']['status']
-                    
-                    if paystack_status == 'success' and payment.status == 'pending' and not _paystack_amount_ok(payment, response['data']):
-                        _flag_payment_mismatch(payment, response['data'])
-                    elif paystack_status == 'success' and payment.status == 'pending':
-                        payment.status = 'completed'
-                        payment.completed_at = datetime.utcnow()
-                        payment.payment_details = json.dumps({
-                            **(json.loads(payment.payment_details) if payment.payment_details else {}),
-                            'verification_response': response['data']
-                        })
-                        db.session.commit()
-                        
-                        # Update user plan
-                        user_to_update = User.query.get(payment.user_id)
-                        if user_to_update:
-                            user_to_update.subscription_plan = payment.plan
-                            user_to_update.subscription_status = 'active'
-                            user_to_update.billing_cycle = payment.duration
-                            user_to_update.last_payment_date = datetime.utcnow()
-                            
-                            if payment.duration == '1_month':
-                                user_to_update.subscription_ends_at = datetime.utcnow() + timedelta(days=30)
-                            elif payment.duration == '6_month':
-                                user_to_update.subscription_ends_at = datetime.utcnow() + timedelta(days=180)
-                            elif payment.duration == '1_year':
-                                user_to_update.subscription_ends_at = datetime.utcnow() + timedelta(days=365)
-                            
-                            db.session.commit()
-                    
-                    return jsonify({
-                        'success': True,
-                        'status': payment.status,
-                        'paystack_status': paystack_status,
-                        'payment': {
-                            'reference': payment.transaction_id,
-                            'plan': payment.plan,
-                            'amount': payment.amount,
-                            'currency': payment.currency
-                        }
-                    }), 200
-                    
-            except Exception as e:
-                logger.error(f"Paystack verification error: {e}")
-        
-        # Return current status
-        return jsonify({
-            'success': True,
-            'status': payment.status,
-            'payment': {
-                'reference': payment.transaction_id,
-                'plan': payment.plan,
-                'amount': payment.amount,
-                'currency': payment.currency,
-                'created_at': payment.created_at.isoformat() if payment.created_at else None
-            }
-        }), 200
-        
+        payment = _find_payment(reference)
+        if not payment or payment.user_id != request.user.id:
+            return jsonify({'success': False, 'error': 'Payment not found'}), 404
+        _check_paystack(payment)
+        return jsonify({'success': True, 'status': payment.status, 'failure_reason': payment.failure_reason,
+                        'payment': {'reference': payment.transaction_id, 'plan': payment.plan, 'amount': payment.amount,
+                                    'currency': payment.currency, 'duration': payment.duration, 'method': payment.payment_method,
+                                    'completed_at': payment.completed_at.isoformat() if payment.completed_at else None}}), 200
     except Exception as e:
+        db.session.rollback()
         logger.error(f"Payment verification error: {e}")
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'success': False, 'error': 'Could not check the payment'}), 500
+
 
 import json
 
@@ -137591,7 +137196,7 @@ def initialize_paystack_payment_public():
             "Content-Type": "application/json"
         }
         
-        callback_url = f"{current_app.config.get('FRONTEND_URL', 'http://safetrackproglobal.com')}/payment/callback"
+        callback_url = f"{_pay_frontend()}/payment/callback"
         
         payload = {
             "email": email,
@@ -137770,48 +137375,9 @@ def create_payment_record_public():
 # ✅ Also update the callback to handle signup payments
 @app.route('/api/payment/paystack/callback', methods=['GET'])
 def paystack_callback():
-    """Handle Paystack payment callback - Works for both authenticated and signup"""
-    try:
-        reference = request.args.get('reference')
-        
-        if not reference:
-            return redirect(f"{app.config.get('FRONTEND_URL', 'http://safetrackproglobal.com')}/payment-failed?error=no_reference")
-        
-        # Check if this is a signup payment
-        is_signup = 'SIGNUP' in reference or reference.startswith('PAYSTACK-SIGNUP')
-        
-        # Find payment - check both regular and pending session
-        payment = None
-        
-        if is_signup:
-            # For signup, check session first
-            pending_payment = session.get('pending_payment', {})
-            if pending_payment and pending_payment.get('reference') == reference:
-                # Update session payment status
-                pending_payment['status'] = 'completed'
-                pending_payment['completed_at'] = datetime.utcnow().isoformat()
-                session['pending_payment'] = pending_payment
-                session.modified = True
-                
-                logger.info(f"Signup payment completed via callback: {reference}")
-                return redirect(f"{app.config.get('FRONTEND_URL', 'http://safetrackproglobal.com')}/payment-success?reference={reference}&signup=true")
-        
-        # Regular payment flow for authenticated users
-        payment = Payment.query.filter_by(transaction_id=reference).first()
-        if not payment:
-            payment = Payment.query.filter_by(paystack_reference=reference).first()
-        
-        if payment:
-            # Process regular payment
-            # ... (existing code)
-            pass
-        
-        # Default redirect
-        return redirect(f"{app.config.get('FRONTEND_URL', 'http://safetrackproglobal.com')}/payment-waiting?reference={reference}")
-        
-    except Exception as e:
-        logger.error(f"Paystack callback error: {e}")
-        return redirect(f"{app.config.get('FRONTEND_URL', 'http://safetrackproglobal.com')}/payment-failed?error=callback_error")
+    """Older callback address: same check as the public callback."""
+    return paystack_public_callback()
+
 
 def calculate_expiry_date(duration):
     """Calculate expiry date based on duration"""
@@ -167301,6 +166867,421 @@ def doclib_member_pdf():
 
 
 # =====================================================================================================
+# COMPANY BILLING (2026-11-24): agreed price per company, one activation path for every payment method
+# =====================================================================================================
+from urllib.parse import quote_plus
+import html as _pay_html
+from models import CompanyQuote
+
+BILLING_CYCLES = {'1_month': 30, '6_month': 180, '1_year': 365}
+BILLING_CYCLE_TEXT = {'1_month': 'month', '6_month': '6 months', '1_year': 'year'}
+COMPANY_PLANS_PAID = ('enterprise', 'custom')
+QUOTE_CURRENCIES = ('GHS', 'USD', 'EUR', 'GBP', 'NGN', 'ZAR', 'KES', 'QAR', 'INR')
+PAYSTACK_CURRENCIES = {'GHS', 'NGN', 'ZAR', 'KES', 'USD'}
+PAYPAL_CURRENCIES = {'USD', 'EUR', 'GBP', 'GHS'}          # GHS is converted to USD by the PayPal route
+_PAY_HOST_RE = re.compile(r'^https://(www\.)?safetrackproglobal\.com/|^http://(localhost|127\.0\.0\.1)(:\d+)?/')
+
+
+def _pay_frontend():
+    base = (app.config.get('FRONTEND_URL') or os.getenv('FRONTEND_URL') or 'https://www.safetrackproglobal.com').rstrip('/')
+    return re.sub(r'^https?://(www\.)?safetrackproglobal\.com$', 'https://www.safetrackproglobal.com', base)
+
+
+def _safe_payment_callback(url):
+    """Return address after Paystack: only our own site."""
+    url = str(url or '')
+    return url if _PAY_HOST_RE.match(url) else f'{_pay_frontend()}/payment-callback'
+
+
+def _platform_team():
+    return User.query.filter(db.or_(User.is_super_admin == True, User.is_platform_owner == True, User.is_system_team == True),  # noqa: E712
+                             User.is_active == True).limit(20).all()  # noqa: E712
+
+
+def _billing_company(user):
+    """Company a user pays for: only company admins pay for a company. None for everybody else."""
+    uid = getattr(user, 'id', None)
+    if not uid:
+        return None
+    row = db.session.query(User.user_type, User.company_id).filter(User.id == uid).first()
+    if not row or row[0] not in ('admin', 'company_admin') or not row[1]:
+        return None
+    return db.session.get(Company, row[1])
+
+
+def _active_quote(company_id):
+    return CompanyQuote.query.filter_by(company_id=company_id, status='active').order_by(CompanyQuote.id.desc()).first()
+
+
+def _company_suspended(company):
+    return bool(company.is_suspended or company.subscription_status == 'suspended')
+
+
+def _company_price(company, plan, duration):
+    """(amount, currency, error) of the price agreed with this company."""
+    if _company_suspended(company):
+        return None, None, (jsonify({'error': 'This company account is suspended. Please contact support.', 'code': 'COMPANY_SUSPENDED'}), 403)
+    quote = _active_quote(company.id)
+    if not quote or not quote.amount:
+        return None, None, (jsonify({'error': 'Your price has not been agreed yet. Request it on the billing page.',
+                                     'requires_contact': True, 'code': 'NO_QUOTE'}), 400)
+    if plan != quote.plan or duration != quote.billing_cycle:
+        return None, None, (jsonify({'error': 'The agreed plan has changed. Reload the page to see the current price.', 'code': 'QUOTE_CHANGED'}), 409)
+    return float(quote.amount), quote.currency, None
+
+
+def _find_payment(reference):
+    if not reference:
+        return None
+    return Payment.query.filter_by(transaction_id=reference).first() or Payment.query.filter_by(paystack_reference=reference).first()
+
+
+def _payment_details(payment):
+    try:
+        d = json.loads(payment.payment_details) if payment.payment_details else {}
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _activate_paid_plan(user, plan, duration, method):
+    """Start (or extend) a paid plan for a user and, for a company admin, for the company. Does not commit."""
+    now = datetime.utcnow()
+    days = BILLING_CYCLES.get(duration, 30)
+    ends = now + timedelta(days=days)
+    company = _billing_company(user)
+    if plan not in COMPANY_PLANS_PAID:
+        company = None
+    status, members = 'active', []
+    if company is not None:
+        # an early renewal is added to the paid time that is left
+        if company.plan == plan and company.subscription_ends_at and _subscription_is_current(company.subscription_status, company.subscription_ends_at, now):
+            ends = company.subscription_ends_at + timedelta(days=days)
+        else:
+            company.subscription_starts_at = now
+        company.plan, company.billing_cycle, company.payment_method = plan, duration, method
+        company.subscription_ends_at = company.next_payment_date = ends
+        company.last_payment_date = now
+        company.is_trial = False
+        if _company_suspended(company):
+            status = 'suspended'              # a payment never lifts a suspension
+        else:
+            company.subscription_status, company.is_active = 'active', True
+        quote = _active_quote(company.id)
+        if quote and quote.plan == plan:
+            quote.last_paid_at = now
+        members = User.query.filter(User.company_id == company.id, User.id != user.id,
+                                    User.user_type.in_(('admin', 'company_admin', 'employee'))).all()
+    for person in [user] + members:
+        person.subscription_plan, person.subscription_status = plan, status
+        person.billing_cycle, person.subscription_ends_at = duration, ends
+    user.last_payment_date = now
+    sub = Subscription.query.filter_by(user_id=user.id).first()
+    if not sub:
+        sub = Subscription(user_id=user.id, plan=plan, start_date=now, auto_renew=False)
+        db.session.add(sub)
+    sub.plan, sub.status, sub.end_date = plan, 'active', ends
+    sub.payment_method, sub.last_payment_date, sub.next_payment_date = method, now, ends
+    db.session.flush()
+    for person in [user] + members:
+        UserCache.clear(person.id)
+    return ends
+
+
+def _complete_gateway_payment(payment, data, method):
+    """Record a confirmed Paystack / PayPal charge exactly once and start the plan."""
+    if payment.failure_reason == 'amount_mismatch':
+        return False
+    if method == 'paystack' and not _paystack_amount_ok(payment, data):
+        if payment.status != 'completed':
+            _flag_payment_mismatch(payment, data)
+        return False
+    # webhook and browser return can arrive together: only one of them may claim the payment
+    claimed = Payment.query.filter(Payment.id == payment.id, Payment.status.in_(('pending', 'failed'))).update(
+        {'status': 'completed', 'completed_at': datetime.utcnow(), 'failure_reason': None}, synchronize_session=False)
+    if not claimed:
+        db.session.rollback()
+        return False
+    user = None
+    try:
+        db.session.refresh(payment)
+        payment.payment_details = json.dumps({**_payment_details(payment), 'confirmation': data}, default=str)
+        history = PaymentHistory.query.filter_by(payment_id=payment.transaction_id).first()
+        if history:
+            history.status, history.paid_at = 'completed', datetime.utcnow()
+            history.gateway_response = json.loads(json.dumps(data, default=str))
+        user = db.session.get(User, payment.user_id) if payment.user_id else None
+        if user:
+            old = user.subscription_plan
+            ends = _activate_paid_plan(user, payment.plan, payment.duration, method)
+            db.session.add(SubscriptionHistory(user_id=user.id, old_plan=old, new_plan=payment.plan, billing_cycle=payment.duration,
+                                               country=user.country or 'default', currency=payment.currency, amount=payment.amount,
+                                               change_type='renewal' if old == payment.plan else 'upgrade',
+                                               change_reason=f'Payment completed via {method}', effective_date=datetime.utcnow()))
+            logger.info(f"Payment {payment.transaction_id} completed for user {user.id}: {payment.plan} until {ends:%Y-%m-%d}")
+        db.session.commit()
+    except Exception:
+        db.session.rollback()         # the payment stays unsettled, so the next webhook or check tries again
+        raise
+    try:
+        if user:
+            send_payment_confirmation_email(user, payment)
+    except Exception as e:
+        logger.warning(f"Payment confirmation email failed: {e}")
+    return True
+
+
+def _check_paystack(payment):
+    """Ask Paystack about an unsettled payment."""
+    if payment.status == 'completed' or payment.payment_method != 'paystack' or not (PAYSTACK_AVAILABLE and paystack):
+        return
+    try:
+        res = paystack.transaction.verify(reference=payment.paystack_reference or payment.transaction_id) or {}
+    except Exception as e:
+        logger.error(f"Paystack verification error: {e}")
+        return
+    data = res.get('data') or {}
+    state = data.get('status')
+    if res.get('status') and state == 'success':
+        _complete_gateway_payment(payment, data, 'paystack')
+    elif state in ('failed', 'reversed') and payment.status == 'pending':
+        payment.status, payment.failure_reason = 'failed', str(data.get('gateway_response') or 'failed')[:200]
+        db.session.commit()
+
+
+def _quote_dict(q):
+    return None if q is None else {
+        'id': q.id, 'plan': q.plan, 'billing_cycle': q.billing_cycle, 'amount': float(q.amount) if q.amount is not None else None,
+        'currency': q.currency, 'status': q.status, 'note': q.note, 'request_note': q.request_note,
+        'last_paid_at': q.last_paid_at.isoformat() if q.last_paid_at else None, 'created_at': q.created_at.isoformat() if q.created_at else None}
+
+
+def _pay_methods(currency):
+    cur = (currency or '').upper()
+    return {'paystack': bool(app.config.get('PAYSTACK_SECRET_KEY') and PAYSTACK_AVAILABLE and paystack and cur in PAYSTACK_CURRENCIES),
+            'paypal': bool(os.getenv('PAYPAL_CLIENT_ID') and os.getenv('PAYPAL_CLIENT_SECRET') and cur in PAYPAL_CURRENCIES),
+            'bank_transfer': True, 'mobile_money': cur == 'GHS'}
+
+
+@app.route('/api/billing/overview', methods=['GET'])
+@jwt_required
+def billing_overview():
+    """Everything the billing page shows: plan, price, payment methods, payment waiting for review."""
+    try:
+        user = _acct_db_user()
+        if not user:
+            return jsonify({'success': False, 'error': 'User not found'}), 404
+        gate = _login_stage_for(user)
+        stage, redirect_to = (gate['stage'], gate['redirect_to']) if isinstance(gate, dict) else ('blocked', '/login')
+        out = {'success': True, 'stage': stage, 'redirect_to': redirect_to, 'country': user.country or 'default'}
+        waiting = ManualPayment.query.filter_by(user_id=user.id, status='pending_verification').order_by(ManualPayment.id.desc()).first()
+        out['pending_manual'] = None if not waiting else {
+            'reference': waiting.payment_reference, 'amount': waiting.amount, 'currency': waiting.currency, 'plan': waiting.plan,
+            'method': waiting.payment_method, 'submitted_at': waiting.submitted_at.isoformat() if waiting.submitted_at else None}
+        company = _billing_company(user)
+        if company is not None:
+            quote = _active_quote(company.id)
+            asked = None if quote else CompanyQuote.query.filter_by(company_id=company.id, status='requested').order_by(CompanyQuote.id.desc()).first()
+            out.update(kind='company', plan=company.plan, status=company.subscription_status,
+                       ends_at=company.subscription_ends_at.isoformat() if company.subscription_ends_at else None,
+                       company={'name': company.name, 'industry': company.industry, 'employee_count': company.employee_count, 'country': company.country,
+                                'phone': company.phone, 'website': company.website, 'address': company.address},
+                       suspended=_company_suspended(company), quote=_quote_dict(quote), request=_quote_dict(asked),
+                       methods=_pay_methods(quote.currency) if quote else {})
+        elif user.user_type in ('admin', 'company_admin'):
+            out.update(kind='no_company')
+        elif user.user_type == 'employee':
+            out.update(kind='employee')
+        else:
+            pricing = get_pricing(user.country or 'default')
+            plans = {p: {k: pricing[p].get(k) for k in ('1_month', '6_month', '1_year', 'currency')} for p in ('basic', 'pro') if p in pricing}
+            out.update(kind='individual', plan=user.subscription_plan, status=user.subscription_status,
+                       ends_at=user.subscription_ends_at.isoformat() if user.subscription_ends_at else None,
+                       plans=plans, methods=_pay_methods((plans.get('pro') or {}).get('currency')))
+        return jsonify(out), 200
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f"billing overview failed: {e}")
+        return jsonify({'success': False, 'error': 'Could not load billing'}), 500
+
+
+def _tell_people(people, title, text_, url, link_text):
+    """In-app notice plus email. Returns the number of emails accepted."""
+    sent = 0
+    try:
+        for person in people:
+            db.session.add(Notification(user_id=person.id, title=title[:200], message=text_, type='info', priority='high',
+                                        category='system', action_url=url))
+        db.session.commit()
+        for person in people:
+            body = f'<p>{_pay_html.escape(text_)}</p><p><a href="{_pay_frontend()}{url}">{link_text}</a></p>'
+            sent += 1 if send_email(to=person.email, subject=title[:200], body=body) else 0
+    except Exception as e:
+        db.session.rollback()
+        logger.warning(f"billing notice failed: {e}")
+    return sent
+
+
+@app.route('/api/company/setup', methods=['POST'])
+@jwt_required
+@limiter.limit("10 per minute")
+def company_setup():
+    """An approved company admin without a company creates it. The company starts unpaid; nothing is unlocked here."""
+    try:
+        user = _acct_db_user()
+        if not user or user.user_type not in ('admin', 'company_admin'):
+            return jsonify({'success': False, 'error': 'Only a company administrator can set up a company'}), 403
+        if user.approval_status != 'approved':
+            return jsonify({'success': False, 'error': 'Your administrator account is waiting for approval'}), 403
+        if user.company_id and db.session.get(Company, user.company_id):
+            return jsonify({'success': False, 'error': 'Your company is already set up', 'code': 'ALREADY_SET_UP'}), 409
+        data = request.get_json(silent=True) or {}
+        name = re.sub(r'\s+', ' ', str(data.get('company_name') or '')).strip()
+        if not name or len(name) > 255 or '<' in name or '>' in name:
+            return jsonify({'success': False, 'error': 'Enter a valid company name'}), 400
+        raw = str(data.get('phone') or '').strip()
+        phone, perr = _clean_phone(raw) if raw else (None, None)
+        if raw and not phone:
+            return jsonify({'success': False, 'error': perr or 'Enter a valid phone number'}), 400
+        website = str(data.get('website') or '').strip()
+        if website and not re.fullmatch(r'https?://[^\s<>"]{3,230}', website):
+            return jsonify({'success': False, 'error': 'Website must start with http:// or https://'}), 400
+        if Company.query.filter(db.func.lower(Company.name) == name.lower()).first():
+            return jsonify({'success': False, 'error': 'An organization with this name is already registered. Ask its administrator to add you.',
+                            'code': 'COMPANY_EXISTS'}), 409
+        if Company.query.filter_by(email=user.email).first():
+            return jsonify({'success': False, 'error': 'A company already uses your email address. Please contact support.', 'code': 'EMAIL_EXISTS'}), 409
+        try:
+            employees = max(0, min(int(data.get('employee_count') or 0), 1000000))
+        except (TypeError, ValueError):
+            employees = 0
+        clean = lambda v, n: re.sub(r'[<>]', '', str(v or '')).strip()[:n]  # noqa: E731
+        company = Company(name=name, plan='enterprise', subscription_status='pending', is_active=False, is_enterprise=True, is_trial=False,
+                          company_number=f"COMP-{datetime.utcnow().strftime('%Y%m%d')}-{secrets.randbelow(900000) + 100000}",
+                          email=user.email, phone=phone, website=website or None, address=clean(data.get('address'), 500) or None,
+                          country=clean(data.get('country') or user.country, 64) or 'default',
+                          industry=clean(data.get('industry'), 100) or 'Other', employee_count=employees,
+                          owner_id=user.id, created_by=user.id)
+        db.session.add(company)
+        db.session.flush()
+        user.company_id, user.company_name = company.id, company.name
+        user.subscription_plan, user.subscription_status = 'enterprise', 'pending'
+        db.session.commit()
+        UserCache.clear(user.id)
+        return jsonify({'success': True, 'company': {'id': company.id, 'name': company.name}, 'redirect_to': '/payment'}), 201
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f"company setup failed: {e}")
+        return jsonify({'success': False, 'error': 'Could not save your company. Please try again.'}), 500
+
+
+@app.route('/api/billing/quote-request', methods=['POST'])
+@jwt_required
+@limiter.limit("5 per minute")
+def billing_quote_request():
+    """Company admin asks the team for a price."""
+    try:
+        user = _acct_db_user()
+        company = _billing_company(user)
+        if company is None:
+            return jsonify({'success': False, 'error': 'Only a company administrator can request a price'}), 403
+        data = request.get_json(silent=True) or {}
+        plan, cycle = data.get('plan'), data.get('billing_cycle')
+        if plan not in COMPANY_PLANS_PAID or cycle not in BILLING_CYCLES:
+            return jsonify({'success': False, 'error': 'Choose a plan and a billing period'}), 400
+        row = CompanyQuote.query.filter_by(company_id=company.id, status='requested').first()
+        if not row:
+            row = CompanyQuote(company_id=company.id, status='requested')
+            db.session.add(row)
+        row.plan, row.billing_cycle, row.requested_by = plan, cycle, user.id
+        row.request_note = str(data.get('note') or '').strip()[:2000] or None
+        row.updated_at = datetime.utcnow()
+        db.session.commit()
+        out = _quote_dict(row)
+        _tell_people(_platform_team(), f'Price request: {company.name}',
+                     f'{user.name} ({user.email}) asked for the {plan.title()} price, billed per {BILLING_CYCLE_TEXT[cycle]}. {row.request_note or ""}',
+                     '/safetypro/dashboard', 'Open Company Prices')
+        return jsonify({'success': True, 'request': out}), 200
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f"quote request failed: {e}")
+        return jsonify({'success': False, 'error': 'Could not send your request'}), 500
+
+
+@app.route('/api/admin/company-quotes', methods=['GET'])
+@safetypro_required
+def admin_company_quotes():
+    """Platform team: companies with their agreed price and open requests."""
+    try:
+        q = Company.query
+        term = re.sub(r'[\\%_]', '', (request.args.get('search') or '')).strip()
+        if term:
+            q = q.filter(db.or_(Company.name.ilike(f'%{term}%'), Company.email.ilike(f'%{term}%')))
+        companies = q.order_by(Company.id.desc()).limit(300).all()
+        ids = [x.id for x in companies]
+        rows = CompanyQuote.query.filter(CompanyQuote.company_id.in_(ids), CompanyQuote.status.in_(('active', 'requested'))).all() if ids else []
+        by = {(r.company_id, r.status): r for r in rows}
+        items = [{'company_id': x.id, 'name': x.name, 'email': x.email, 'country': x.country, 'plan': x.plan, 'status': x.subscription_status,
+                  'employee_count': x.employee_count, 'ends_at': x.subscription_ends_at.isoformat() if x.subscription_ends_at else None,
+                  'quote': _quote_dict(by.get((x.id, 'active'))), 'request': _quote_dict(by.get((x.id, 'requested')))} for x in companies]
+        items.sort(key=lambda i: 0 if i['request'] else 1)
+        return jsonify({'success': True, 'companies': items, 'currencies': list(QUOTE_CURRENCIES)}), 200
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f"company quotes failed: {e}")
+        return jsonify({'success': False, 'error': 'Could not load company prices'}), 500
+
+
+@app.route('/api/admin/companies/<int:company_id>/quote', methods=['POST'])
+@safetypro_required
+def admin_set_company_quote(company_id):
+    """Platform team: set the price a company pays (replaces the previous one)."""
+    try:
+        data = request.get_json(silent=True) or {}
+        plan, cycle, currency = data.get('plan'), data.get('billing_cycle'), str(data.get('currency') or '').upper()
+        try:
+            amount = round(float(data.get('amount')), 2)
+        except (TypeError, ValueError):
+            amount = 0
+        if plan not in COMPANY_PLANS_PAID or cycle not in BILLING_CYCLES or currency not in QUOTE_CURRENCIES or not (1 <= amount <= 10000000):
+            return jsonify({'success': False, 'error': 'Choose a plan, billing period, currency and an amount from 1 to 10,000,000'}), 400
+        # row lock: two team members saving together cannot leave two active prices
+        if not db.session.query(Company.id).filter(Company.id == company_id).with_for_update().first():
+            return jsonify({'success': False, 'error': 'Company not found'}), 404
+        CompanyQuote.query.filter(CompanyQuote.company_id == company_id, CompanyQuote.status.in_(('active', 'requested'))).update(
+            {'status': 'replaced', 'updated_at': datetime.utcnow()}, synchronize_session=False)
+        row = CompanyQuote(company_id=company_id, plan=plan, billing_cycle=cycle, currency=currency, amount=amount, status='active',
+                           note=str(data.get('note') or '').strip()[:1000] or None, created_by=request.user.id)
+        db.session.add(row)
+        db.session.commit()
+        out = _quote_dict(row)
+        logger.info(f"Company {company_id} price set to {currency} {amount} / {cycle} ({plan}) by user {request.user.id}")
+        admins = User.query.filter(User.company_id == company_id, User.user_type.in_(('admin', 'company_admin')), User.is_active == True).all()  # noqa: E712
+        told = _tell_people(admins, 'Your SafeTrack Pro price is ready',
+                            f'Your {plan.title()} plan price is {currency} {amount:,.2f} per {BILLING_CYCLE_TEXT[cycle]}. You can pay on the billing page.',
+                            '/payment', 'Open the billing page')
+        return jsonify({'success': True, 'quote': out, 'emails_sent': told}), 200
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f"set company quote failed: {e}")
+        return jsonify({'success': False, 'error': 'Could not save the price'}), 500
+
+
+@app.route('/api/admin/companies/<int:company_id>/quote', methods=['DELETE'])
+@safetypro_required
+def admin_withdraw_company_quote(company_id):
+    try:
+        n = CompanyQuote.query.filter_by(company_id=company_id, status='active').update(
+            {'status': 'withdrawn', 'updated_at': datetime.utcnow()}, synchronize_session=False)
+        db.session.commit()
+        return jsonify({'success': True, 'withdrawn': n}), 200
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f"withdraw quote failed: {e}")
+        return jsonify({'success': False, 'error': 'Could not withdraw the price'}), 500
+
+
+# =====================================================================================================
 # AUTO MIGRATIONS (2026-11-23)
 # Railway's Data tab appends LIMIT to every query, so CREATE/ALTER statements fail there. Instead the
 # backend applies the idempotent files in sql/AUTO_MIGRATIONS once, at startup:
@@ -167310,7 +167291,7 @@ def doclib_member_pdf():
 #   - a failing statement is logged and the file is retried on the next start
 # Set AUTO_MIGRATE=0 on Railway to switch this off.
 # =====================================================================================================
-AUTO_MIGRATIONS = ('DEPLOY_2026-11-23_FULL.sql',)
+AUTO_MIGRATIONS = ('DEPLOY_2026-11-23_FULL.sql', '2026-11-24_company_quotes.sql')
 _MIGRATION_LOCK_KEY = 74230115
 
 

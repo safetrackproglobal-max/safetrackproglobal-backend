@@ -7794,6 +7794,29 @@ class ConsentRecord(db.Model):
     )
 
 
+class CompanyQuote(db.Model):
+    """Agreed price of a company plan, set by the platform team.
+
+    status: requested (admin asked, no price yet) | active (payable, also for renewals) | replaced | withdrawn
+    """
+    __tablename__ = 'company_quotes'
+
+    id            = db.Column(db.Integer, primary_key=True)
+    company_id    = db.Column(db.Integer, db.ForeignKey('companies.id', ondelete='CASCADE'), nullable=False, index=True)
+    plan          = db.Column(db.String(32), nullable=False, default='enterprise')
+    billing_cycle = db.Column(db.String(20), nullable=False, default='1_year')
+    amount        = db.Column(db.Numeric(12, 2), nullable=True)
+    currency      = db.Column(db.String(8), nullable=True)
+    status        = db.Column(db.String(20), nullable=False, default='requested')
+    request_note  = db.Column(db.Text, nullable=True)
+    note          = db.Column(db.Text, nullable=True)
+    requested_by  = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    created_by    = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    last_paid_at  = db.Column(db.DateTime, nullable=True)
+    created_at    = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    updated_at    = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+
 class BillingNotice(db.Model):
     """One row per billing email/notice, so each is sent exactly once per billing period.
 
@@ -8361,7 +8384,7 @@ __all__ = [
     'EscalationRule', 'EscalationHistory', 'IncidentCost', 'RegulatoryFiling', 'FishboneVersion', 'FishboneFiveWhys', 'AIAssistantSession', 'AIAssistantMessage', 
     'SimilarIncidentMatch', 'IncidentComparison', 'IncidentClusterAnalysis', 'PredictiveAnalyticsRun', 'PredictiveScenario', 'AIGenerationLog', 'EnvironmentalSite', 'HospitalFinancialRecord',
      'PlatformActivityLog', 'PlatformSessionTracking', 'Chemical', 'ChemicalIncident', 'VideoEvidence', 'ConsentRecord',
-    'BillingNotice', 'AuditLog',
+    'BillingNotice', 'AuditLog', 'CompanyQuote',
     'ClientOrganization', 'ClientMember', 'DocumentSubmission', 'SubmissionSigner', 'SigningAsset', 'WorkPermit',
 ]
 
