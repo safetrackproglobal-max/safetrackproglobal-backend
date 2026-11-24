@@ -167212,6 +167212,8 @@ _HARDEN_RULES = (
     ('POST', 'exact', '/api/safety/search', 30, 600),
     ('POST', 'exact', '/api/safety/search/batch', 5, 600),
     ('POST', 'exact', '/api/safety/search/analyze', 30, 600),
+    ('POST', 'exact', '/api/public/doc-pdf', 5, 86400),
+    ('POST', 'exact', '/api/doc-library/pdf', 40, 3600),
     ('POST', 'exact', '/api/contact', 5, 600),
     ('POST', 'exact', '/api/auth/resend-verification', 3, 600),
     ('POST', 'exact', '/api/resend-verification', 3, 600),
@@ -167429,6 +167431,135 @@ def _hide_internal_errors(response):
     except Exception:
         pass
     return response
+
+
+# =====================================================================================================
+# PUBLIC DOCUMENT LIBRARY (2026-11-24): turns an edited free template into a PDF
+#   anonymous  : 5 PDFs per day per IP, "Created free with SafeTrack Pro Global" footer
+#   free login : more PDFs, same footer          paid plan: no footer
+# The HTML is rebuilt from an allow-list; nothing is stored and nothing external is loaded.
+# =====================================================================================================
+from html.parser import HTMLParser as _DLParser
+import html as _dl_html
+
+_DL_TAGS = {'p', 'br', 'b', 'strong', 'i', 'em', 'u', 'h1', 'h2', 'h3', 'h4', 'ul', 'ol', 'li', 'table', 'tr', 'td', 'th', 'hr', 'blockquote'}
+_DL_DROP = {'script', 'style', 'iframe', 'object', 'embed', 'svg', 'math', 'template', 'noscript', 'head', 'title'}
+_DL_VOID = {'br', 'hr'}
+
+
+class _DLClean(_DLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.out, self.skip, self.stack = [], 0, []
+
+    def handle_starttag(self, tag, attrs):
+        if tag in _DL_DROP:
+            self.skip += 1
+        elif not self.skip and tag in _DL_TAGS and (tag in _DL_VOID or len(self.stack) < 16):   # no deep nesting bombs
+            self.out.append(f'<{tag}/>' if tag in _DL_VOID else f'<{tag}>')
+            if tag not in _DL_VOID:
+                self.stack.append(tag)
+        elif not self.skip and tag == 'div':
+            self.out.append('<br/>')
+
+    def handle_endtag(self, tag):
+        if tag in _DL_DROP:
+            self.skip = max(0, self.skip - 1)
+        elif not self.skip and tag in self.stack:
+            while self.stack:
+                t = self.stack.pop()
+                self.out.append(f'</{t}>')
+                if t == tag:
+                    break
+
+    def handle_data(self, data):
+        if not self.skip:
+            self.out.append(_dl_html.escape(data.replace('☐', '[  ]').replace('☑', '[X]').replace('☒', '[X]'), quote=False))
+
+    def result(self):
+        while self.stack:
+            self.out.append(f'</{self.stack.pop()}>')
+        return ''.join(self.out)
+
+
+def _doclib_pdf(title, body_html, company, project, logo, footer):
+    import io as _io
+    import pymupdf as _mu
+    cleaner = _DLClean()
+    cleaner.feed(body_html)
+    esc_ = _dl_html.escape
+    head = f'<h1>{esc_(title)}</h1>'
+    meta = ' | '.join(x for x in (esc_(company), esc_(project)) if x)
+    if meta:
+        head += f'<p><b>{meta}</b></p>'
+    css = ('body{font-family:sans-serif;font-size:9.5pt;color:#1a202c} h1{font-size:17pt;color:#1E3D58;margin:0 0 4pt 0} '
+           'h2{font-size:12pt;color:#1E3D58;margin:10pt 0 3pt 0} p{margin:2pt 0} table{border-collapse:collapse;margin:4pt 0} '
+           'td,th{border:0.6px solid #94a3b8;padding:3px;font-size:8pt} th{background-color:#e2e8f0}')
+    story = _mu.Story(html=head + cleaner.result(), user_css=css)
+    buf = _io.BytesIO()
+    writer = _mu.DocumentWriter(buf)
+    box = _mu.paper_rect('a4')
+    pages, more = 0, True
+    while more and pages < 60:
+        dev = writer.begin_page(box)
+        more, _ = story.place(box + (42, 52 if (pages or not logo) else 84, -42, -52))
+        story.draw(dev)
+        writer.end_page()
+        pages += 1
+    writer.close()
+    doc = _mu.open('pdf', buf.getvalue())
+    for i, page in enumerate(doc, 1):
+        page.insert_text((42, box.height - 24), f'Page {i} of {len(doc)}', fontsize=7, color=(.4, .4, .4))
+        if footer:
+            page.insert_text((190, box.height - 24), footer, fontsize=7, color=(.4, .4, .4))
+    if logo:
+        doc[0].insert_image(_mu.Rect(box.width - 162, 26, box.width - 42, 76), stream=logo, keep_proportion=True)
+    doc.set_metadata({'title': title, 'creator': 'SafeTrack Pro Global'})
+    return doc.tobytes(garbage=3, deflate=True)
+
+
+def _doclib_request(footer):
+    import base64 as _b64
+    from io import BytesIO
+    if (request.content_length or 0) > 900 * 1024:
+        return jsonify({'success': False, 'error': 'This document is too large'}), 413
+    data = request.get_json(silent=True) or {}
+    title = ' '.join(str(data.get('title') or 'Safety document').split())[:150]
+    body_html = str(data.get('html') or '')
+    if not 20 <= len(body_html) <= 250000:
+        return jsonify({'success': False, 'error': 'The document is empty or too large'}), 400
+    logo = None
+    m = re.match(r'data:image/(?:png|jpeg);base64,([A-Za-z0-9+/=]+)$', str(data.get('logo') or ''))
+    if m and len(m.group(1)) <= 400000:
+        try:
+            from PIL import Image as _Img
+            im = _Img.open(BytesIO(_b64.b64decode(m.group(1))))
+            if im.format in ('PNG', 'JPEG') and im.width * im.height <= 4000000:
+                im = im.convert('RGBA')
+                im.thumbnail((600, 250))
+                o = BytesIO()
+                im.save(o, 'PNG')
+                logo = o.getvalue()
+        except Exception:
+            logo = None
+    try:
+        pdf = _doclib_pdf(title, body_html, str(data.get('company') or '')[:100], str(data.get('project') or '')[:100], logo, footer)
+    except Exception as e:
+        logger.error('document library pdf failed: %s', e)
+        return jsonify({'success': False, 'error': 'Could not create the PDF. Please try again.'}), 500
+    name = re.sub(r'[^A-Za-z0-9]+', '-', title).strip('-')[:80] or 'document'
+    return Response(pdf, mimetype='application/pdf', headers={'Content-Disposition': f'attachment; filename="{name}.pdf"', 'Cache-Control': 'no-store'})
+
+
+@app.route('/api/public/doc-pdf', methods=['POST'])
+def doclib_public_pdf():
+    return _doclib_request('Created free with SafeTrack Pro Global - www.safetrackproglobal.com/free-safety-documents')
+
+
+@app.route('/api/doc-library/pdf', methods=['POST'])
+@jwt_required
+def doclib_member_pdf():
+    return _doclib_request(None if _exam_paid(request.user) else 'Created with SafeTrack Pro Global - www.safetrackproglobal.com')
 
 
 # =====================================================================================================
