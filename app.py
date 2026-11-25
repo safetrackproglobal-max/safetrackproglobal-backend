@@ -29267,6 +29267,16 @@ def get_document(document_id):
                 'code': 'ACCESS_DENIED'
             }), 403
         
+        # Tags are stored as JSON text: the editor needs a list, or saving would clear them
+        tags = document.tags or []
+        if isinstance(tags, str):
+            try:
+                tags = json.loads(tags)
+            except ValueError:
+                tags = [t.strip() for t in tags.split(',') if t.strip()]
+        if not isinstance(tags, list):
+            tags = []
+
         # Parse analysis results
         analysis_results = {}
         if document.analysis_result:
@@ -29291,7 +29301,9 @@ def get_document(document_id):
                 'file_name': document.file_name,
                 'file_size': document.file_size,
                 'mime_type': document.mime_type,
-                'tags': document.tags or [],
+                'tags': tags,
+                'content': document.content,
+                'editing_source': getattr(document, 'editing_source', None) or 'regular',
                 'is_confidential': document.is_confidential,
                 'requires_approval': document.requires_approval,
                 'review_status': document.review_status,
