@@ -167293,6 +167293,548 @@ def admin_withdraw_company_quote(company_id):
         return jsonify({'success': False, 'error': 'Could not withdraw the price'}), 500
 
 
+# ============================================================================
+# READY CHECK — pre-task life-saving controls, stop work, lone-worker timer (2026-11-25)
+# ============================================================================
+# DB: new table ready_checks -> sql/2026-11-25_ready_checks.sql (auto migration)
+# The GO / STOP decision is a fixed rule, never AI: one missing life-saving control means STOP.
+from models import LessonLearned as _RcLesson
+
+
+class ReadyCheck(db.Model):
+    __tablename__ = 'ready_checks'
+    __table_args__ = {'extend_existing': True}
+    id = db.Column(db.Integer, primary_key=True)
+    client_id = db.Column(db.String(64), nullable=False)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id', ondelete='CASCADE'), nullable=True, index=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
+    worker_name = db.Column(db.String(120))
+    kind = db.Column(db.String(12), nullable=False, default='check')       # check | stop
+    task_key = db.Column(db.String(40))
+    task_name = db.Column(db.String(160), nullable=False)
+    location = db.Column(db.String(200))
+    crew_size = db.Column(db.Integer, nullable=False, default=1)
+    answers = db.Column(db.Text)
+    missing = db.Column(db.Text)
+    controls_total = db.Column(db.Integer, nullable=False, default=0)
+    controls_ok = db.Column(db.Integer, nullable=False, default=0)
+    result = db.Column(db.String(8), nullable=False)                        # go | stop
+    status = db.Column(db.String(12), nullable=False)                       # working | stopped | released | finished
+    note = db.Column(db.Text)
+    is_lone = db.Column(db.Boolean, nullable=False, default=False)
+    expected_end = db.Column(db.DateTime)
+    alert_level = db.Column(db.Integer, nullable=False, default=0)
+    alerted_at = db.Column(db.DateTime)
+    finished_at = db.Column(db.DateTime)
+    resolved_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    resolved_at = db.Column(db.DateTime)
+    resolution_note = db.Column(db.Text)
+    done_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+
+# key: (name, words that match past records, ((id, what the worker must SEE before starting, may be 'not needed'), ...))
+RC_TASKS = {
+    'height': ('Working at height', ('height', 'fall from', 'fell from', 'scaffold', 'ladder', 'roof', 'harness'), (
+        ('edge', 'Guardrails, a platform or a cover protects every open edge and hole', True),
+        ('harness', 'Harness is worn and clipped to a strong anchor', True),
+        ('access', 'Ladder, scaffold or lift is inspected and stable', False),
+        ('below', 'Nobody can walk below; tools are tied or netted', False),
+        ('rescue', 'We know how to rescue a person left hanging', True))),
+    'excavation': ('Excavation or trench', ('excavat', 'trench', 'cave-in', 'shoring'), (
+        ('wall', 'Walls are sloped, shored or boxed, or a competent person has approved the depth', False),
+        ('services', 'Buried cables and pipes are located and marked', False),
+        ('edge', 'Soil, plant and vehicles are kept back from the edge', False),
+        ('exit', 'A ladder or ramp is close to everyone inside', True),
+        ('inspect', 'A competent person checked it today and after rain', False))),
+    'confined': ('Confined space', ('confined', 'manhole', 'tank entry', 'vessel entry', 'asphyxi'), (
+        ('permit', 'Entry permit is signed for today', False),
+        ('gas', 'Air was tested and is being monitored', False),
+        ('vent', 'Ventilation is running', True),
+        ('watch', 'A trained attendant stays at the entrance', False),
+        ('rescue', 'Rescue equipment is ready outside; nobody will enter alone to rescue', False))),
+    'energy': ('Electrical or machine isolation', ('electri', 'electro', 'lockout', 'loto', 'arc flash', 'energised', 'energized'), (
+        ('lock', 'Every energy source is switched off and locked with my own lock', False),
+        ('test', 'I tried to start it or tested for dead', False),
+        ('stored', 'Stored energy (springs, pressure, gravity, capacitors) is released', False),
+        ('comp', 'I am trained and allowed to do this work', False))),
+    'lifting': ('Lifting and cranes', ('crane', 'hoist', 'sling', 'suspended', 'rigging', 'dropped load'), (
+        ('plan', 'Load weight is known and the lift plan is understood', False),
+        ('gear', 'Crane, slings and hooks are inspected and in date', False),
+        ('zone', 'The drop zone is barricaded and empty', False),
+        ('signal', 'One trained signaller and clear communication', False),
+        ('weather', 'Wind and ground are safe for this lift', False))),
+    'vehicle': ('Working near vehicles or plant', ('vehicle', 'reversing', 'forklift', 'excavator', 'truck', 'struck by', 'run over'), (
+        ('separate', 'People and moving machines are separated by a barrier or a marked zone', False),
+        ('eye', 'The driver knows I am here and we agreed signals', False),
+        ('seen', 'I am wearing high-visibility clothing', False),
+        ('alarm', 'Brakes, reversing alarm and mirrors were checked', False))),
+    'hotwork': ('Hot work (welding, cutting, grinding)', ('hot work', 'weld', 'grinding', 'grinder', 'fire', 'burn', 'spark'), (
+        ('permit', 'Hot work permit is signed for today', False),
+        ('clear', 'Flammable material is removed or covered', False),
+        ('ext', 'A working extinguisher is within reach', False),
+        ('watch', 'A fire watch stays during the work and after it', False),
+        ('gas', 'Cylinders are upright, secured and leak-checked', True))),
+    'chemical': ('Chemicals or hazardous substances', ('chemical', 'acid burn', 'solvent', 'spill', 'toxic', 'fume', 'gas leak'), (
+        ('sds', 'I read the safety data sheet and the label', False),
+        ('ppe', 'The right gloves, eye and breathing protection are worn', False),
+        ('vent', 'The area is ventilated', False),
+        ('spill', 'Spill kit, shower or eyewash is close', False))),
+    'pressure': ('Pressure systems and line breaking', ('pressure', 'line break', 'flange', 'hydrotest', 'boiler', 'compressor'), (
+        ('zero', 'The line is isolated, drained and shows zero pressure', False),
+        ('stand', 'Nobody stands in the line of fire', False),
+        ('gear', 'Hoses and fittings are rated, inspected and secured', False),
+        ('permit', 'The permit covers this exact line', False))),
+    'machinery': ('Machinery and power tools', ('machine', 'unguarded', 'caught in', 'entangle', 'amputat', 'power tool', 'conveyor'), (
+        ('guard', 'All guards are fitted and working', False),
+        ('stop', 'The emergency stop works and I can reach it', True),
+        ('loose', 'No loose clothing, jewellery or hair near moving parts', False),
+        ('inspect', 'The tool was inspected; cable or hose is not damaged', False))),
+    'heat': ('Hot weather or heavy physical work', ('heat stress', 'heat exhaustion', 'heat stroke', 'heatstroke', 'dehydrat'), (
+        ('water', 'Cool drinking water is close', False),
+        ('rest', 'Shaded rest breaks are planned', False),
+        ('buddy', 'Somebody is watching me for signs of heat illness', False),
+        ('fit', 'I feel well, rested and used to this heat', False))),
+    'general': ('Other work', ('slip', 'tripped', 'manual handling'), (
+        ('know', 'I know the steps and what could seriously hurt me', False),
+        ('control', 'A control is in place for the worst thing that could happen', False),
+        ('ppe', 'I have the right protective equipment', False),
+        ('help', 'I know how to get help here', False))),
+}
+RC_DAILY_LIMIT = 60
+RC_GRACE_MINUTES = 5
+RC_REPEAT_MINUTES = 15
+RC_MAX_ALERTS = 3
+
+
+def _rc_text(v, limit):
+    return re.sub(r'\s+', ' ', re.sub(r'<[^>]*>', '', str(v if v is not None else ''))).strip()[:limit]
+
+
+def _rc_staff(user):
+    if not getattr(user, 'company_id', None):
+        return False
+    role = (getattr(user, 'role', None) or '').strip().lower().replace(' ', '_')
+    return bool(_ov_company_scope(user)) or role in INC_STAFF_ROLES
+
+
+def _rc_staff_users(company_id, exclude=None):
+    """Who receives alerts. Role is read from the row itself: _ov_company_scope also looks at the current request."""
+    if not company_id:
+        return []
+    out = []
+    for u in _TbtUser.query.filter(_TbtUser.company_id == company_id).all():
+        if u.id == exclude or getattr(u, 'is_active', True) is False:
+            continue
+        kind = (getattr(u, 'user_type', None) or '').strip().lower()
+        role = (getattr(u, 'role', None) or '').strip().lower().replace(' ', '_')
+        if kind in OV_COMPANY_TYPES or kind in INC_STAFF_ROLES or role in INC_STAFF_ROLES:
+            out.append(u)
+    return out
+
+
+def _rc_can_view(user, rec):
+    if rec.user_id == user.id:
+        return True
+    return bool(rec.company_id) and rec.company_id == getattr(user, 'company_id', None) and _rc_staff(user)
+
+
+def _rc_get(user, rid, lock=False):
+    q = ReadyCheck.query.filter(ReadyCheck.id == rid)
+    rec = (q.with_for_update() if lock else q).first()
+    return rec if rec and _rc_can_view(user, rec) else None
+
+
+def _rc_dict(r):
+    def iso(d):
+        return d.isoformat() + 'Z' if d else None
+    open_timer = r.status in ('working', 'released') and r.expected_end is not None
+    return {'id': r.id, 'client_id': r.client_id, 'user_id': r.user_id, 'worker_name': r.worker_name, 'kind': r.kind,
+            'task_key': r.task_key, 'task_name': r.task_name, 'location': r.location, 'crew_size': r.crew_size,
+            'answers': _tbt_json(r.answers, {}), 'missing': _tbt_json(r.missing, []), 'controls_total': r.controls_total,
+            'controls_ok': r.controls_ok, 'result': r.result, 'status': r.status, 'note': r.note, 'is_lone': bool(r.is_lone),
+            'expected_end': iso(r.expected_end), 'overdue': bool(open_timer and r.expected_end < datetime.utcnow()),
+            'alert_level': r.alert_level or 0, 'finished_at': iso(r.finished_at), 'resolved_at': iso(r.resolved_at),
+            'resolution_note': r.resolution_note, 'done_at': iso(r.done_at)}
+
+
+def _rc_alert_send(targets, title, text, priority):
+    """In-app + e-mail, outside the request. targets = [(user_id, email)] read before the thread starts."""
+    from html import escape as _esc
+    with app.app_context():
+        try:
+            for uid, _email in targets:                      # in-app first: a slow mail server must not delay it
+                try:
+                    if create_notification(uid, title, text, type='critical' if priority == 'critical' else 'warning',
+                                           priority=priority, action_url='/ready-check?tab=board', expires_in_hours=72) is None:
+                        db.session.rollback()
+                except Exception as e:
+                    db.session.rollback()
+                    logger.error(f'ready check notification failed: {e}')
+            for _uid, email in targets:
+                if email:
+                    try:
+                        send_email(to=email, subject=title, body=f'<p>{_esc(text)}</p><p>Open Ready Check in SafeTrack Pro to act.</p>')
+                    except Exception as e:
+                        logger.error(f'ready check e-mail failed: {e}')
+        finally:
+            db.session.remove()
+
+
+def _rc_alert(company_id, exclude, title, text, priority='critical'):
+    targets = [(u.id, getattr(u, 'email', None)) for u in _rc_staff_users(company_id, exclude)]
+    if targets:
+        threading.Thread(target=_rc_alert_send, args=(targets, title[:200], text[:900], priority), daemon=True).start()
+    return len(targets)
+
+
+def _rc_lessons(user, task_key):
+    """What already went wrong here on this kind of work. Workers see published lessons and counts only;
+    incident titles (which can name people) are for safety staff."""
+    cid = getattr(user, 'company_id', None)
+    out = {'lessons': [], 'events': [], 'incident_count': 0, 'near_miss_count': 0, 'weak_controls': []}
+    if not cid or task_key not in RC_TASKS:
+        return out
+    words = RC_TASKS[task_key][1]
+    since = datetime.utcnow() - timedelta(days=1095)
+    staff = _rc_staff(user)
+
+    def match(*cols):
+        return or_(*[c.ilike(f'%{w}%') for c in cols for w in words])
+
+    def section(fn):
+        try:
+            fn()
+        except Exception as e:
+            db.session.rollback()
+            logger.warning(f'ready check lessons skipped: {e}')
+
+    def lessons():
+        L = _RcLesson
+        for r in (L.query.filter(L.company_id == cid, L.status == 'published', match(L.title, L.summary))
+                  .order_by(L.id.desc()).limit(3).all()):
+            out['lessons'].append({'title': _tbt_txt(r.title, 140), 'summary': _tbt_txt(r.summary, 260)})
+
+    def incidents():
+        I = _TbtIncident
+        q = I.query.filter(I.company_id == cid, I.date_occurred >= since, match(I.title, I.description, I.incident_type))
+        out['incident_count'] = q.count()
+        if staff:
+            for r in q.order_by(I.date_occurred.desc()).limit(3).all():
+                out['events'].append({'title': _tbt_txt(r.title, 140), 'severity': _tbt_txt(r.severity, 20),
+                                      'date': r.date_occurred.date().isoformat() if r.date_occurred else None})
+
+    def near():
+        N = _TbtNearMiss
+        members = _tbt_select(_TbtUser.id).where(_TbtUser.company_id == cid)
+        out['near_miss_count'] = N.query.filter(N.reported_by.in_(members), N.date_occurred >= since,
+                                                match(N.title, N.description)).count()
+
+    def weak():
+        counts = {}
+        rows = (ReadyCheck.query.filter(ReadyCheck.company_id == cid, ReadyCheck.task_key == task_key, ReadyCheck.result == 'stop',
+                                        ReadyCheck.done_at >= datetime.utcnow() - timedelta(days=90))
+                .with_entities(ReadyCheck.missing).limit(1000).all())
+        for (m,) in rows:
+            for c in _tbt_json(m, []):
+                counts[c] = counts.get(c, 0) + 1
+        label = {c[0]: c[1] for c in RC_TASKS[task_key][2]}
+        out['weak_controls'] = [{'control': label[k], 'times': n}
+                                for k, n in sorted(counts.items(), key=lambda kv: -kv[1])[:3] if k in label]
+
+    for fn in (lessons, incidents, near, weak):
+        section(fn)
+    return out
+
+
+@app.route('/api/ready-check/tasks', methods=['GET'])
+@jwt_required
+def rc_tasks_route():
+    user = request.user
+    cid = getattr(user, 'company_id', None)
+    return jsonify({'success': True, 'data': {
+        'tasks': [{'key': k, 'name': v[0], 'controls': [{'id': c[0], 'text': c[1], 'optional': c[2]} for c in v[2]]}
+                  for k, v in RC_TASKS.items()],
+        'is_staff': _rc_staff(user), 'has_company': bool(cid), 'supervisors': len(_rc_staff_users(cid, user.id))}}), 200
+
+
+@app.route('/api/ready-check/lessons/<task_key>', methods=['GET'])
+@jwt_required
+def rc_lessons_route(task_key):
+    return jsonify({'success': True, 'data': _rc_lessons(request.user, task_key)}), 200
+
+
+def _rc_int(v, low, high):
+    try:
+        n = int(v)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return n if low <= n <= high else None
+
+
+def _rc_done_at(v):
+    """Time on the worker's phone (checks made without signal arrive later): accepted only within the last 48 hours."""
+    now = datetime.utcnow()
+    try:
+        d = datetime.fromisoformat(str(v).replace('Z', '+00:00'))
+        if d.tzinfo is not None:
+            d = (d - d.utcoffset()).replace(tzinfo=None)
+        return d if now - timedelta(hours=48) <= d <= now else now
+    except (TypeError, ValueError, OverflowError):
+        return now
+
+
+@app.route('/api/ready-check', methods=['POST'])
+@jwt_required
+def rc_create_route():
+    user = request.user
+    uid = user.id
+    data = _tbt_body()
+    client_id = str(data.get('client_id') or '')
+    if not re.fullmatch(r'[A-Za-z0-9-]{8,64}', client_id):
+        return jsonify({'success': False, 'error': 'Invalid check reference.'}), 400
+    existing = ReadyCheck.query.filter_by(user_id=uid, client_id=client_id).first()
+    if existing:                                                # the same saved check sent twice
+        return jsonify({'success': True, 'data': _rc_dict(existing), 'duplicate': True}), 200
+    cid = getattr(user, 'company_id', None)
+    kind = 'stop' if data.get('kind') == 'stop' else 'check'
+    since = datetime.utcnow() - timedelta(hours=24)
+    # the limit never blocks a stop-work call
+    if kind == 'check' and ReadyCheck.query.filter(ReadyCheck.user_id == uid, ReadyCheck.created_at >= since).count() >= RC_DAILY_LIMIT:
+        return jsonify({'success': False, 'error': 'Too many checks today.'}), 429
+    name = _rc_text(getattr(user, 'name', None) or 'Worker', 120)
+    crew = _rc_int(data.get('crew_size') or 1, 1, 200)
+    if crew is None:
+        return jsonify({'success': False, 'error': 'Crew size must be between 1 and 200.'}), 400
+    rec = ReadyCheck(client_id=client_id, company_id=cid, user_id=uid, worker_name=name, kind=kind,
+                     location=_rc_text(data.get('location'), 200), crew_size=crew, note=_rc_text(data.get('note'), 1000),
+                     done_at=_rc_done_at(data.get('done_at')), controls_total=0, controls_ok=0, alert_level=0, is_lone=False)
+    missing_text = ''
+    if kind == 'stop':
+        if len(rec.note) < 5:
+            return jsonify({'success': False, 'error': 'Say what is unsafe (at least 5 characters).'}), 400
+        rec.task_name, rec.answers, rec.missing = _rc_text(data.get('task_name'), 160) or 'Stop work', '{}', '[]'
+        rec.result, rec.status = 'stop', 'stopped'
+        missing_text = rec.note
+    else:
+        key = str(data.get('task_key') or '')
+        if key not in RC_TASKS:
+            return jsonify({'success': False, 'error': 'Choose the work you are about to do.'}), 400
+        raw = data.get('answers') if isinstance(data.get('answers'), dict) else {}
+        answers, missing, needed = {}, [], 0
+        for c, text, optional in RC_TASKS[key][2]:
+            a = raw.get(c)
+            if a not in ('yes', 'no') and not (a == 'na' and optional):
+                return jsonify({'success': False, 'error': 'Answer every question.'}), 400
+            answers[c] = a
+            if a != 'na':
+                needed += 1
+            if a == 'no':
+                missing.append((c, text))
+        if key == 'height' and answers['edge'] == 'na' and answers['harness'] == 'na':
+            return jsonify({'success': False, 'error': 'Work at height needs edge protection or a harness. One of them cannot be "not needed".'}), 400
+        rec.task_key, rec.task_name = key, RC_TASKS[key][0]
+        rec.answers, rec.missing = json.dumps(answers), json.dumps([m[0] for m in missing])
+        rec.controls_total, rec.controls_ok = needed, needed - len(missing)
+        rec.result = 'stop' if missing else 'go'
+        rec.status = 'stopped' if missing else 'working'
+        missing_text = 'Missing: ' + '; '.join(m[1] for m in missing)
+        if data.get('is_lone') is True and rec.result == 'go':
+            mins = _rc_int(data.get('minutes'), 10, 720)
+            if mins is None:
+                return jsonify({'success': False, 'error': 'Choose how long the work will take (10 minutes to 12 hours).'}), 400
+            if not _rc_staff_users(cid, uid):
+                return jsonify({'success': False, 'code': 'NO_SUPERVISOR',
+                                'error': 'Nobody in your company can receive a lone-worker alert yet. Ask an admin to add a supervisor.'}), 400
+            rec.is_lone = True
+            end = rec.done_at + timedelta(minutes=mins)
+            if end > datetime.utcnow():                          # a check sent long after the job must not raise a false alarm
+                rec.expected_end = end
+    try:
+        db.session.add(rec)
+        db.session.commit()
+    except Exception as e:
+        db.session.rollback()
+        again = ReadyCheck.query.filter_by(user_id=uid, client_id=client_id).first()
+        if again:
+            return jsonify({'success': True, 'data': _rc_dict(again), 'duplicate': True}), 200
+        logger.error(f'ready check save failed: {e}')
+        return jsonify({'success': False, 'error': 'Could not save the check. Please try again.'}), 500
+    out = _rc_dict(rec)
+    out['alerted'] = 0
+    if rec.result == 'stop':
+        where = f' at {rec.location}' if rec.location else ''
+        out['alerted'] = _rc_alert(cid, uid, f'STOP WORK: {rec.task_name}', f'{name} stopped work{where}. {missing_text}')
+    return jsonify({'success': True, 'data': out}), 201
+
+
+@app.route('/api/ready-check/mine', methods=['GET'])
+@jwt_required
+def rc_mine_route():
+    rows = ReadyCheck.query.filter(ReadyCheck.user_id == request.user.id).order_by(ReadyCheck.done_at.desc()).limit(20).all()
+    return jsonify({'success': True, 'data': [_rc_dict(r) for r in rows]}), 200
+
+
+@app.route('/api/ready-check/<int:rid>/extend', methods=['POST'])
+@jwt_required
+def rc_extend_route(rid):
+    """'I am OK': the worker moves the finish time."""
+    rec = _rc_get(request.user, rid, lock=True)
+    if not rec or rec.user_id != request.user.id:
+        return jsonify({'success': False, 'error': 'Check not found.'}), 404
+    if rec.status != 'working' or not rec.expected_end:
+        return jsonify({'success': False, 'error': 'This check has no running timer.'}), 409
+    mins = _rc_int(_tbt_body().get('minutes'), 10, 240)
+    if mins is None:
+        return jsonify({'success': False, 'error': 'Choose 10 to 240 minutes.'}), 400
+    was = rec.alert_level or 0
+    rec.expected_end = datetime.utcnow() + timedelta(minutes=mins)
+    rec.alert_level, rec.alerted_at = 0, None
+    db.session.commit()
+    if was:
+        _rc_alert(rec.company_id, rec.user_id, f'{rec.worker_name} checked in: OK',
+                  f'{rec.worker_name} confirmed they are OK on {rec.task_name}.', 'medium')
+    return jsonify({'success': True, 'data': _rc_dict(rec)}), 200
+
+
+@app.route('/api/ready-check/<int:rid>/finish', methods=['POST'])
+@jwt_required
+def rc_finish_route(rid):
+    """The worker, or a supervisor who has confirmed the worker is safe, closes the job."""
+    rec = _rc_get(request.user, rid, lock=True)
+    if not rec:
+        return jsonify({'success': False, 'error': 'Check not found.'}), 404
+    if rec.status != 'working':
+        return jsonify({'success': False, 'error': 'This job is not running.'}), 409
+    if rec.user_id != request.user.id:
+        note = _rc_text(_tbt_body().get('note'), 500)
+        if len(note) < 5:
+            return jsonify({'success': False, 'error': 'Write how you confirmed the worker is safe.'}), 400
+        rec.resolved_by, rec.resolved_at, rec.resolution_note = request.user.id, datetime.utcnow(), note
+    was = rec.alert_level or 0
+    rec.status, rec.finished_at = 'finished', datetime.utcnow()
+    db.session.commit()
+    if was:
+        _rc_alert(rec.company_id, request.user.id, f'{rec.worker_name}: timer closed',
+                  f'The lone-worker timer for {rec.worker_name} was closed.', 'medium')
+    return jsonify({'success': True, 'data': _rc_dict(rec)}), 200
+
+
+@app.route('/api/ready-check/<int:rid>/release', methods=['POST'])
+@jwt_required
+def rc_release_route(rid):
+    """A supervisor confirms the missing control is fixed. Nobody releases their own stop while another supervisor exists."""
+    user = request.user
+    uid = user.id
+    rec = _rc_get(user, rid, lock=True)
+    if not rec:
+        return jsonify({'success': False, 'error': 'Check not found.'}), 404
+    if rec.company_id:
+        if not _rc_staff(user):
+            return jsonify({'success': False, 'error': 'Only a supervisor can release stopped work.'}), 403
+        if rec.user_id == uid and _rc_staff_users(rec.company_id, uid):
+            return jsonify({'success': False, 'error': 'Another supervisor must release work that you stopped.'}), 403
+    if rec.status != 'stopped':
+        return jsonify({'success': False, 'error': 'This work is not stopped.'}), 409
+    note = _rc_text(_tbt_body().get('note'), 1000)
+    if len(note) < 10:
+        return jsonify({'success': False, 'error': 'Write what was fixed (at least 10 characters).'}), 400
+    rec.status, rec.resolved_by, rec.resolved_at, rec.resolution_note = 'released', uid, datetime.utcnow(), note
+    db.session.commit()
+    out = _rc_dict(rec)
+    if out['user_id'] != uid:
+        if create_notification(out['user_id'], f"Work released: {out['task_name']}"[:200],
+                               f'Fixed: {note}. Run the Ready Check again before you start.'[:900],
+                               type='success', priority='high', action_url='/ready-check', expires_in_hours=72) is None:
+            db.session.rollback()
+    return jsonify({'success': True, 'data': out}), 200
+
+
+@app.route('/api/ready-check/board', methods=['GET'])
+@jwt_required
+def rc_board_route():
+    user = request.user
+    if not _rc_staff(user):
+        return jsonify({'success': False, 'error': 'Supervisors only.'}), 403
+    now = datetime.utcnow()
+    base = ReadyCheck.query.filter(ReadyCheck.company_id == user.company_id)
+    stopped = base.filter(ReadyCheck.status == 'stopped').order_by(ReadyCheck.done_at.desc()).limit(100).all()
+    out = (base.filter(ReadyCheck.status == 'working', ReadyCheck.expected_end.isnot(None))
+           .order_by(ReadyCheck.expected_end).limit(100).all())
+    recent = (base.filter(ReadyCheck.kind == 'check', ReadyCheck.done_at >= now - timedelta(days=30))
+              .order_by(ReadyCheck.done_at.desc()).limit(5000).all())
+    tasks, miss = {}, {}
+    for r in recent:
+        t = tasks.setdefault(r.task_key, {'task': r.task_name, 'checks': 0, 'stops': 0, 'total': 0, 'ok': 0})
+        t['checks'] += 1
+        t['stops'] += 1 if r.result == 'stop' else 0
+        t['total'] += r.controls_total or 0
+        t['ok'] += r.controls_ok or 0
+        for m in _tbt_json(r.missing, []):
+            miss[(r.task_key, m)] = miss.get((r.task_key, m), 0) + 1
+    rows = list(tasks.values())
+    for t in rows:
+        t['score'] = round(100 * t['ok'] / t['total']) if t['total'] else None
+    rows.sort(key=lambda t: (t['score'] is None, t['score'] or 0))
+    labels = {(k, c[0]): (v[0], c[1]) for k, v in RC_TASKS.items() for c in v[2]}
+    top = [{'task': labels[k][0], 'control': labels[k][1], 'times': n}
+           for k, n in sorted(miss.items(), key=lambda kv: -kv[1])[:8] if k in labels]
+    total, ok = sum(t['total'] for t in rows), sum(t['ok'] for t in rows)
+    return jsonify({'success': True, 'data': {
+        'stopped': [_rc_dict(r) for r in stopped], 'out': [_rc_dict(r) for r in out], 'tasks': rows, 'missing': top,
+        'checks_30d': len(recent), 'stops_30d': sum(t['stops'] for t in rows), 'score': round(100 * ok / total) if total else None}}), 200
+
+
+def _rc_check_overdue(now=None):
+    """Alert for overdue lone workers: after the grace time, then every 15 minutes, three alerts at most."""
+    now = now or datetime.utcnow()
+    due = (ReadyCheck.query.filter(ReadyCheck.status == 'working', ReadyCheck.expected_end.isnot(None),
+                                   ReadyCheck.expected_end < now - timedelta(minutes=RC_GRACE_MINUTES),
+                                   ReadyCheck.alert_level < RC_MAX_ALERTS,
+                                   or_(ReadyCheck.alerted_at.is_(None),
+                                       ReadyCheck.alerted_at < now - timedelta(minutes=RC_REPEAT_MINUTES)))
+           .limit(200).all())
+    todo = [(r.id, r.alert_level or 0, r.expected_end) for r in due]
+    sent = 0
+    for rid, level, end in todo:
+        # claim this alert first: two processes never send it twice, and a check-in that just arrived wins
+        claimed = (ReadyCheck.query.filter(ReadyCheck.id == rid, ReadyCheck.alert_level == level, ReadyCheck.expected_end == end,
+                                           ReadyCheck.status == 'working')
+                   .update({'alert_level': level + 1, 'alerted_at': now}, synchronize_session=False))
+        db.session.commit()
+        if not claimed:
+            continue
+        r = db.session.get(ReadyCheck, rid)
+        late = int((now - end).total_seconds() // 60)
+        where = f' at {r.location}' if r.location else ''
+        _rc_alert(r.company_id, r.user_id, f'LONE WORKER OVERDUE: {r.worker_name}',
+                  f'{r.worker_name} is {late} minutes overdue on {r.task_name}{where}. Contact them now. '
+                  f'(Alert {level + 1} of {RC_MAX_ALERTS})')
+        sent += 1
+    return sent
+
+
+def _rc_watch_loop():
+    time.sleep(90)
+    while True:
+        try:
+            with app.app_context():
+                _rc_check_overdue()
+        except Exception as e:
+            logger.error(f'ready check watcher: {e}')
+        finally:
+            try:
+                with app.app_context():
+                    db.session.remove()
+            except Exception:
+                pass
+        time.sleep(60)
+
+
+if os.environ.get('READY_CHECK_WATCHER', '1') == '1':
+    threading.Thread(target=_rc_watch_loop, name='ready-check-watcher', daemon=True).start()
+
+
 # =====================================================================================================
 # AUTO MIGRATIONS (2026-11-23)
 # Railway's Data tab appends LIMIT to every query, so CREATE/ALTER statements fail there. Instead the
@@ -167303,7 +167845,7 @@ def admin_withdraw_company_quote(company_id):
 #   - a failing statement is logged and the file is retried on the next start
 # Set AUTO_MIGRATE=0 on Railway to switch this off.
 # =====================================================================================================
-AUTO_MIGRATIONS = ('DEPLOY_2026-11-23_FULL.sql', '2026-11-24_company_quotes.sql')
+AUTO_MIGRATIONS = ('DEPLOY_2026-11-23_FULL.sql', '2026-11-24_company_quotes.sql', '2026-11-25_ready_checks.sql')
 _MIGRATION_LOCK_KEY = 74230115
 
 
