@@ -167835,6 +167835,758 @@ if os.environ.get('READY_CHECK_WATCHER', '1') == '1':
     threading.Thread(target=_rc_watch_loop, name='ready-check-watcher', daemon=True).start()
 
 
+# ============================================================================
+# EVACUATION ROLL CALL + CONTRACTOR MANAGEMENT (2026-11-26)
+# ============================================================================
+# DB: muster_events, muster_marks, contractor_firms, contractor_workers, contractor_docs
+#     -> sql/2026-11-26_muster_contractors.sql (auto migration)
+
+
+class MusterEvent(db.Model):
+    __tablename__ = 'muster_events'
+    __table_args__ = {'extend_existing': True}
+    id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id', ondelete='CASCADE'), nullable=False, index=True)
+    kind = db.Column(db.String(10), nullable=False, default='drill')        # drill | real
+    reason = db.Column(db.String(300))
+    site = db.Column(db.String(200))
+    assembly_point = db.Column(db.String(200))
+    status = db.Column(db.String(10), nullable=False, default='open')       # open | closed
+    started_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    started_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    closed_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    closed_at = db.Column(db.DateTime)
+    close_note = db.Column(db.Text)
+    summary = db.Column(db.Text)
+
+
+class MusterMark(db.Model):
+    __tablename__ = 'muster_marks'
+    __table_args__ = {'extend_existing': True}
+    id = db.Column(db.Integer, primary_key=True)
+    event_id = db.Column(db.Integer, db.ForeignKey('muster_events.id', ondelete='CASCADE'), nullable=False, index=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='CASCADE'), nullable=True)
+    person_name = db.Column(db.String(160))                                 # visitors / contractors without an account
+    status = db.Column(db.String(10), nullable=False)                       # safe | help | away
+    note = db.Column(db.String(300))
+    marked_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    marked_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+
+MU_STATUS = ('safe', 'help', 'away')
+
+
+def _mu_iso(d):
+    return d.isoformat() + 'Z' if d else None
+
+
+def _mu_body():
+    data = request.get_json(silent=True)
+    return data if isinstance(data, dict) else {}
+
+
+def _mu_people(cid):
+    return [u for u in _TbtUser.query.filter(_TbtUser.company_id == cid).all() if getattr(u, 'is_active', True) is not False]
+
+
+def _mu_event_dict(e, full=False):
+    out = {'id': e.id, 'kind': e.kind, 'reason': e.reason, 'site': e.site, 'assembly_point': e.assembly_point, 'status': e.status,
+           'started_at': _mu_iso(e.started_at), 'closed_at': _mu_iso(e.closed_at), 'close_note': e.close_note,
+           'summary': _tbt_json(e.summary, None)}
+    if full:
+        marks = MusterMark.query.filter(MusterMark.event_id == e.id).all()
+        by_user = {m.user_id: m for m in marks if m.user_id}
+        people = []
+        for u in _mu_people(e.company_id):
+            m = by_user.get(u.id)
+            people.append({'user_id': u.id, 'name': _rc_text(getattr(u, 'name', None) or getattr(u, 'email', None) or f'User {u.id}', 160),
+                           'status': m.status if m else 'missing', 'note': m.note if m else None,
+                           'marked_at': _mu_iso(m.marked_at) if m else None, 'self_marked': bool(m and m.marked_by == u.id)})
+        for m in marks:
+            if not m.user_id:
+                people.append({'user_id': None, 'mark_id': m.id, 'name': m.person_name, 'status': m.status, 'note': m.note,
+                               'marked_at': _mu_iso(m.marked_at), 'visitor': True, 'self_marked': False})
+        order = {'help': 0, 'missing': 1, 'safe': 2, 'away': 3}
+        people.sort(key=lambda p: (order.get(p['status'], 9), (p['name'] or '').lower()))
+        counts = {k: sum(1 for p in people if p['status'] == k) for k in ('safe', 'help', 'away', 'missing')}
+        out['people'] = people
+        out['counts'] = counts
+        out['accounted'] = counts['safe'] + counts['away']
+        out['total'] = len(people)
+    return out
+
+
+def _mu_open(cid):
+    return MusterEvent.query.filter(MusterEvent.company_id == cid, MusterEvent.status == 'open').order_by(MusterEvent.id.desc()).first()
+
+
+def _mu_alert_all(cid, exclude, title, text, url, email):
+    targets = [(u.id, getattr(u, 'email', None) if email else None) for u in _mu_people(cid) if u.id != exclude]
+    if not targets:
+        return 0
+
+    def run():
+        from html import escape as _esc
+        with app.app_context():
+            try:
+                for uid, _m in targets:
+                    try:
+                        if create_notification(uid, title, text, type='critical', priority='critical', action_url=url, expires_in_hours=24) is None:
+                            db.session.rollback()
+                    except Exception as e:
+                        db.session.rollback()
+                        logger.error(f'muster notification failed: {e}')
+                for _u, m in targets:
+                    if m:
+                        try:
+                            send_email(to=m, subject=title, body=f'<p>{_esc(text)}</p><p>Open SafeTrack Pro and press "I am safe".</p>')
+                        except Exception as e:
+                            logger.error(f'muster e-mail failed: {e}')
+            finally:
+                db.session.remove()
+    threading.Thread(target=run, daemon=True).start()
+    return len(targets)
+
+
+@app.route('/api/muster', methods=['POST'])
+@jwt_required
+def mu_start_route():
+    user = request.user
+    if not _rc_staff(user):
+        return jsonify({'success': False, 'error': 'Only a supervisor or admin can start a roll call.'}), 403
+    cid = user.company_id
+    if _mu_open(cid):
+        return jsonify({'success': False, 'error': 'A roll call is already running. Close it first.'}), 409
+    data = _mu_body()
+    kind = 'real' if data.get('kind') == 'real' else 'drill'
+    e = MusterEvent(company_id=cid, kind=kind, reason=_rc_text(data.get('reason'), 300), site=_rc_text(data.get('site'), 200),
+                    assembly_point=_rc_text(data.get('assembly_point'), 200), status='open', started_by=user.id)
+    db.session.add(e)
+    db.session.flush()
+    db.session.add(MusterMark(event_id=e.id, user_id=user.id, status='safe', marked_by=user.id))
+    db.session.commit()
+    label = 'EVACUATION' if kind == 'real' else 'EVACUATION DRILL'
+    where = f' Go to {e.assembly_point}.' if e.assembly_point else ' Go to your assembly point.'
+    sent = _mu_alert_all(cid, user.id, f'{label}: roll call started', f'{label}{": " + e.reason if e.reason else ""}.{where} Then press "I am safe".',
+                         '/roll-call', email=(kind == 'real'))
+    out = _mu_event_dict(e, full=True)
+    out['notified'] = sent
+    return jsonify({'success': True, 'data': out}), 201
+
+
+@app.route('/api/muster/current', methods=['GET'])
+@jwt_required
+def mu_current_route():
+    user = request.user
+    cid = getattr(user, 'company_id', None)
+    e = _mu_open(cid) if cid else None
+    if not e:
+        return jsonify({'success': True, 'data': {'event': None, 'is_staff': _rc_staff(user)}}), 200
+    mine = MusterMark.query.filter(MusterMark.event_id == e.id, MusterMark.user_id == user.id).first()
+    return jsonify({'success': True, 'data': {'event': _mu_event_dict(e, full=_rc_staff(user)), 'is_staff': _rc_staff(user),
+                                              'my_status': mine.status if mine else 'missing'}}), 200
+
+
+def _mu_get(user, eid):
+    e = db.session.get(MusterEvent, eid)
+    return e if e and e.company_id == getattr(user, 'company_id', None) else None
+
+
+@app.route('/api/muster/<int:eid>/me', methods=['POST'])
+@jwt_required
+def mu_me_route(eid):
+    user = request.user
+    e = _mu_get(user, eid)
+    if not e:
+        return jsonify({'success': False, 'error': 'Roll call not found.'}), 404
+    if e.status != 'open':
+        return jsonify({'success': False, 'error': 'This roll call is closed.'}), 409
+    data = _mu_body()
+    status = data.get('status')
+    if status not in ('safe', 'help'):
+        return jsonify({'success': False, 'error': 'Choose "I am safe" or "I need help".'}), 400
+    m = MusterMark.query.filter(MusterMark.event_id == e.id, MusterMark.user_id == user.id).first()
+    if not m:
+        m = MusterMark(event_id=e.id, user_id=user.id)
+        db.session.add(m)
+    m.status, m.note, m.marked_by, m.marked_at = status, _rc_text(data.get('note'), 300), user.id, datetime.utcnow()
+    try:
+        db.session.commit()
+    except Exception:                                       # two taps at once: the unique row already exists
+        db.session.rollback()
+        m = MusterMark.query.filter(MusterMark.event_id == e.id, MusterMark.user_id == user.id).first()
+        m.status, m.note, m.marked_by, m.marked_at = status, _rc_text(data.get('note'), 300), user.id, datetime.utcnow()
+        db.session.commit()
+    if status == 'help':
+        name = _rc_text(getattr(user, 'name', None) or 'A worker', 120)
+        _rc_alert(e.company_id, user.id, f'NEEDS HELP: {name}', f'{name} pressed "I need help" during the roll call. {m.note or ""}'.strip())
+    return jsonify({'success': True, 'data': {'my_status': status}}), 200
+
+
+@app.route('/api/muster/<int:eid>/mark', methods=['POST'])
+@jwt_required
+def mu_mark_route(eid):
+    """A warden marks someone they can see (or a visitor without an account)."""
+    user = request.user
+    if not _rc_staff(user):
+        return jsonify({'success': False, 'error': 'Only a supervisor can mark other people.'}), 403
+    e = _mu_get(user, eid)
+    if not e:
+        return jsonify({'success': False, 'error': 'Roll call not found.'}), 404
+    if e.status != 'open':
+        return jsonify({'success': False, 'error': 'This roll call is closed.'}), 409
+    data = _mu_body()
+    status = data.get('status')
+    if status not in MU_STATUS + ('missing',):
+        return jsonify({'success': False, 'error': 'Unknown status.'}), 400
+    note = _rc_text(data.get('note'), 300)
+    if data.get('user_id') is not None:
+        try:
+            uid = int(data.get('user_id'))
+        except (TypeError, ValueError):
+            return jsonify({'success': False, 'error': 'Unknown person.'}), 400
+        target = db.session.get(_TbtUser, uid)
+        if not target or target.company_id != e.company_id:
+            return jsonify({'success': False, 'error': 'Unknown person.'}), 404
+        m = MusterMark.query.filter(MusterMark.event_id == e.id, MusterMark.user_id == uid).first()
+        if status == 'missing':
+            if m:
+                db.session.delete(m)
+        else:
+            if not m:
+                m = MusterMark(event_id=e.id, user_id=uid)
+                db.session.add(m)
+            m.status, m.note, m.marked_by, m.marked_at = status, note, user.id, datetime.utcnow()
+    elif data.get('mark_id') is not None:
+        m = MusterMark.query.filter(MusterMark.id == data.get('mark_id'), MusterMark.event_id == e.id, MusterMark.user_id.is_(None)).first()
+        if not m:
+            return jsonify({'success': False, 'error': 'Unknown person.'}), 404
+        if status == 'missing':
+            db.session.delete(m)
+        else:
+            m.status, m.note, m.marked_by, m.marked_at = status, note or m.note, user.id, datetime.utcnow()
+    else:
+        name = _rc_text(data.get('name'), 160)
+        if len(name) < 2 or status == 'missing':
+            return jsonify({'success': False, 'error': 'Type the visitor\'s name.'}), 400
+        if MusterMark.query.filter(MusterMark.event_id == e.id, MusterMark.user_id.is_(None)).count() >= 500:
+            return jsonify({'success': False, 'error': 'Too many visitors on this roll call.'}), 400
+        db.session.add(MusterMark(event_id=e.id, person_name=name, status=status, note=note, marked_by=user.id))
+    db.session.commit()
+    return jsonify({'success': True, 'data': _mu_event_dict(e, full=True)}), 200
+
+
+@app.route('/api/muster/<int:eid>', methods=['GET'])
+@jwt_required
+def mu_get_route(eid):
+    user = request.user
+    if not _rc_staff(user):
+        return jsonify({'success': False, 'error': 'Supervisors only.'}), 403
+    e = _mu_get(user, eid)
+    if not e:
+        return jsonify({'success': False, 'error': 'Roll call not found.'}), 404
+    if e.status == 'closed' and e.summary:
+        out = _mu_event_dict(e)
+        snap = _tbt_json(e.summary, {})
+        out.update({'people': snap.get('people', []), 'counts': snap.get('counts', {}), 'accounted': snap.get('accounted'), 'total': snap.get('total')})
+        return jsonify({'success': True, 'data': out}), 200
+    return jsonify({'success': True, 'data': _mu_event_dict(e, full=True)}), 200
+
+
+@app.route('/api/muster/<int:eid>/close', methods=['POST'])
+@jwt_required
+def mu_close_route(eid):
+    user = request.user
+    if not _rc_staff(user):
+        return jsonify({'success': False, 'error': 'Only a supervisor can close a roll call.'}), 403
+    e = _mu_get(user, eid)
+    if not e:
+        return jsonify({'success': False, 'error': 'Roll call not found.'}), 404
+    if e.status != 'open':
+        return jsonify({'success': False, 'error': 'This roll call is already closed.'}), 409
+    full = _mu_event_dict(e, full=True)
+    note = _rc_text(_mu_body().get('note'), 1000)
+    missing = full['counts']['missing'] + full['counts']['help']
+    if missing and len(note) < 5:
+        return jsonify({'success': False, 'code': 'UNACCOUNTED',
+                        'error': f'{missing} people are not accounted for. Write what was done about them before closing.'}), 400
+    now = datetime.utcnow()
+    marks = [p['marked_at'] for p in full['people'] if p['status'] == 'safe' and p['marked_at']]
+    last = max(marks) if marks else None
+    e.summary = json.dumps({'people': full['people'], 'counts': full['counts'], 'accounted': full['accounted'], 'total': full['total'],
+                            'minutes_to_last_safe': round((datetime.fromisoformat(last[:-1]) - e.started_at).total_seconds() / 60, 1) if last else None,
+                            'minutes_open': round((now - e.started_at).total_seconds() / 60, 1)})
+    e.status, e.closed_at, e.closed_by, e.close_note = 'closed', now, user.id, note
+    db.session.commit()
+    return jsonify({'success': True, 'data': _mu_event_dict(e)}), 200
+
+
+@app.route('/api/muster/history', methods=['GET'])
+@jwt_required
+def mu_history_route():
+    user = request.user
+    if not _rc_staff(user):
+        return jsonify({'success': False, 'error': 'Supervisors only.'}), 403
+    rows = MusterEvent.query.filter(MusterEvent.company_id == user.company_id).order_by(MusterEvent.id.desc()).limit(50).all()
+    return jsonify({'success': True, 'data': [_mu_event_dict(r) for r in rows]}), 200
+
+
+# ------------------------------------------------------------------------------------------- contractors
+class ContractorFirm(db.Model):
+    __tablename__ = 'contractor_firms'
+    __table_args__ = {'extend_existing': True}
+    id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id', ondelete='CASCADE'), nullable=False, index=True)
+    name = db.Column(db.String(200), nullable=False)
+    trade = db.Column(db.String(120))
+    contact_name = db.Column(db.String(120))
+    contact_email = db.Column(db.String(200))
+    contact_phone = db.Column(db.String(40))
+    status = db.Column(db.String(12), nullable=False, default='pending')    # pending | approved | suspended
+    prequal = db.Column(db.Text)                                            # JSON {question id: yes|no}
+    notes = db.Column(db.Text)
+    approved_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    approved_at = db.Column(db.DateTime)
+    created_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class ContractorWorker(db.Model):
+    __tablename__ = 'contractor_workers'
+    __table_args__ = {'extend_existing': True}
+    id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id', ondelete='CASCADE'), nullable=False, index=True)
+    firm_id = db.Column(db.Integer, db.ForeignKey('contractor_firms.id', ondelete='CASCADE'), nullable=False, index=True)
+    name = db.Column(db.String(160), nullable=False)
+    role = db.Column(db.String(120))
+    phone = db.Column(db.String(40))
+    inducted_on = db.Column(db.Date)
+    induction_valid_until = db.Column(db.Date)
+    status = db.Column(db.String(10), nullable=False, default='active')     # active | removed
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+
+class ContractorDoc(db.Model):
+    __tablename__ = 'contractor_docs'
+    __table_args__ = {'extend_existing': True}
+    id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id', ondelete='CASCADE'), nullable=False, index=True)
+    firm_id = db.Column(db.Integer, db.ForeignKey('contractor_firms.id', ondelete='CASCADE'), nullable=False, index=True)
+    worker_id = db.Column(db.Integer, db.ForeignKey('contractor_workers.id', ondelete='CASCADE'), nullable=True, index=True)
+    doc_type = db.Column(db.String(30), nullable=False)
+    title = db.Column(db.String(200))
+    number = db.Column(db.String(100))
+    expires_on = db.Column(db.Date)
+    file_name = db.Column(db.String(200))
+    file_mime = db.Column(db.String(60))
+    notified_stage = db.Column(db.Integer, nullable=False, default=0)      # 1 = 30 days, 2 = 7 days, 3 = expired
+    uploaded_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+
+CT_PREQUAL = (
+    ('policy', 'Has a written health and safety policy'),
+    ('rams', 'Gives risk assessments and method statements for its work'),
+    ('training', 'Workers are trained and competent for the work'),
+    ('incidents', 'Shared its accident record for the last 3 years'),
+    ('equipment', 'Equipment is inspected and certified'),
+    ('supervision', 'Names a competent supervisor on site'),
+)
+CT_FIRM_DOCS = {'insurance': 'Liability insurance', 'license': 'Business licence or registration', 'safety_policy': 'Safety policy',
+                'rams': 'Risk assessment / method statement', 'other': 'Other'}
+CT_WORKER_DOCS = {'id': 'Identity document', 'certificate': 'Competence certificate', 'medical': 'Medical fitness',
+                  'training': 'Training record', 'other': 'Other'}
+CT_REQUIRED_FIRM = ('insurance',)
+CT_MAX_FILE = 10 * 1024 * 1024
+CT_MIME = {b'%PDF': ('application/pdf', 'pdf'), b'\x89PNG': ('image/png', 'png'), b'\xff\xd8\xff': ('image/jpeg', 'jpg')}
+
+
+def _ct_date(v):
+    if v in (None, ''):
+        return None
+    try:
+        return datetime.strptime(str(v)[:10], '%Y-%m-%d').date()
+    except ValueError:
+        raise ValueError('Dates must look like 2026-12-31.')
+
+
+def _ct_doc_state(d, today):
+    if not d.expires_on:
+        return 'valid'
+    days = (d.expires_on - today).days
+    return 'expired' if days < 0 else 'expiring' if days <= 30 else 'valid'
+
+
+def _ct_doc_dict(d, today):
+    return {'id': d.id, 'firm_id': d.firm_id, 'worker_id': d.worker_id, 'doc_type': d.doc_type, 'title': d.title, 'number': d.number,
+            'expires_on': d.expires_on.isoformat() if d.expires_on else None, 'state': _ct_doc_state(d, today),
+            'has_file': bool(d.file_name), 'created_at': _mu_iso(d.created_at)}
+
+
+def _ct_firm_issues(f, docs, today):
+    """Why this firm may not work here (empty list = may work)."""
+    issues = []
+    answers = _tbt_json(f.prequal, {})
+    if any(answers.get(q) != 'yes' for q, _ in CT_PREQUAL):
+        issues.append('Pre-qualification not complete')
+    for t in CT_REQUIRED_FIRM:
+        mine = [d for d in docs if d.worker_id is None and d.doc_type == t]
+        if not mine:
+            issues.append(f'{CT_FIRM_DOCS[t]} missing')
+        elif all(_ct_doc_state(d, today) == 'expired' for d in mine):
+            issues.append(f'{CT_FIRM_DOCS[t]} expired')
+    return issues
+
+
+def _ct_worker_issues(w, firm, docs, today):
+    issues = []
+    if firm.status != 'approved':
+        issues.append(f'Company is {firm.status}')
+    if w.status != 'active':
+        issues.append('Worker removed')
+    if not w.inducted_on:
+        issues.append('Not inducted')
+    elif w.induction_valid_until and w.induction_valid_until < today:
+        issues.append('Induction expired')
+    for d in docs:
+        if d.worker_id == w.id and _ct_doc_state(d, today) == 'expired':
+            issues.append(f'{CT_WORKER_DOCS.get(d.doc_type, d.doc_type)} expired')
+    return issues
+
+
+def _ct_firm_dict(f, today, full=False):
+    docs = ContractorDoc.query.filter(ContractorDoc.firm_id == f.id).all()
+    workers = ContractorWorker.query.filter(ContractorWorker.firm_id == f.id).order_by(ContractorWorker.name).all()
+    states = [_ct_doc_state(d, today) for d in docs]
+    out = {'id': f.id, 'name': f.name, 'trade': f.trade, 'contact_name': f.contact_name, 'contact_email': f.contact_email,
+           'contact_phone': f.contact_phone, 'status': f.status, 'prequal': _tbt_json(f.prequal, {}), 'notes': f.notes,
+           'approved_at': _mu_iso(f.approved_at), 'issues': _ct_firm_issues(f, docs, today),
+           'workers': sum(1 for w in workers if w.status == 'active'), 'docs_expired': states.count('expired'),
+           'docs_expiring': states.count('expiring')}
+    if full:
+        out['docs'] = [_ct_doc_dict(d, today) for d in sorted(docs, key=lambda d: (d.worker_id or 0, d.doc_type))]
+        out['worker_list'] = [{'id': w.id, 'name': w.name, 'role': w.role, 'phone': w.phone, 'status': w.status,
+                               'inducted_on': w.inducted_on.isoformat() if w.inducted_on else None,
+                               'induction_valid_until': w.induction_valid_until.isoformat() if w.induction_valid_until else None,
+                               'issues': _ct_worker_issues(w, f, docs, today)} for w in workers]
+    return out
+
+
+def _ct_staff_or_403(user):
+    if not _rc_staff(user):
+        return jsonify({'success': False, 'error': 'Only supervisors and admins can manage contractors.'}), 403
+    return None
+
+
+def _ct_firm(user, fid):
+    f = db.session.get(ContractorFirm, fid)
+    return f if f and f.company_id == user.company_id else None
+
+
+def _ct_apply_firm(f, data):
+    name = _rc_text(data.get('name'), 200) if 'name' in data else f.name
+    if not name or len(name) < 2:
+        raise ValueError('Type the contractor\'s name.')
+    f.name = name
+    for k, n in (('trade', 120), ('contact_name', 120), ('contact_phone', 40), ('notes', 2000)):
+        if k in data:
+            setattr(f, k, _rc_text(data.get(k), n) or None)
+    if 'contact_email' in data:
+        em = _rc_text(data.get('contact_email'), 200)
+        if em and not re.fullmatch(r'[^@\s]+@[^@\s]+\.[^@\s]+', em):
+            raise ValueError('The e-mail address is not valid.')
+        f.contact_email = em or None
+    if isinstance(data.get('prequal'), dict):
+        f.prequal = json.dumps({q: data['prequal'].get(q) for q, _ in CT_PREQUAL if data['prequal'].get(q) in ('yes', 'no')})
+
+
+@app.route('/api/contractors', methods=['GET', 'POST'])
+@jwt_required
+def ct_list_route():
+    user = request.user
+    deny = _ct_staff_or_403(user)
+    if deny:
+        return deny
+    today = datetime.utcnow().date()
+    if request.method == 'GET':
+        firms = ContractorFirm.query.filter(ContractorFirm.company_id == user.company_id).order_by(ContractorFirm.name).limit(1000).all()
+        return jsonify({'success': True, 'data': {'firms': [_ct_firm_dict(f, today) for f in firms],
+                                                  'prequal_questions': [{'id': q, 'text': t} for q, t in CT_PREQUAL],
+                                                  'firm_doc_types': CT_FIRM_DOCS, 'worker_doc_types': CT_WORKER_DOCS,
+                                                  'required_firm_docs': list(CT_REQUIRED_FIRM)}}), 200
+    data = _mu_body()
+    if ContractorFirm.query.filter(ContractorFirm.company_id == user.company_id).count() >= 1000:
+        return jsonify({'success': False, 'error': 'Contractor limit reached.'}), 400
+    f = ContractorFirm(company_id=user.company_id, status='pending', created_by=user.id, prequal='{}')
+    try:
+        _ct_apply_firm(f, data)
+    except ValueError as e:
+        return jsonify({'success': False, 'error': str(e)}), 400
+    if ContractorFirm.query.filter(ContractorFirm.company_id == user.company_id, func.lower(ContractorFirm.name) == f.name.lower()).first():
+        return jsonify({'success': False, 'error': 'A contractor with this name already exists.'}), 409
+    db.session.add(f)
+    db.session.commit()
+    return jsonify({'success': True, 'data': _ct_firm_dict(f, today, full=True)}), 201
+
+
+@app.route('/api/contractors/<int:fid>', methods=['GET', 'PUT'])
+@jwt_required
+def ct_firm_route(fid):
+    user = request.user
+    deny = _ct_staff_or_403(user)
+    if deny:
+        return deny
+    f = _ct_firm(user, fid)
+    if not f:
+        return jsonify({'success': False, 'error': 'Contractor not found.'}), 404
+    today = datetime.utcnow().date()
+    if request.method == 'PUT':
+        try:
+            _ct_apply_firm(f, _mu_body())
+        except ValueError as e:
+            return jsonify({'success': False, 'error': str(e)}), 400
+        clash = ContractorFirm.query.filter(ContractorFirm.company_id == user.company_id, ContractorFirm.id != f.id,
+                                            func.lower(ContractorFirm.name) == f.name.lower()).first()
+        if clash:
+            db.session.rollback()
+            return jsonify({'success': False, 'error': 'A contractor with this name already exists.'}), 409
+        docs = ContractorDoc.query.filter(ContractorDoc.firm_id == f.id).all()
+        if f.status == 'approved' and _ct_firm_issues(f, docs, today):
+            f.status = 'pending'                               # an approval only stands while its conditions hold
+        db.session.commit()
+    return jsonify({'success': True, 'data': _ct_firm_dict(f, today, full=True)}), 200
+
+
+@app.route('/api/contractors/<int:fid>/status', methods=['POST'])
+@jwt_required
+def ct_status_route(fid):
+    user = request.user
+    deny = _ct_staff_or_403(user)
+    if deny:
+        return deny
+    f = _ct_firm(user, fid)
+    if not f:
+        return jsonify({'success': False, 'error': 'Contractor not found.'}), 404
+    status = _mu_body().get('status')
+    if status not in ('approved', 'suspended', 'pending'):
+        return jsonify({'success': False, 'error': 'Unknown status.'}), 400
+    today = datetime.utcnow().date()
+    if status == 'approved':
+        issues = _ct_firm_issues(f, ContractorDoc.query.filter(ContractorDoc.firm_id == f.id).all(), today)
+        if issues:
+            return jsonify({'success': False, 'code': 'NOT_READY', 'issues': issues, 'error': 'Cannot approve yet: ' + '; '.join(issues)}), 400
+        f.approved_by, f.approved_at = user.id, datetime.utcnow()
+    f.status = status
+    db.session.commit()
+    return jsonify({'success': True, 'data': _ct_firm_dict(f, today, full=True)}), 200
+
+
+@app.route('/api/contractors/<int:fid>/workers', methods=['POST'])
+@app.route('/api/contractors/<int:fid>/workers/<int:wid>', methods=['PUT'])
+@jwt_required
+def ct_worker_route(fid, wid=None):
+    user = request.user
+    deny = _ct_staff_or_403(user)
+    if deny:
+        return deny
+    f = _ct_firm(user, fid)
+    if not f:
+        return jsonify({'success': False, 'error': 'Contractor not found.'}), 404
+    data = _mu_body()
+    if wid is None:
+        if ContractorWorker.query.filter(ContractorWorker.firm_id == f.id).count() >= 2000:
+            return jsonify({'success': False, 'error': 'Worker limit reached.'}), 400
+        w = ContractorWorker(company_id=f.company_id, firm_id=f.id, status='active')
+    else:
+        w = ContractorWorker.query.filter(ContractorWorker.id == wid, ContractorWorker.firm_id == f.id).first()
+        if not w:
+            return jsonify({'success': False, 'error': 'Worker not found.'}), 404
+    name = _rc_text(data.get('name'), 160) if 'name' in data or wid is None else w.name
+    if not name or len(name) < 2:
+        return jsonify({'success': False, 'error': 'Type the worker\'s name.'}), 400
+    w.name = name
+    for k, n in (('role', 120), ('phone', 40)):
+        if k in data:
+            setattr(w, k, _rc_text(data.get(k), n) or None)
+    try:
+        if 'inducted_on' in data:
+            w.inducted_on = _ct_date(data.get('inducted_on'))
+        if 'induction_valid_until' in data:
+            w.induction_valid_until = _ct_date(data.get('induction_valid_until'))
+    except ValueError as e:
+        return jsonify({'success': False, 'error': str(e)}), 400
+    if w.inducted_on and w.inducted_on > datetime.utcnow().date():
+        return jsonify({'success': False, 'error': 'The induction date cannot be in the future.'}), 400
+    if w.inducted_on and w.induction_valid_until and w.induction_valid_until < w.inducted_on:
+        return jsonify({'success': False, 'error': 'The induction cannot expire before it was given.'}), 400
+    if data.get('status') in ('active', 'removed'):
+        w.status = data['status']
+    if wid is None:
+        db.session.add(w)
+    db.session.commit()
+    return jsonify({'success': True, 'data': _ct_firm_dict(f, datetime.utcnow().date(), full=True)}), 200 if wid else 201
+
+
+def _ct_dir(cid):
+    return os.path.join(BASE_UPLOAD_DIR, 'contractors', str(int(cid)))
+
+
+@app.route('/api/contractors/<int:fid>/docs', methods=['POST'])
+@jwt_required
+def ct_doc_add_route(fid):
+    user = request.user
+    deny = _ct_staff_or_403(user)
+    if deny:
+        return deny
+    f = _ct_firm(user, fid)
+    if not f:
+        return jsonify({'success': False, 'error': 'Contractor not found.'}), 404
+    form = request.form if request.form else (_mu_body())
+    worker_id = form.get('worker_id')
+    w = None
+    if worker_id not in (None, '', 'null'):
+        try:
+            w = ContractorWorker.query.filter(ContractorWorker.id == int(worker_id), ContractorWorker.firm_id == f.id).first()
+        except (TypeError, ValueError):
+            w = None
+        if not w:
+            return jsonify({'success': False, 'error': 'Worker not found.'}), 404
+    kinds = CT_WORKER_DOCS if w else CT_FIRM_DOCS
+    doc_type = form.get('doc_type')
+    if doc_type not in kinds:
+        return jsonify({'success': False, 'error': 'Choose the document type.'}), 400
+    try:
+        expires = _ct_date(form.get('expires_on'))
+    except ValueError as e:
+        return jsonify({'success': False, 'error': str(e)}), 400
+    if ContractorDoc.query.filter(ContractorDoc.firm_id == f.id).count() >= 3000:
+        return jsonify({'success': False, 'error': 'Document limit reached.'}), 400
+    d = ContractorDoc(company_id=f.company_id, firm_id=f.id, worker_id=w.id if w else None, doc_type=doc_type,
+                      title=_rc_text(form.get('title'), 200) or kinds[doc_type], number=_rc_text(form.get('number'), 100) or None,
+                      expires_on=expires, uploaded_by=user.id, notified_stage=0)
+    up = request.files.get('file')
+    if up and up.filename:
+        raw = up.read(CT_MAX_FILE + 1)
+        if len(raw) > CT_MAX_FILE:
+            return jsonify({'success': False, 'error': 'The file is larger than 10 MB.'}), 400
+        kind = next((v for k, v in CT_MIME.items() if raw.startswith(k)), None)
+        if not kind:
+            return jsonify({'success': False, 'error': 'Only PDF, PNG or JPG files.'}), 400
+        folder = _ct_dir(f.company_id)
+        os.makedirs(folder, exist_ok=True)
+        d.file_name = f'{uuid.uuid4().hex}.{kind[1]}'
+        d.file_mime = kind[0]
+        with open(os.path.join(folder, d.file_name), 'wb') as fh:
+            fh.write(raw)
+    db.session.add(d)
+    db.session.commit()
+    return jsonify({'success': True, 'data': _ct_firm_dict(f, datetime.utcnow().date(), full=True)}), 201
+
+
+@app.route('/api/contractors/docs/<int:did>', methods=['GET', 'DELETE'])
+@jwt_required
+def ct_doc_route(did):
+    user = request.user
+    deny = _ct_staff_or_403(user)
+    if deny:
+        return deny
+    d = db.session.get(ContractorDoc, did)
+    if not d or d.company_id != user.company_id:
+        return jsonify({'success': False, 'error': 'Document not found.'}), 404
+    path = os.path.join(_ct_dir(d.company_id), d.file_name) if d.file_name and re.fullmatch(r'[0-9a-f]{32}\.(pdf|png|jpg)', d.file_name) else None
+    if request.method == 'DELETE':
+        f = db.session.get(ContractorFirm, d.firm_id)
+        db.session.delete(d)
+        today = datetime.utcnow().date()
+        db.session.flush()
+        if f.status == 'approved' and _ct_firm_issues(f, ContractorDoc.query.filter(ContractorDoc.firm_id == f.id).all(), today):
+            f.status = 'pending'
+        db.session.commit()
+        if path and os.path.exists(path):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        return jsonify({'success': True, 'data': _ct_firm_dict(f, today, full=True)}), 200
+    if not path or not os.path.exists(path):
+        return jsonify({'success': False, 'error': 'No file was uploaded for this document.'}), 404
+    resp = send_file(path, mimetype=d.file_mime, as_attachment=False, download_name=f'{d.doc_type}-{d.id}.{d.file_name.rsplit(".", 1)[1]}')
+    resp.headers['X-Content-Type-Options'] = 'nosniff'
+    resp.headers['Cache-Control'] = 'private, no-store'
+    return resp
+
+
+@app.route('/api/contractors/gate', methods=['GET'])
+@jwt_required
+def ct_gate_route():
+    """Gate check: may this contractor worker enter the site today?"""
+    user = request.user
+    deny = _ct_staff_or_403(user)
+    if deny:
+        return deny
+    q = _rc_text(request.args.get('q'), 80)
+    if len(q) < 2:
+        return jsonify({'success': True, 'data': []}), 200
+    today = datetime.utcnow().date()
+    like = '%' + q.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_') + '%'
+    workers = (ContractorWorker.query.filter(ContractorWorker.company_id == user.company_id, ContractorWorker.name.ilike(like, escape='\\'))
+               .order_by(ContractorWorker.name).limit(20).all())
+    out, firms, docs = [], {}, {}
+    for w in workers:
+        if w.firm_id not in firms:
+            firms[w.firm_id] = db.session.get(ContractorFirm, w.firm_id)
+            docs[w.firm_id] = ContractorDoc.query.filter(ContractorDoc.firm_id == w.firm_id).all()
+        f = firms[w.firm_id]
+        issues = _ct_worker_issues(w, f, docs[w.firm_id], today) + [f'Company: {i}' for i in _ct_firm_issues(f, docs[w.firm_id], today)]
+        out.append({'worker_id': w.id, 'name': w.name, 'role': w.role, 'firm': f.name, 'firm_id': f.id, 'allowed': not issues, 'issues': issues})
+    return jsonify({'success': True, 'data': out}), 200
+
+
+def _ct_expiry_alerts(today=None):
+    """Tell supervisors once at 30 days, once at 7 days and once when a contractor document expires."""
+    today = today or datetime.utcnow().date()
+    rows = (ContractorDoc.query.filter(ContractorDoc.expires_on.isnot(None), ContractorDoc.notified_stage < 3,
+                                       ContractorDoc.expires_on <= today + timedelta(days=30)).limit(500).all())
+    by_company = {}
+    for d in rows:
+        days = (d.expires_on - today).days
+        stage = 3 if days < 0 else 2 if days <= 7 else 1
+        if stage <= (d.notified_stage or 0):
+            continue
+        claimed = (ContractorDoc.query.filter(ContractorDoc.id == d.id, ContractorDoc.notified_stage == (d.notified_stage or 0))
+                   .update({'notified_stage': stage}, synchronize_session=False))
+        db.session.commit()
+        if claimed:
+            f = db.session.get(ContractorFirm, d.firm_id)
+            by_company.setdefault(d.company_id, []).append(
+                f"{f.name if f else 'Contractor'}: {d.title or d.doc_type} " + ('has expired' if days < 0 else f'expires in {days} days'))
+    for cid, lines in by_company.items():
+        _rc_alert(cid, None, f'Contractor documents: {len(lines)} need attention', '; '.join(lines[:10]) + (' ...' if len(lines) > 10 else ''), 'high')
+    return sum(len(v) for v in by_company.values())
+
+
+def _ct_watch_loop():
+    time.sleep(300)
+    while True:
+        try:
+            with app.app_context():
+                _ct_expiry_alerts()
+        except Exception as e:
+            logger.error(f'contractor expiry watcher: {e}')
+        finally:
+            try:
+                with app.app_context():
+                    db.session.remove()
+            except Exception:
+                pass
+        time.sleep(6 * 3600)
+
+
+if os.environ.get('READY_CHECK_WATCHER', '1') == '1':
+    threading.Thread(target=_ct_watch_loop, name='contractor-expiry-watcher', daemon=True).start()
+
+
 # =====================================================================================================
 # AUTO MIGRATIONS (2026-11-23)
 # Railway's Data tab appends LIMIT to every query, so CREATE/ALTER statements fail there. Instead the
@@ -167845,7 +168597,7 @@ if os.environ.get('READY_CHECK_WATCHER', '1') == '1':
 #   - a failing statement is logged and the file is retried on the next start
 # Set AUTO_MIGRATE=0 on Railway to switch this off.
 # =====================================================================================================
-AUTO_MIGRATIONS = ('DEPLOY_2026-11-23_FULL.sql', '2026-11-24_company_quotes.sql', '2026-11-25_ready_checks.sql')
+AUTO_MIGRATIONS = ('DEPLOY_2026-11-23_FULL.sql', '2026-11-24_company_quotes.sql', '2026-11-25_ready_checks.sql', '2026-11-26_muster_contractors.sql')
 _MIGRATION_LOCK_KEY = 74230115
 
 
