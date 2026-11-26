@@ -168587,6 +168587,142 @@ if os.environ.get('READY_CHECK_WATCHER', '1') == '1':
     threading.Thread(target=_ct_watch_loop, name='contractor-expiry-watcher', daemon=True).start()
 
 
+# ============================================================================
+# HSE INDUSTRY WORKSPACE — real data for the industry pages (2026-11-26)
+# ============================================================================
+# The old industry pages called /api/hse/industries/<id>/... routes that never existed and showed invented numbers.
+# This serves what is real: the HSE knowledge base for the industry, the company's documents for that industry,
+# Ready Check results, and chemical inventory editing.
+HW_INDUSTRIES = {
+    'oil_gas': ('Oil & Gas', 'oil_gas'), 'construction': ('Construction', 'construction'), 'healthcare': ('Healthcare', 'healthcare'),
+    'mining': ('Mining', 'mining'), 'chemical': ('Chemical Processing', 'chemical'), 'aviation': ('Aviation', 'aviation'),
+    'maritime': ('Maritime', 'maritime'), 'general': ('Manufacturing', 'general'),
+}
+_hw_kb = None
+_hw_kb_lock = threading.Lock()
+
+
+def _hw_knowledge():
+    global _hw_kb
+    with _hw_kb_lock:
+        if _hw_kb is None:
+            import HSE as _HSEMod
+            _hw_kb = _HSEMod.HSEKnowledgeBase()
+        return _hw_kb
+
+
+def _hw_enum(value):
+    return getattr(value, 'value', value)
+
+
+@app.route('/api/hse/workspace/<industry>', methods=['GET'])
+@jwt_required
+def hw_workspace_route(industry):
+    if industry not in HW_INDUSTRIES:
+        return jsonify({'success': False, 'error': 'Unknown industry.'}), 404
+    user = request.user
+    label, module = HW_INDUSTRIES[industry]
+    out = {'industry': industry, 'label': label, 'hazards': [], 'regulations': [], 'documents': [], 'documents_total': 0,
+           'ready_check': None}
+    try:
+        kb = _hw_knowledge()
+        ind = next((i for i in type(next(iter(kb.hazard_library.values())).industries[0]) if i.value == label), None)
+        for h in kb.hazard_library.values():
+            if ind in h.industries:
+                controls = [{'type': _hw_enum(c.control_type)[1] if isinstance(_hw_enum(c.control_type), tuple) else str(_hw_enum(c.control_type)),
+                             'description': c.description, 'verification': c.verification_method}
+                            for c in kb.control_library.values() if c.hazard_id == h.id]
+                out['hazards'].append({'id': h.id, 'name': h.name, 'category': _hw_enum(h.category), 'description': h.description,
+                                       'risks': list(h.risks)[:8], 'severity': h.severity_potential, 'controls': controls})
+        out['hazards'].sort(key=lambda h: -(h['severity'] or 0))
+        for r in kb.regulation_library.values():
+            if ind in r.applicability:
+                out['regulations'].append({'jurisdiction': r.jurisdiction, 'title': r.title, 'reference': r.reference,
+                                           'key_requirements': list(r.key_requirements)[:6], 'website': r.website})
+    except Exception as e:
+        logger.warning(f'hse workspace knowledge base: {e}')
+    try:
+        cid = getattr(user, 'company_id', None)
+        q = Document.query.filter(Document.module == module)
+        q = q.filter(Document.company_id == cid) if cid else q.filter(Document.user_id == user.id)
+        out['documents_total'] = q.count()
+        out['documents'] = [{'id': d.id, 'title': d.title, 'type': d.document_type, 'status': d.status,
+                             'updated_at': (d.updated_at or d.created_at).isoformat() + 'Z' if (d.updated_at or d.created_at) else None}
+                            for d in q.order_by(Document.updated_at.desc().nullslast()).limit(12).all()]
+    except Exception as e:
+        db.session.rollback()
+        logger.warning(f'hse workspace documents: {e}')
+    try:
+        cid = getattr(user, 'company_id', None)
+        if cid:
+            since = datetime.utcnow() - timedelta(days=30)
+            rows = ReadyCheck.query.filter(ReadyCheck.company_id == cid, ReadyCheck.kind == 'check', ReadyCheck.done_at >= since).limit(5000).all()
+            total = sum(r.controls_total or 0 for r in rows)
+            out['ready_check'] = {'checks': len(rows), 'stops': sum(1 for r in rows if r.result == 'stop'),
+                                  'score': round(100 * sum(r.controls_ok or 0 for r in rows) / total) if total else None,
+                                  'stopped_now': ReadyCheck.query.filter(ReadyCheck.company_id == cid, ReadyCheck.status == 'stopped').count()}
+    except Exception as e:
+        db.session.rollback()
+        logger.warning(f'hse workspace ready check: {e}')
+    return jsonify({'success': True, 'data': out}), 200
+
+
+@app.before_request
+def _hw_close_legacy_construction():
+    """The old /api/construction/* routes did not separate companies (one company could read, change or delete another's
+    incidents, equipment and training, and list every user). They stay closed until rebuilt with company separation.
+    Not counted as an attack: old browser tabs may still call them."""
+    if request.path.startswith('/api/construction/') and os.environ.get('ENABLE_LEGACY_CONSTRUCTION') != '1':
+        if request.method == 'OPTIONS':
+            return None
+        return jsonify({'success': False, 'code': 'MODULE_RETIRED',
+                        'error': 'This construction screen was replaced. Open HSE > Construction again.'}), 410
+    return None
+
+
+def _hw_chem(user, cid_):
+    c = db.session.get(Chemical, cid_)
+    if not c:
+        return None
+    if getattr(user, 'company_id', None):
+        return c if c.company_id == user.company_id else None
+    return c if c.user_id == user.id and not c.company_id else None
+
+
+HW_RISK = ('Low', 'Medium', 'High', 'Critical')
+
+
+@app.route('/api/chemical/inventory/<int:chem_id>', methods=['PUT', 'DELETE'])
+@jwt_required
+def hw_chemical_item_route(chem_id):
+    user = request.user
+    c = _hw_chem(user, chem_id)
+    if not c:
+        return jsonify({'success': False, 'error': 'Chemical not found.'}), 404
+    if request.method == 'DELETE':
+        db.session.delete(c)
+        db.session.commit()
+        return jsonify({'success': True}), 200
+    data = _mu_body()
+    for key, col, n in (('chemical', 'name', 100), ('location', 'location', 100), ('quantity', 'quantity', 50), ('hazard', 'hazard_class', 50)):
+        if key in data:
+            v = _rc_text(data.get(key), n)
+            if not v:
+                return jsonify({'success': False, 'error': f'{key.capitalize()} cannot be empty.'}), 400
+            setattr(c, col, v)
+    if 'riskLevel' in data:
+        if data.get('riskLevel') not in HW_RISK:
+            return jsonify({'success': False, 'error': 'Risk level must be Low, Medium, High or Critical.'}), 400
+        c.risk_level = data['riskLevel']
+    if 'sds_url' in data:
+        u = _rc_text(data.get('sds_url'), 500)
+        if u and not re.match(r'^https://', u):
+            return jsonify({'success': False, 'error': 'The safety data sheet link must start with https://'}), 400
+        c.sds_url = u or None
+    db.session.commit()
+    return jsonify({'success': True, 'data': c.to_dict()}), 200
+
+
 # =====================================================================================================
 # AUTO MIGRATIONS (2026-11-23)
 # Railway's Data tab appends LIMIT to every query, so CREATE/ALTER statements fail there. Instead the
