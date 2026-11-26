@@ -153,6 +153,133 @@ def extract_text_lines(pdf_bytes, page_number):
         doc.close()
 
 
+# ---------------------------------------------------------------- OCR (lettering drawn as lines)
+OCR_MAX_PIXELS = 5200          # longest side of the rendered page image
+OCR_MIN_CONF = 55
+
+
+def ocr_text_lines(pdf_bytes, page_number, skip_lines=None, lang='eng'):
+    """Find words that are drawn as vector strokes or pictures (CAD lettering, scans) with Tesseract.
+
+    Returns lines in the same shape as extract_text_lines (visible coordinates) plus 'ocr': True.
+    Lines that overlap real text lines (skip_lines) are left out."""
+    import pytesseract
+    from PIL import Image
+    doc = fitz.open(stream=pdf_bytes, filetype='pdf')
+    try:
+        if page_number < 1 or page_number > doc.page_count:
+            raise PdfEditError('Page out of range')
+        page = doc[page_number - 1]
+        vis = page.rect   # visible size (rotation applied)
+        zoom = min(300 / 72.0, OCR_MAX_PIXELS / max(vis.width, vis.height, 1))
+        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False, annots=False)
+        img = Image.frombytes('RGB', (pix.width, pix.height), pix.samples)
+        gray = img.convert('L')
+        data = pytesseract.image_to_data(gray, lang=lang, config='--psm 11', output_type=pytesseract.Output.DICT)
+    finally:
+        doc.close()
+
+    # group words by Tesseract block/paragraph/line, then split where the gap between words is large
+    groups = {}
+    for i, word in enumerate(data.get('text', [])):
+        w = (word or '').strip()
+        try:
+            conf = float(data['conf'][i])
+        except (TypeError, ValueError):
+            conf = -1
+        if not w or conf < OCR_MIN_CONF or not re.search(r'[A-Za-z0-9]', w):
+            continue
+        x, y, ww, hh = (data[k][i] / zoom for k in ('left', 'top', 'width', 'height'))
+        if hh < 2.5 or hh > 60 or ww > vis.width * 0.9:
+            continue
+        key = (data['block_num'][i], data['par_num'][i], data['line_num'][i])
+        groups.setdefault(key, []).append({'t': w, 'x0': x, 'y0': y, 'x1': x + ww, 'y1': y + hh, 'conf': conf})
+
+    skip = [fitz.Rect(l['x0'], l['y0'], l['x1'], l['y1']) for l in (skip_lines or [])]
+    lines = []
+    for key, words in sorted(groups.items()):
+        words.sort(key=lambda d: d['x0'])
+        runs, cur = [], [words[0]]
+        for wd in words[1:]:
+            h = max(cur[-1]['y1'] - cur[-1]['y0'], wd['y1'] - wd['y0'])
+            same_row = abs((wd['y1']) - (cur[-1]['y1'])) < 0.5 * h
+            if same_row and wd['x0'] - cur[-1]['x1'] < 1.2 * h:
+                cur.append(wd)
+            else:
+                runs.append(cur)
+                cur = [wd]
+        runs.append(cur)
+        for run in runs:
+            text = ' '.join(d['t'] for d in run)
+            if len(run) == 1 and len(text) < 2:
+                continue   # single stray characters are mostly drawing marks
+            r = fitz.Rect(min(d['x0'] for d in run), min(d['y0'] for d in run),
+                          max(d['x1'] for d in run), max(d['y1'] for d in run))
+            if any((r & s).get_area() > 0.3 * r.get_area() for s in skip):
+                continue
+            # baseline: bottom of words without descenders; size from cap height (Helvetica cap ~0.72 em)
+            plain = [d for d in run if not re.search(r'[gjpqy,;]', d['t'])] or run
+            baseline = sorted(d['y1'] for d in plain)[len(plain) // 2]
+            caps = [d for d in plain if not re.search(r'[a-z]', d['t'])]
+            if caps:
+                size = sorted(d['y1'] - d['y0'] for d in caps)[len(caps) // 2] / 0.72
+            else:
+                size = (r.height) / 0.95
+            lines.append({
+                'id': f'p{page_number}_ocr{len(lines)}',
+                'text': text,
+                'x0': round(r.x0, 2), 'y0': round(r.y0, 2), 'x1': round(r.x1, 2), 'y1': round(r.y1, 2),
+                'origin_x': round(r.x0, 2), 'baseline': round(baseline, 2),
+                'size': round(max(4.0, min(72.0, size)), 2),
+                'font_name': 'OCR', 'font': 'Helvetica', 'bold': False, 'italic': False,
+                'color': '#000000', 'mixed_styles': False, 'ocr': True,
+                'confidence': round(sum(d['conf'] for d in run) / len(run)),
+            })
+    return lines
+
+
+# ---------------------------------------------------------------- transparent erase
+_CLIP_FAR = 20000
+
+
+def _erase_areas(doc, page, rects):
+    """Hide everything the page content draws inside `rects` (unrotated page coords) without painting anything.
+
+    The existing content is wrapped in clip paths that exclude each area (even-odd rule), so lines, text and
+    pictures there are no longer drawn and the paper shows through. Content added later (new text) is outside
+    the wrap and stays visible."""
+    if not rects:
+        return
+    to_pdf = ~page.transformation_matrix
+    clips = []
+    for r in rects:
+        pr = fitz.Rect(r) * to_pdf
+        pr.normalize()
+        clips.append(f'{-_CLIP_FAR} {-_CLIP_FAR} {2 * _CLIP_FAR} {2 * _CLIP_FAR} re '
+                     f'{pr.x0:.3f} {pr.y0:.3f} {pr.width:.3f} {pr.height:.3f} re W* n')
+    page.clean_contents(sanitize=False)   # one content stream, balanced q/Q
+    old = page.get_contents()
+    pre, post = doc.get_new_xref(), doc.get_new_xref()
+    doc.update_object(pre, '<<>>')
+    doc.update_stream(pre, ('q\n' + '\n'.join(clips) + '\n').encode())
+    doc.update_object(post, '<<>>')
+    doc.update_stream(post, b'\nQ\n')
+    doc.xref_set_key(page.xref, 'Contents', '[' + ' '.join(f'{x} 0 R' for x in [pre, *old, post]) + ']')
+
+
+def _remove_annots_inside(page, rects):
+    """Comments, stamps and drawings (not form fields or links) that lie fully inside an erased area."""
+    gone = 0
+    for annot in list(page.annots() or []):
+        if annot.type[0] in (fitz.PDF_ANNOT_WIDGET, fitz.PDF_ANNOT_LINK, fitz.PDF_ANNOT_POPUP):
+            continue
+        ar = annot.rect
+        if any(fitz.Rect(r).contains(ar) for r in rects):
+            page.delete_annot(annot)
+            gone += 1
+    return gone
+
+
 # ---------------------------------------------------------------- writing
 def _insert_lines(page, x, top, text, size, color, fontname, family, align='left', box_width=None,
                   baseline=None):
@@ -171,6 +298,28 @@ def _insert_lines(page, x, top, text, size, color, fontname, family, align='left
             lx = x + width - widths[i]
         p = _to_unrot(page, lx, first_baseline + i * LINE_HEIGHT * size)
         page.insert_text(p, line, fontsize=size, fontname=fontname, color=color, rotate=page.rotation)
+    _ensure_font(page, fontname)
+
+
+BASE14_PDF_NAME = {
+    'helv': 'Helvetica', 'hebo': 'Helvetica-Bold', 'heit': 'Helvetica-Oblique', 'hebi': 'Helvetica-BoldOblique',
+    'tiro': 'Times-Roman', 'tibo': 'Times-Bold', 'tiit': 'Times-Italic', 'tibi': 'Times-BoldItalic',
+    'cour': 'Courier', 'cobo': 'Courier-Bold', 'coit': 'Courier-Oblique', 'cobi': 'Courier-BoldOblique',
+}
+
+
+def _ensure_font(page, fontname):
+    """PyMuPDF skips adding a font to the page when a form XObject on the page already uses the same name.
+    If a redaction then removed the page's own last use of that font, the new text would have no font.
+    Make sure the page's own /Font dictionary has it."""
+    doc = page.parent
+    if fontname not in BASE14_PDF_NAME or doc.xref_get_key(page.xref, 'Resources')[0] == 'null':
+        return
+    if doc.xref_get_key(page.xref, f'Resources/Font/{fontname}')[0] != 'null':
+        return
+    x = doc.get_new_xref()
+    doc.update_object(x, f'<</Type/Font/Subtype/Type1/BaseFont/{BASE14_PDF_NAME[fontname]}/Encoding/WinAnsiEncoding>>')
+    doc.xref_set_key(page.xref, f'Resources/Font/{fontname}', f'{x} 0 R')
 
 
 def _validate(objects):
@@ -206,6 +355,7 @@ def apply_edits(pdf_bytes, objects):
 
             # 1) removal pass: edited text is removed (background kept); white-out erases + paints
             redactions = 0
+            erase_rects, erase_annot_rects = [], []
             for o in objs:
                 t = o.get('type')
                 if t == 'textedit':
@@ -213,6 +363,15 @@ def apply_edits(pdf_bytes, objects):
                     r = _rect_to_unrot(page, x0, y0, x1, y1)
                     page.add_redact_annot(r, fill=False, cross_out=False)
                     redactions += 1
+                    if o.get('ocr'):
+                        erase_rects.append(r)      # the words are drawn as lines: hide the strokes too
+                elif t == 'erase':
+                    x, y, w, h = (_num(o[k], k) for k in ('x', 'y', 'w', 'h'))
+                    r = _rect_to_unrot(page, x, y, x + w, y + h)
+                    page.add_redact_annot(r, fill=False, cross_out=False)   # real text there is deleted
+                    redactions += 1
+                    erase_rects.append(r)
+                    erase_annot_rects.append(r)
                 elif t == 'whiteout':
                     x, y, w, h = (_num(o[k], k) for k in ('x', 'y', 'w', 'h'))
                     r = _rect_to_unrot(page, x, y, x + w, y + h)
@@ -222,6 +381,9 @@ def apply_edits(pdf_bytes, objects):
                 page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE,
                                       graphics=fitz.PDF_REDACT_LINE_ART_NONE,
                                       text=fitz.PDF_REDACT_TEXT_REMOVE)
+            if erase_rects:
+                _remove_annots_inside(page, erase_annot_rects)
+                _erase_areas(doc, page, erase_rects)
 
             # 2) drawing pass (in the order the user created them)
             for o in objs:
@@ -284,7 +446,7 @@ def apply_edits(pdf_bytes, objects):
                         poly = [_to_unrot(page, _num(p[0], 'point'), _num(p[1], 'point')) for p in pts[:5000]]
                         page.draw_polyline(poly, color=color, width=max(0.5, min(20.0, _num(o.get('width', 2), 'width'))),
                                            overlay=True, lineCap=1, lineJoin=1)
-                elif t == 'whiteout':
+                elif t in ('whiteout', 'erase'):
                     pass  # done in the removal pass
                 else:
                     raise PdfEditError(f"Unknown change type: {t}")

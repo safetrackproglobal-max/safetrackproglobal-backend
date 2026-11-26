@@ -150265,7 +150265,19 @@ def pdf_editor_text_lines(document_id):
             return err
         page = request.args.get('page', type=int) or 1
         with open(abs_path, 'rb') as f:
-            data = pdf_edit_engine.extract_text_lines(f.read(), page)
+            raw = f.read()
+        data = pdf_edit_engine.extract_text_lines(raw, page)
+        if request.args.get('ocr') in ('1', 'true'):
+            # lettering drawn as lines (CAD drawings) or scanned pages: find the words with Tesseract
+            try:
+                found = pdf_edit_engine.ocr_text_lines(raw, page, skip_lines=data.get('lines'))
+            except pdf_edit_engine.PdfEditError:
+                raise
+            except Exception as oe:
+                current_app.logger.error(f"pdf ocr failed: {oe}", exc_info=True)
+                return jsonify({'success': False, 'error': 'Word recognition (OCR) is not available right now'}), 503
+            data['lines'] = (data.get('lines') or []) + found
+            data['ocr_found'] = len(found)
         return jsonify({'success': True, **data}), 200
     except Exception as e:
         if e.__class__.__name__ == 'PdfEditError':
@@ -165248,6 +165260,19 @@ def wv_public_directory():
     if len(q) < 2:
         return jsonify({'success': True, 'data': []}), 200
     like = f"%{q.replace('%', '').replace('_', '')}%"
+    # A channel used to exist only after an admin opened the Workplace Voice settings, so most companies could not be
+    # found. Channels default to on + listed, so give matching active companies their channel now. A company that
+    # switched the channel off or unlisted itself keeps its row and stays hidden.
+    try:
+        missing = (Company.query.outerjoin(WorkplaceVoiceChannel, WorkplaceVoiceChannel.company_id == Company.id)
+                   .filter(WorkplaceVoiceChannel.id.is_(None), Company.name.ilike(like),
+                           func.coalesce(Company.is_active, True).is_(True), func.coalesce(Company.is_suspended, False).is_(False))
+                   .limit(10).all())
+        for comp in missing:
+            _wv_channel_for(comp.id, create=True)
+    except Exception as e:
+        db.session.rollback()
+        app.logger.warning(f'wv directory: could not create channels: {e}')
     rows = (db.session.query(WorkplaceVoiceChannel, Company)
             .join(Company, Company.id == WorkplaceVoiceChannel.company_id)
             .filter(WorkplaceVoiceChannel.enabled.is_(True), WorkplaceVoiceChannel.listed.is_(True), Company.name.ilike(like))
