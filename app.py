@@ -704,13 +704,13 @@ COUNTRY_PRICING = {
             "payment_method": "Paystack (MTN MoMo & Cards)"
         },
         "enterprise": {
-            "1_month": "Custom", "6_month": "Custom", "1_year": "Custom", "currency": "GHS",
+            "1_month": 500, "6_month": 2500, "1_year": 4500, "currency": "GHS",
             "payment_method": "Bank Transfer / Invoice",
             "account_details": {
                 "bank_name": "GCB Bank",
                 "account_name": COMPANY_LEGAL_NAME,
                 "account_number": "4151440001070",
-                "instructions": "Contact sales@safetytrack.com for custom enterprise pricing, invoicing, and dedicated account setup."
+                "instructions": "Pay the Enterprise price by card or bank transfer. For a Custom plan (special terms or volume) contact our sales team."
             }
         }
     },
@@ -725,10 +725,10 @@ COUNTRY_PRICING = {
             "payment_method": "Paystack (Cards)"
         },
         "enterprise": {
-            "1_month": "Custom", "6_month": "Custom", "1_year": "Custom", "currency": "QAR",
+            "1_month": 750, "6_month": 3750, "1_year": 6750, "currency": "QAR",
             "payment_method": "Bank Transfer / Invoice",
             "account_details": {
-                "instructions": "Contact sales@safetytrack.com for custom enterprise pricing, invoicing, and dedicated account setup."
+                "instructions": "Pay the Enterprise price by card or bank transfer. For a Custom plan (special terms or volume) contact our sales team."
             }
         }
     },
@@ -743,10 +743,10 @@ COUNTRY_PRICING = {
             "payment_method": "Paystack (Cards)"
         },
         "enterprise": {
-            "1_month": "Custom", "6_month": "Custom", "1_year": "Custom", "currency": "USD",
+            "1_month": 250, "6_month": 1250, "1_year": 2250, "currency": "USD",
             "payment_method": "Bank Transfer / Invoice",
             "account_details": {
-                "instructions": "Contact sales@safetytrack.com for custom enterprise pricing, invoicing, and dedicated account setup."
+                "instructions": "Pay the Enterprise price by card or bank transfer. For a Custom plan (special terms or volume) contact our sales team."
             }
         }
     },
@@ -761,10 +761,10 @@ COUNTRY_PRICING = {
             "payment_method": "Paystack (Cards)"
         },
         "enterprise": {
-            "1_month": "Custom", "6_month": "Custom", "1_year": "Custom", "currency": "USD",
+            "1_month": 250, "6_month": 1250, "1_year": 2250, "currency": "USD",
             "payment_method": "Bank Transfer / Invoice",
             "account_details": {
-                "instructions": "Contact sales@safetytrack.com for custom enterprise pricing, invoicing, and dedicated account setup."
+                "instructions": "Pay the Enterprise price by card or bank transfer. For a Custom plan (special terms or volume) contact our sales team."
             }
         }
     }
@@ -916,7 +916,7 @@ PLANS = {
 
     "enterprise": {
         "label": "Enterprise",
-        "price_usd": "Custom",
+        "price_usd": 250,
         "limits": {
             "uploads_per_month": "Unlimited",
             "api_calls_per_month": "Unlimited",
@@ -8660,6 +8660,9 @@ def _resolve_server_price(user, plan, duration):
     company = _billing_company(user)
     if company is not None:
         return _company_price(company, plan, duration)
+    if plan in ('enterprise', 'custom'):
+        return None, None, (jsonify({'error': 'Enterprise and Custom are company plans. Set up your company first.',
+                                     'requires_company': True}), 400)
     plan_pricing = get_pricing(getattr(user, 'country', None) or 'default').get(plan)
     if not plan_pricing:
         return None, None, (jsonify({'error': 'Invalid plan'}), 400)
@@ -138117,6 +138120,10 @@ def create_audit_log(document_id, user_id, action, details=None):
             # Not in request context
             pass
         
+        try:
+            _dm_emit_event(document_id, user_id, action)
+        except Exception:
+            pass
         audit_log = DocumentAuditLog(
             id=audit_id,  # ✅ INTEGER ID
             document_id=document_id,  # ✅ INTEGER
@@ -142509,6 +142516,16 @@ def download_document_control(document_id):
             details={'downloaded_at': datetime.utcnow().isoformat()}
         )
         
+        try:
+            _wm = _DmWm.query.filter_by(document_id=document.id).first()
+            if _wm and _wm.enabled is not False and getattr(_wm, 'apply_on_download', False):
+                with open(file_path, 'rb') as _f:
+                    _raw = _f.read()
+                if _raw[:5] == b'%PDF-':
+                    return send_file(_dm_io.BytesIO(_dm_watermark_pdf(_raw, _dm_wm_opts(_wm), current_user)), as_attachment=True,
+                                     download_name=document.file_name or 'document.pdf', mimetype='application/pdf')
+        except Exception as _we:
+            current_app.logger.warning(f"download watermark skipped: {_we}")
         return send_file(
             file_path,
             as_attachment=True,
@@ -143841,7 +143858,7 @@ def dm_get_document_permissions(document_id):
 
         # Feature gate (plan-based)
         if not is_super_admin:
-            user_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
+            user_plan = (resolve_effective_plan(user).get('plan') or 'free').lower()
             if user_plan not in ['basic', 'pro', 'business', 'enterprise', 'custom']:
                 return jsonify({
                     'success': False,
@@ -143938,7 +143955,7 @@ def dm_add_document_permission(document_id):
 
         # Feature gate
         if not is_super_admin:
-            user_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
+            user_plan = (resolve_effective_plan(user).get('plan') or 'free').lower()
             if user_plan not in ['pro', 'business', 'enterprise', 'custom']:
                 return jsonify({
                     'success': False,
@@ -144097,7 +144114,7 @@ def dm_update_document_permission(permission_id):
             }), 401
 
         if not is_super_admin:
-            user_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
+            user_plan = (resolve_effective_plan(user).get('plan') or 'free').lower()
             if user_plan not in ['pro', 'business', 'enterprise', 'custom']:
                 return jsonify({
                     'success': False,
@@ -144212,7 +144229,7 @@ def dm_remove_document_permission(permission_id):
             }), 401
 
         if not is_super_admin:
-            user_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
+            user_plan = (resolve_effective_plan(user).get('plan') or 'free').lower()
             if user_plan not in ['pro', 'business', 'enterprise', 'custom']:
                 return jsonify({
                     'success': False,
@@ -144305,7 +144322,7 @@ def dm_revoke_all_document_permissions(document_id):
             }), 401
 
         if not is_super_admin:
-            user_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
+            user_plan = (resolve_effective_plan(user).get('plan') or 'free').lower()
             if user_plan not in ['pro', 'business', 'enterprise', 'custom']:
                 return jsonify({
                     'success': False,
@@ -144398,7 +144415,7 @@ def dm_get_document_security(document_id):
             }), 401
 
         if not is_super_admin:
-            user_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
+            user_plan = (resolve_effective_plan(user).get('plan') or 'free').lower()
             if user_plan not in ['basic', 'pro', 'business', 'enterprise', 'custom']:
                 return jsonify({
                     'success': False,
@@ -144506,7 +144523,7 @@ def dm_update_document_security(document_id):
             }), 401
 
         if not is_super_admin:
-            user_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
+            user_plan = (resolve_effective_plan(user).get('plan') or 'free').lower()
             if user_plan not in ['pro', 'business', 'enterprise', 'custom']:
                 return jsonify({
                     'success': False,
@@ -144642,7 +144659,7 @@ def dm_get_access_audit_log(document_id):
             }), 401
 
         if not is_super_admin:
-            user_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
+            user_plan = (resolve_effective_plan(user).get('plan') or 'free').lower()
             if user_plan not in ['basic', 'pro', 'business', 'enterprise', 'custom']:
                 return jsonify({
                     'success': False,
@@ -144798,7 +144815,7 @@ def dm_set_document_retention(document_id):
 
         is_super_admin = check_super_admin()
         if not is_super_admin:
-            user_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
+            user_plan = (resolve_effective_plan(user).get('plan') or 'free').lower()
             if user_plan not in ['pro', 'business', 'enterprise', 'custom']:
                 return jsonify({'success': False, 'error': 'Plan does not include retention', 'code': 'FEATURE_NOT_AVAILABLE'}), 403
             if document.company_id and user.company_id and document.company_id != user.company_id:
@@ -144941,7 +144958,7 @@ def dm_create_legal_hold():
 
         is_super_admin = check_super_admin()
         if not is_super_admin:
-            user_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
+            user_plan = (resolve_effective_plan(user).get('plan') or 'free').lower()
             if user_plan not in ['pro', 'business', 'enterprise', 'custom']:
                 return jsonify({'success': False, 'error': 'Plan does not include legal holds', 'code': 'FEATURE_NOT_AVAILABLE'}), 403
 
@@ -145086,31 +145103,21 @@ def dm_get_disposition_certificates():
 @jwt_required
 @cross_origin()
 def dm_download_disposition_certificate(certificate_id):
-    """Download a disposition certificate (PDF placeholder)"""
+    """Download a disposition certificate as a PDF."""
     try:
-        user = getattr(request, 'user', None)
-        if not user:
-            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
-
+        user, err = _dm_user_or_401()
+        if err:
+            return err
         cert = DispositionCertificate.query.get(certificate_id)
-        if not cert:
+        if not cert or (not check_super_admin() and cert.company_id != user.company_id):
             return jsonify({'success': False, 'error': 'Certificate not found'}), 404
-
-        is_super_admin = check_super_admin()
-        if not is_super_admin and cert.company_id and user.company_id and cert.company_id != user.company_id:
-            return jsonify({'success': False, 'error': 'Access denied'}), 403
-
-        # TODO: Generate actual PDF. Placeholder text response.
-        from io import BytesIO
-        content = f"Disposition Certificate\n\nNumber: {cert.certificate_number}\nDocument: {cert.document_title}\nMethod: {cert.disposal_method}\nDisposed At: {cert.disposed_at}\nDisposed By: {cert.disposed_by_name}\n".encode('utf-8')
-        return Response(
-            content,
-            mimetype='application/pdf',
-            headers={'Content-Disposition': f'attachment; filename="certificate-{cert.certificate_number}.pdf"'}
-        )
+        company = _DmCompany.query.get(cert.company_id) if cert.company_id else None
+        pdf = _dm_report_pdf(f'Certificate {cert.certificate_number}', _dm_certificate_html(cert, company.name if company else ''))
+        return Response(pdf, mimetype='application/pdf',
+                        headers={'Content-Disposition': f'attachment; filename="certificate-{re.sub(r"[^A-Za-z0-9_-]", "_", str(cert.certificate_number))}.pdf"'})
     except Exception as e:
         current_app.logger.error(f"dm_download_disposition_certificate error: {str(e)}")
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': 'The certificate could not be produced'}), 500
 
 
 @app.route('/api/dm-documents/<int:document_id>/dispose', methods=['POST'])
@@ -145129,7 +145136,7 @@ def dm_dispose_document(document_id):
 
         is_super_admin = check_super_admin()
         if not is_super_admin:
-            user_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
+            user_plan = (resolve_effective_plan(user).get('plan') or 'free').lower()
             if user_plan not in ['pro', 'business', 'enterprise', 'custom']:
                 return jsonify({'success': False, 'error': 'Plan does not include disposal', 'code': 'FEATURE_NOT_AVAILABLE'}), 403
             if document.company_id and user.company_id and document.company_id != user.company_id:
@@ -145294,7 +145301,7 @@ def dm_save_watermark_settings(document_id):
 
         is_super_admin = check_super_admin()
         if not is_super_admin:
-            user_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
+            user_plan = (resolve_effective_plan(user).get('plan') or 'free').lower()
             if user_plan not in ['pro', 'business', 'enterprise', 'custom']:
                 return jsonify({'success': False, 'error': 'Plan does not include watermarking', 'code': 'FEATURE_NOT_AVAILABLE'}), 403
             if document.company_id and user.company_id and document.company_id != user.company_id:
@@ -145396,68 +145403,66 @@ def dm_apply_watermark(document_id):
 @jwt_required
 @cross_origin()
 def dm_generate_watermark_preview(document_id):
-    """Generate a watermark preview (placeholder)"""
+    """First page of the real document with the watermark applied, as a PNG."""
     try:
-        user = getattr(request, 'user', None)
-        if not user:
-            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
-
+        user, err = _dm_user_or_401()
+        if err:
+            return err
         document = Document.query.get(document_id)
         if not document or not _user_can_access_document(user, document, check_super_admin()):
             return jsonify({'success': False, 'error': 'Document not found'}), 404
-
-        # TODO: Generate actual preview image. Placeholder SVG.
-        data = request.get_json() or {}
-        import html as _html
-        import re as _re
-        text = _html.escape(str(data.get('text', 'CONFIDENTIAL'))[:60])
-        color = str(data.get('color', '#f5222d'))
-        if not _re.fullmatch(r'#[0-9a-fA-F]{3,8}', color):
-            color = '#f5222d'
+        import pymupdf as _fz
+        base = _dm_document_pdf_bytes(document)
+        if not base:
+            blank = _fz.open()
+            blank.new_page(width=595, height=842)
+            base = blank.tobytes()
+        stamped = _dm_watermark_pdf(base, _dm_wm_opts(request.get_json() or {}), user)
+        d = _fz.open(stream=stamped, filetype='pdf')
         try:
-            opacity = min(max(float(data.get('opacity', 0.15)), 0.0), 1.0)
-        except (TypeError, ValueError):
-            opacity = 0.15
-
-        svg = f'''<svg xmlns="http://www.w3.org/2000/svg" width="600" height="400">
-  <rect width="100%" height="100%" fill="#ffffff"/>
-  <text x="50%" y="50%" font-family="Arial" font-size="60" font-weight="bold"
-        fill="{color}" fill-opacity="{opacity}" text-anchor="middle"
-        transform="rotate(-45 300 200)">{text}</text>
-</svg>'''
-        return Response(svg, mimetype='image/svg+xml')
+            pg = d[0]
+            zoom = min(1.5, 900 / max(pg.rect.width, pg.rect.height))
+            png = pg.get_pixmap(matrix=_fz.Matrix(zoom, zoom), alpha=False).tobytes('png')
+        finally:
+            d.close()
+        return Response(png, mimetype='image/png')
     except Exception as e:
         current_app.logger.error(f"dm_generate_watermark_preview error: {str(e)}")
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': 'The preview could not be made'}), 500
 
 
 @app.route('/api/dm-documents/watermark/upload-image', methods=['POST'])
 @jwt_required
 @cross_origin()
 def dm_upload_watermark_image():
-    """Upload watermark image/logo"""
+    """Upload a logo for image watermarks (PNG/JPEG, re-saved as PNG, max 5 MB)."""
     try:
-        user = getattr(request, 'user', None)
-        if not user:
-            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
-
-        if 'image' not in request.files:
+        user, err = _dm_user_or_401()
+        if err:
+            return err
+        file = request.files.get('image')
+        if not file or not file.filename:
             return jsonify({'success': False, 'error': 'No image provided', 'code': 'NO_FILE'}), 400
-
-        file = request.files['image']
-        if not file.filename:
-            return jsonify({'success': False, 'error': 'Empty filename', 'code': 'EMPTY_FILENAME'}), 400
-
-        # TODO: Save file to storage. Placeholder URL.
-        import uuid
-        filename = f"watermark_{uuid.uuid4().hex}_{file.filename}"
-        # upload_path = save_file(file, filename)  # your storage logic
-        url = f"/uploads/watermarks/{filename}"
-
-        return jsonify({'success': True, 'url': url, 'filename': filename})
+        raw = file.read(5 * 1024 * 1024 + 1)
+        if len(raw) > 5 * 1024 * 1024:
+            return jsonify({'success': False, 'error': 'The image is larger than 5 MB'}), 400
+        try:
+            from PIL import Image as _Im
+            im = _Im.open(_dm_io.BytesIO(raw))
+            im.verify()
+            im = _Im.open(_dm_io.BytesIO(raw)).convert('RGBA')
+            im.thumbnail((1600, 1600))
+        except Exception:
+            return jsonify({'success': False, 'error': 'This file is not a valid image'}), 400
+        d = os.path.join(_dm_upload_root(), DM_WM_DIR)
+        os.makedirs(d, exist_ok=True)
+        name = f'{int(user.company_id or 0)}_{uuid.uuid4().hex}.png'
+        im.save(os.path.join(d, name), 'PNG')
+        url = f'/api/dm-documents/watermark/images/{name}'
+        return jsonify({'success': True, 'url': url, 'filename': name})
     except Exception as e:
         current_app.logger.error(f"dm_upload_watermark_image error: {str(e)}")
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': 'The image could not be uploaded'}), 500
 
 
 @app.route('/api/dm-documents/<int:document_id>/watermark/log', methods=['GET'])
@@ -145558,7 +145563,7 @@ def dm_create_workflow():
 
         is_super_admin = check_super_admin()
         if not is_super_admin:
-            user_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
+            user_plan = (resolve_effective_plan(user).get('plan') or 'free').lower()
             if user_plan not in ['pro', 'business', 'enterprise', 'custom']:
                 return jsonify({'success': False, 'error': 'Plan does not include workflow builder', 'code': 'FEATURE_NOT_AVAILABLE'}), 403
 
@@ -145771,7 +145776,7 @@ def dm_generate_compliance_report():
 
         is_super_admin = check_super_admin()
         if not is_super_admin:
-            user_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
+            user_plan = (resolve_effective_plan(user).get('plan') or 'free').lower()
             if user_plan not in ['pro', 'business', 'enterprise', 'custom']:
                 return jsonify({'success': False, 'error': 'Plan does not include compliance reports', 'code': 'FEATURE_NOT_AVAILABLE'}), 403
 
@@ -145846,26 +145851,20 @@ def dm_preview_compliance_report():
 @jwt_required
 @cross_origin()
 def dm_download_compliance_report(report_id):
-    """Download a compliance report (placeholder PDF)"""
+    """Download a compliance report built from the document register."""
     try:
-        user = getattr(request, 'user', None)
-        if not user:
-            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
-
+        user, err = _dm_user_or_401()
+        if err:
+            return err
         report = DocumentComplianceReport.query.get(report_id)
-        if not report:
+        if not report or (not check_super_admin() and report.company_id != user.company_id):
             return jsonify({'success': False, 'error': 'Report not found'}), 404
-
-        is_super_admin = check_super_admin()
-        if not is_super_admin and report.company_id and user.company_id and report.company_id != user.company_id:
-            return jsonify({'success': False, 'error': 'Access denied'}), 403
-
-        content = f"Compliance Report\n\nTitle: {report.title}\nType: {report.report_type}\nGenerated: {report.created_at}\n".encode('utf-8')
-        return Response(content, mimetype='application/pdf',
+        pdf = _dm_report_pdf(report.title or 'Compliance report', _dm_compliance_report_html(report, user))
+        return Response(pdf, mimetype='application/pdf',
                         headers={'Content-Disposition': f'attachment; filename="compliance-report-{report_id}.pdf"'})
     except Exception as e:
         current_app.logger.error(f"dm_download_compliance_report error: {str(e)}")
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': 'The report could not be produced'}), 500
 
 
 @app.route('/api/dm-documents/compliance/reports/<int:report_id>', methods=['DELETE'])
@@ -145907,7 +145906,7 @@ def dm_schedule_compliance_report():
 
         is_super_admin = check_super_admin()
         if not is_super_admin:
-            user_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
+            user_plan = (resolve_effective_plan(user).get('plan') or 'free').lower()
             if user_plan not in ['pro', 'business', 'enterprise', 'custom']:
                 return jsonify({'success': False, 'error': 'Plan does not include scheduling', 'code': 'FEATURE_NOT_AVAILABLE'}), 403
 
@@ -146022,7 +146021,7 @@ def dm_create_bundle():
 
         is_super_admin = check_super_admin()
         if not is_super_admin:
-            user_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
+            user_plan = (resolve_effective_plan(user).get('plan') or 'free').lower()
             if user_plan not in ['pro', 'business', 'enterprise', 'custom']:
                 return jsonify({'success': False, 'error': 'Plan does not include bundles', 'code': 'FEATURE_NOT_AVAILABLE'}), 403
 
@@ -146212,37 +146211,24 @@ def dm_remove_document_from_bundle(bundle_id, document_id):
 @jwt_required
 @cross_origin()
 def dm_export_bundle(bundle_id):
-    """Export bundle as ZIP/PDF (placeholder)"""
+    """Export a bundle as a ZIP of its files or one combined PDF (optionally password protected)."""
     try:
-        user = getattr(request, 'user', None)
-        if not user:
-            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
-
+        user, err = _dm_user_or_401()
+        if err:
+            return err
         bundle = DocumentBundle.query.get(bundle_id)
-        if not bundle:
+        if not bundle or (not check_super_admin() and bundle.company_id != user.company_id):
             return jsonify({'success': False, 'error': 'Bundle not found'}), 404
-
-        is_super_admin = check_super_admin()
-        if not is_super_admin and bundle.company_id and user.company_id and bundle.company_id != user.company_id:
-            return jsonify({'success': False, 'error': 'Access denied'}), 403
-
-        # TODO: Build actual ZIP. Return metadata.
         data = request.get_json() or {}
-        items = BundleDocument.query.filter_by(bundle_id=bundle_id).all()
-        return jsonify({
-            'success': True,
-            'export': {
-                'bundle_id': bundle_id,
-                'bundle_name': bundle.name,
-                'format': data.get('format', 'zip'),
-                'document_count': len(items),
-                'download_url': f"/api/dm-documents/bundles/{bundle_id}/export/download",
-                'message': 'Export queued'
-            }
-        })
+        fmt = 'pdf' if str(data.get('format') or 'zip').lower() == 'pdf' else 'zip'
+        if data.get('password') and fmt == 'zip':
+            return jsonify({'success': False, 'error': 'Password protection is available for the PDF format only'}), 400
+        out, mime, name = _dm_bundle_export(bundle, user, fmt, data.get('include_manifest', True) is not False,
+                                            bool(data.get('include_metadata')), data.get('password'))
+        return send_file(_dm_io.BytesIO(out), mimetype=mime, as_attachment=True, download_name=name)
     except Exception as e:
         current_app.logger.error(f"dm_export_bundle error: {str(e)}")
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': 'The bundle could not be exported'}), 500
 
 
 @app.route('/api/dm-documents/bundles/<int:bundle_id>/share', methods=['POST'])
@@ -146377,7 +146363,7 @@ def dm_create_share():
 
         is_super_admin = check_super_admin()
         if not is_super_admin:
-            user_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
+            user_plan = (resolve_effective_plan(user).get('plan') or 'free').lower()
             if user_plan not in ['basic', 'pro', 'business', 'enterprise', 'custom']:
                 return jsonify({'success': False, 'error': 'Plan does not include sharing', 'code': 'FEATURE_NOT_AVAILABLE'}), 403
 
@@ -146578,54 +146564,41 @@ def dm_get_share_analytics():
 @jwt_required
 @cross_origin()
 def dm_submit_smart_intake():
-    """Submit a file for smart intake processing"""
+    """Store a file, read it (OCR for scans), suggest its type and fields, and add it to the library or the review list."""
     try:
-        user = getattr(request, 'user', None)
-        if not user:
-            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
-
-        is_super_admin = check_super_admin()
-        if not is_super_admin:
-            user_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
-            if user_plan not in ['pro', 'business', 'enterprise', 'custom']:
-                return jsonify({'success': False, 'error': 'Plan does not include smart intake', 'code': 'FEATURE_NOT_AVAILABLE'}), 403
-
-        if 'file' not in request.files:
+        user, err = _dm_user_or_401()
+        if err:
+            return err
+        if not _dm_plan_ok(user, ['pro', 'business', 'enterprise', 'custom']):
+            return jsonify({'success': False, 'error': 'Plan does not include smart intake', 'code': 'FEATURE_NOT_AVAILABLE'}), 403
+        file = request.files.get('file')
+        if not file or not file.filename:
             return jsonify({'success': False, 'error': 'No file provided', 'code': 'NO_FILE'}), 400
-
-        file = request.files['file']
-        if not file.filename:
-            return jsonify({'success': False, 'error': 'Empty filename', 'code': 'EMPTY_FILENAME'}), 400
-
-        file.seek(0, 2)
-        size = file.tell()
-        file.seek(0)
-
-        # TODO: Save file to storage. Placeholder URL.
-        import uuid
-        filename = f"intake_{uuid.uuid4().hex}_{file.filename}"
-        url = f"/uploads/intake/{filename}"
-
-        item = IntakeQueueItem(
-            file_name=file.filename,
-            file_size=size,
-            file_url=url,
-            status='processing',
-            stage='analysis',
-            progress=10,
-            company_id=user.company_id,
-            uploaded_by=user.id,
-            uploaded_at=datetime.utcnow()
-        )
+        try:
+            abs_path, url, _ext, size, sha = _dm_save_upload(file, 'intake', DM_INTAKE_EXT, DM_INTAKE_MAX)
+        except ValueError as ve:
+            return jsonify({'success': False, 'error': str(ve), 'code': 'INVALID_FILE'}), 400
+        flag = lambda k, d=True: str(request.form.get(k, str(d))).lower() in ('true', '1', 'yes', 'on')  # noqa: E731
+        item = IntakeQueueItem(file_name=os.path.basename(file.filename)[:255], file_size=size, file_url=url,
+                               status='processing', stage='scanning', progress=10, company_id=user.company_id,
+                               uploaded_by=user.id, uploaded_at=datetime.utcnow())
         db.session.add(item)
+        db.session.flush()
+        try:
+            _dm_intake_process(item, abs_path, sha, user, {
+                'auto_classify': flag('auto_classify'), 'auto_extract': flag('auto_extract'),
+                'check_duplicates': flag('check_duplicates'),
+                'auto_approve_threshold': request.form.get('auto_approve_threshold', 0.9)})
+        except Exception as pe:
+            current_app.logger.error(f"smart intake processing failed: {pe}")
+            item.status, item.stage, item.error, item.progress = 'error', 'error', 'The file could not be read', 100
         db.session.commit()
-
-        return jsonify({'success': True, 'item': item.to_dict(),
-                        'message': 'File submitted for processing'}), 201
+        return jsonify({'success': True, 'id': item.id, 'item': item.to_dict(),
+                        'message': item.message or 'File processed'}), 201
     except Exception as e:
         db.session.rollback()
         current_app.logger.error(f"dm_submit_smart_intake error: {str(e)}")
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': 'The file could not be processed'}), 500
 
 
 @app.route('/api/dm-documents/intake/queue', methods=['GET'])
@@ -146715,39 +146688,32 @@ def dm_get_intake_stats():
 @jwt_required
 @cross_origin()
 def dm_approve_intake_item(item_id):
-    """Approve an intake item (optionally create document)"""
+    """Approve an intake item: it becomes a document in the library."""
     try:
-        user = getattr(request, 'user', None)
-        if not user:
-            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
-
+        user, err = _dm_user_or_401()
+        if err:
+            return err
         item = IntakeQueueItem.query.get(item_id)
-        if not item:
+        if not item or (not check_super_admin() and item.company_id != user.company_id):
             return jsonify({'success': False, 'error': 'Item not found'}), 404
-
-        is_super_admin = check_super_admin()
-        if not is_super_admin and item.company_id and user.company_id and item.company_id != user.company_id:
-            return jsonify({'success': False, 'error': 'Access denied'}), 403
-
         data = request.get_json() or {}
-        item.status = 'approved'
-        item.stage = 'completed'
-        item.needs_review = False
-        item.progress = 100
         if 'predicted_type' in data:
-            item.predicted_type = data['predicted_type']
-        if 'extracted_data' in data:
-            item.extracted_data = json.dumps(data['extracted_data'])
-        if 'suggested_tags' in data:
-            item.suggested_tags = json.dumps(data['suggested_tags'])
+            item.predicted_type = str(data['predicted_type'])[:50]
+        if 'suggested_tags' in data and isinstance(data['suggested_tags'], list):
+            item.suggested_tags = json.dumps([str(t)[:40] for t in data['suggested_tags']][:10])
+        try:
+            doc = _dm_intake_to_document(item, user, data)
+        except ValueError as ve:
+            return jsonify({'success': False, 'error': str(ve)}), 400
+        item.status, item.stage, item.needs_review, item.progress = 'approved', 'complete', False, 100
+        item.message = f'Added to the library as document #{doc.id}'
         item.processed_at = datetime.utcnow()
         db.session.commit()
-
-        return jsonify({'success': True, 'item': item.to_dict(), 'message': 'Item approved'})
+        return jsonify({'success': True, 'item': item.to_dict(), 'document_id': doc.id, 'message': item.message})
     except Exception as e:
         db.session.rollback()
         current_app.logger.error(f"dm_approve_intake_item error: {str(e)}")
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': 'The item could not be approved'}), 500
 
 
 @app.route('/api/dm-documents/intake/<int:item_id>/reject', methods=['POST'])
@@ -146875,7 +146841,7 @@ def dm_create_search_alert():
 
         is_super_admin = check_super_admin()
         if not is_super_admin:
-            user_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
+            user_plan = (resolve_effective_plan(user).get('plan') or 'free').lower()
             if user_plan not in ['pro', 'business', 'enterprise', 'custom']:
                 return jsonify({'success': False, 'error': 'Plan does not include search alerts', 'code': 'FEATURE_NOT_AVAILABLE'}), 403
 
@@ -146929,74 +146895,46 @@ def dm_get_search_alerts():
 @jwt_required
 @cross_origin()
 def dm_ask_assistant():
-    """Ask the AI assistant a question"""
+    """Ask the document assistant. Answers come from the company's documents through DeepSeek."""
     try:
-        user = getattr(request, 'user', None)
-        if not user:
-            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
-
-        is_super_admin = check_super_admin()
-        if not is_super_admin:
-            user_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
-            if user_plan not in ['pro', 'business', 'enterprise', 'custom']:
-                return jsonify({'success': False, 'error': 'Plan does not include AI assistant', 'code': 'FEATURE_NOT_AVAILABLE'}), 403
-
+        user, err = _dm_user_or_401()
+        if err:
+            return err
+        if not _dm_plan_ok(user, ['pro', 'business', 'enterprise', 'custom']):
+            return jsonify({'success': False, 'error': 'Plan does not include AI assistant', 'code': 'FEATURE_NOT_AVAILABLE'}), 403
         data = request.get_json() or {}
-        question = (data.get('question') or '').strip()
+        question = (data.get('question') or '').strip()[:4000]
         if not question:
             return jsonify({'success': False, 'error': 'question required', 'code': 'VALIDATION_ERROR'}), 400
-
-        conversation_id = data.get('conversation_id')
-        if conversation_id:
-            conv = AssistantConversation.query.filter_by(id=conversation_id, user_id=user.id).first()
-        else:
-            conv = None
+        conv = None
+        if data.get('conversation_id'):
+            conv = AssistantConversation.query.filter_by(id=data.get('conversation_id'), user_id=user.id).first()
         if not conv:
-            conv = AssistantConversation(
-                user_id=user.id,
-                title=question[:60],
-                company_id=user.company_id
-            )
+            conv = AssistantConversation(user_id=user.id, title=question[:60], company_id=user.company_id)
             db.session.add(conv)
             db.session.flush()
-
-        # Store user message
-        user_msg = AssistantMessage(
-            conversation_id=conv.id,
-            user_id=user.id,
-            company_id=user.company_id,
-            role='user',
-            content=question
-        )
-        db.session.add(user_msg)
-
-        # TODO: Integrate actual LLM. Placeholder response.
-        answer = f"I received your question: '{question}'. (AI integration pending.)"
-        assistant_msg = AssistantMessage(
-            conversation_id=conv.id,
-            user_id=user.id,
-            company_id=user.company_id,
-            role='assistant',
-            content=answer,
-            sources=json.dumps([]),
-            suggestions=json.dumps([]),
-            tokens_used=0
-        )
+        history = [{'role': m.role, 'content': m.content} for m in
+                   AssistantMessage.query.filter_by(conversation_id=conv.id).order_by(AssistantMessage.id).limit(20).all()]
+        db.session.add(AssistantMessage(conversation_id=conv.id, user_id=user.id, company_id=user.company_id,
+                                        role='user', content=question))
+        result = _dm_assistant_answer(user, question, data.get('document_ids') or [], history,
+                                      mode=data.get('mode') or 'qa', temperature=data.get('temperature', 0.3),
+                                      max_tokens=data.get('max_tokens', 1500))
+        assistant_msg = AssistantMessage(conversation_id=conv.id, user_id=user.id, company_id=user.company_id,
+                                         role='assistant', content=result['answer'], sources=json.dumps(result['sources']),
+                                         suggestions=json.dumps(result['suggestions']), tokens_used=result['tokens_used'])
         db.session.add(assistant_msg)
         conv.message_count = (conv.message_count or 0) + 2
         conv.updated_at = datetime.utcnow()
         db.session.commit()
-
-        return jsonify({
-            'success': True,
-            'conversation_id': conv.id,
-            'answer': answer,
-            'message': assistant_msg.to_dict()
-        })
+        return jsonify({'success': True, 'conversation_id': conv.id, 'answer': result['answer'],
+                        'sources': result['sources'], 'suggestions': result['suggestions'],
+                        'tokens_used': result['tokens_used'], 'ai_used': result['ai_used'],
+                        'message': assistant_msg.to_dict()})
     except Exception as e:
         db.session.rollback()
         current_app.logger.error(f"dm_ask_assistant error: {str(e)}")
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': 'The assistant could not answer. Please try again.'}), 500
 
 
 @app.route('/api/dm-documents/assistant/conversations', methods=['GET'])
@@ -147281,7 +147219,7 @@ def dm_save_detection_rule():
 
         is_super_admin = check_super_admin()
         if not is_super_admin:
-            user_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
+            user_plan = (resolve_effective_plan(user).get('plan') or 'free').lower()
             if user_plan not in ['pro', 'business', 'enterprise', 'custom']:
                 return jsonify({'success': False, 'error': 'Plan does not include detection rules', 'code': 'FEATURE_NOT_AVAILABLE'}), 403
 
@@ -147373,24 +147311,22 @@ def dm_delete_detection_rule(rule_id):
 @jwt_required
 @cross_origin()
 def dm_run_anomaly_detection():
-    """Run anomaly detection (placeholder)"""
+    """Check the document access log against the unusual-activity rules."""
     try:
-        user = getattr(request, 'user', None)
-        if not user:
-            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
-
-        is_super_admin = check_super_admin()
-        if not is_super_admin:
-            user_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
-            if user_plan not in ['pro', 'business', 'enterprise', 'custom']:
-                return jsonify({'success': False, 'error': 'Plan does not include anomaly detection', 'code': 'FEATURE_NOT_AVAILABLE'}), 403
-
+        user, err = _dm_user_or_401()
+        if err:
+            return err
+        if not _dm_plan_ok(user, ['pro', 'business', 'enterprise', 'custom']):
+            return jsonify({'success': False, 'error': 'Plan does not include anomaly detection', 'code': 'FEATURE_NOT_AVAILABLE'}), 403
         data = request.get_json() or {}
-        # TODO: Implement real detection logic. Placeholder.
-        return jsonify({'success': True, 'detected': 0, 'message': 'Detection run queued'})
+        methods = [m for m in (data.get('methods') or []) if isinstance(m, str)]
+        created, checked = _dm_detect_anomalies(user, data.get('sensitivity'), methods)
+        return jsonify({'success': True, 'anomalies_found': created, 'detected': created, 'events_checked': checked,
+                        'method': 'Rules over the document access log (no trained model)'})
     except Exception as e:
+        db.session.rollback()
         current_app.logger.error(f"dm_run_anomaly_detection error: {str(e)}")
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': 'The check could not run'}), 500
 
 
 @app.route('/api/dm-documents/anomalies/<int:anomaly_id>/resolve', methods=['POST'])
@@ -147455,32 +147391,37 @@ def dm_mark_false_positive(anomaly_id):
 @jwt_required
 @cross_origin()
 def dm_block_user(user_id):
-    """Block a user (placeholder)"""
+    """Suspend a user's sign-in (company admins, own company only)."""
     try:
-        admin = getattr(request, 'user', None)
-        if not admin:
-            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
-
+        admin, err = _dm_user_or_401()
+        if err:
+            return err
         is_super_admin = check_super_admin()
-        if not is_super_admin:
-            user_plan = (getattr(admin, 'subscription_plan', None) or 'free').lower()
-            if user_plan not in ['business', 'enterprise', 'custom']:
-                return jsonify({'success': False, 'error': 'Plan does not include user blocking', 'code': 'FEATURE_NOT_AVAILABLE'}), 403
-
+        is_admin = is_super_admin or str(getattr(admin, 'user_type', '') or '').lower() in ('admin', 'company_admin') \
+            or str(getattr(admin, 'role', '') or '').lower() in ('admin', 'company_admin')
+        if not is_admin:
+            return jsonify({'success': False, 'error': 'Only a company administrator can block a user'}), 403
         target = User.query.get(user_id)
-        if not target:
+        if not target or (not is_super_admin and target.company_id != admin.company_id):
             return jsonify({'success': False, 'error': 'Target user not found'}), 404
-
-        if not is_super_admin and target.company_id and admin.company_id and target.company_id != admin.company_id:
-            return jsonify({'success': False, 'error': 'Access denied'}), 403
-
+        if target.id == admin.id:
+            return jsonify({'success': False, 'error': 'You cannot block yourself'}), 400
+        if getattr(target, 'is_platform_owner', False) or getattr(target, 'is_super_admin', False) or getattr(target, 'is_system_team', False):
+            return jsonify({'success': False, 'error': 'This account cannot be blocked here'}), 403
         data = request.get_json() or {}
-        # TODO: actually block. Placeholder.
-        return jsonify({'success': True, 'message': 'User blocked', 'user_id': user_id,
-                        'reason': data.get('reason')})
+        target.is_active = False
+        try:
+            target.token_version = (target.token_version or 0) + 1     # sign out everywhere
+        except Exception:
+            pass
+        db.session.commit()
+        logger.warning(f"user {target.id} blocked by {admin.id}: {str(data.get('reason') or '')[:200]}")
+        return jsonify({'success': True, 'message': f'{target.name} can no longer sign in. Re-activate them in user management.',
+                        'user_id': target.id, 'reason': data.get('reason')})
     except Exception as e:
+        db.session.rollback()
         current_app.logger.error(f"dm_block_user error: {str(e)}")
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': 'The user could not be blocked'}), 500
 
 
 @app.route('/api/dm-documents/anomalies/bulk-action', methods=['POST'])
@@ -147495,7 +147436,7 @@ def dm_bulk_anomaly_action():
 
         is_super_admin = check_super_admin()
         if not is_super_admin:
-            user_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
+            user_plan = (resolve_effective_plan(user).get('plan') or 'free').lower()
             if user_plan not in ['pro', 'business', 'enterprise', 'custom']:
                 return jsonify({'success': False, 'error': 'Plan does not include bulk actions', 'code': 'FEATURE_NOT_AVAILABLE'}), 403
 
@@ -147535,24 +147476,33 @@ def dm_bulk_anomaly_action():
 @jwt_required
 @cross_origin()
 def dm_save_anomaly_settings():
-    """Save anomaly detection settings (placeholder - no model)"""
+    """Save the unusual-activity settings for the company."""
     try:
-        user = getattr(request, 'user', None)
-        if not user:
-            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
-
-        is_super_admin = check_super_admin()
-        if not is_super_admin:
-            user_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
-            if user_plan not in ['pro', 'business', 'enterprise', 'custom']:
-                return jsonify({'success': False, 'error': 'Plan does not include anomaly settings', 'code': 'FEATURE_NOT_AVAILABLE'}), 403
-
+        user, err = _dm_user_or_401()
+        if err:
+            return err
+        if not _dm_plan_ok(user, ['pro', 'business', 'enterprise', 'custom']):
+            return jsonify({'success': False, 'error': 'Plan does not include anomaly settings', 'code': 'FEATURE_NOT_AVAILABLE'}), 403
         data = request.get_json() or {}
-        # TODO: Persist to a settings model or company config
-        return jsonify({'success': True, 'settings': data, 'message': 'Settings saved'})
+        cur = _dm_setting_get('dm_anomaly_settings', user.company_id, DM_ANOMALY_DEFAULTS)
+        if str(data.get('sensitivity') or '').lower() in _DM_SENS:
+            cur['sensitivity'] = str(data['sensitivity']).lower()
+        for k, lo, hi in (('off_hours_start', 0, 23), ('off_hours_end', 0, 23), ('lookback_days', 1, 365)):
+            if k in data:
+                try:
+                    cur[k] = max(lo, min(hi, int(data[k])))
+                except (TypeError, ValueError):
+                    pass
+        for k, v in data.items():
+            if k not in cur and k != 'company_id' and isinstance(v, (bool, int, float, str, list)):
+                cur[k] = v
+        _dm_setting_put('dm_anomaly_settings', user.company_id, cur, user.id)
+        db.session.commit()
+        return jsonify({'success': True, 'settings': cur, 'message': 'Settings saved'})
     except Exception as e:
+        db.session.rollback()
         current_app.logger.error(f"dm_save_anomaly_settings error: {str(e)}")
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': 'Settings could not be saved'}), 500
 
 # ============================================================
 # PREDICTIVE ANALYTICS ENDPOINTS
@@ -147562,32 +147512,16 @@ def dm_save_anomaly_settings():
 @jwt_required
 @cross_origin()
 def dm_get_predictive_forecast():
-    """Get predictive forecast"""
+    """Daily history and forecast for one measure, from the company's own records."""
     try:
-        user = getattr(request, 'user', None)
-        if not user:
-            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
-
-        is_super_admin = check_super_admin()
-        q = Prediction.query
-        if not is_super_admin:
-            q = q.filter_by(company_id=user.company_id)
-
-        ptype = request.args.get('type')
-        if ptype:
-            q = q.filter_by(type=ptype)
-
-        preds = q.order_by(Prediction.created_at.desc()).limit(100).all()
-        timeline = [p.to_dict() for p in preds]
-        summary = {
-            'count': len(timeline),
-            'avg_confidence': round(sum(p.confidence or 0 for p in preds) / len(preds), 2) if preds else 0,
-            'avg_risk': round(sum(p.risk_score or 0 for p in preds) / len(preds), 1) if preds else 0
-        }
-        return jsonify({'success': True, 'timeline': timeline, 'summary': summary})
+        user, err = _dm_user_or_401()
+        if err:
+            return err
+        return jsonify(_dm_forecast(user, request.args.get('type') or 'document_volume',
+                                    request.args.get('horizon_days', 30), request.args.get('confidence', 0.9)))
     except Exception as e:
         current_app.logger.error(f"dm_get_predictive_forecast error: {str(e)}")
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': 'The forecast could not be made'}), 500
 
 
 @app.route('/api/dm-documents/predictive/risk-scores', methods=['GET'])
@@ -147735,98 +147669,86 @@ def dm_get_predictions():
 @jwt_required
 @cross_origin()
 def dm_train_predictive_model():
-    """Train a predictive model (placeholder)"""
+    """Check how well the trend line predicted the last 14 days and record the result."""
     try:
-        user = getattr(request, 'user', None)
-        if not user:
-            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
-
-        is_super_admin = check_super_admin()
-        if not is_super_admin:
-            user_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
-            if user_plan not in ['business', 'enterprise', 'custom']:
-                return jsonify({'success': False, 'error': 'Plan does not include model training', 'code': 'FEATURE_NOT_AVAILABLE'}), 403
-
-        data = request.get_json() or {}
-        model = MLPredictiveModel(
-            name=data.get('name') or 'New Model',
-            type=data.get('type') or 'regression',
-            status='training',
-            model_metadata=json.dumps(data.get('metadata', {})),
-            company_id=user.company_id,
-            created_by=user.id
-        )
-        db.session.add(model)
+        user, err = _dm_user_or_401()
+        if err:
+            return err
+        if not _dm_plan_ok(user, ['pro', 'business', 'enterprise', 'custom']):
+            return jsonify({'success': False, 'error': 'Plan does not include predictive models', 'code': 'FEATURE_NOT_AVAILABLE'}), 403
+        acc = _dm_backtest(user, 'document_volume')
+        m = MLPredictiveModel.query.filter_by(company_id=user.company_id, name='Trend line from your records').first()
+        if not m:
+            m = MLPredictiveModel(name='Trend line from your records', company_id=user.company_id, created_by=user.id)
+            db.session.add(m)
+        m.type, m.status, m.accuracy, m.trained_at, m.updated_at = 'trend', 'ready', acc, datetime.utcnow(), datetime.utcnow()
+        m.model_metadata = json.dumps({'method': DM_METHOD_NOTE, 'checked_on': 'last 14 days against the 60 days before'})
         db.session.commit()
-        return jsonify({'success': True, 'model': model.to_dict(), 'message': 'Training started'}), 201
+        msg = ('Not enough history yet to measure accuracy (needs documents created over at least a few weeks).'
+               if acc is None else f'The trend line predicted the last 14 days with {round(acc * 100)}% accuracy.')
+        return jsonify({'success': True, 'model': m.to_dict(), 'accuracy': acc, 'message': msg}), 201
     except Exception as e:
         db.session.rollback()
         current_app.logger.error(f"dm_train_predictive_model error: {str(e)}")
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': 'The check could not run'}), 500
 
 
 @app.route('/api/dm-documents/predictive/generate-forecast', methods=['POST'])
 @jwt_required
 @cross_origin()
 def dm_generate_forecast():
-    """Generate a forecast (placeholder)"""
+    """Forecast one measure and refresh the company's risk list (expiries, overdue reviews, stuck approvals)."""
     try:
-        user = getattr(request, 'user', None)
-        if not user:
-            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
-
-        is_super_admin = check_super_admin()
-        if not is_super_admin:
-            user_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
-            if user_plan not in ['pro', 'business', 'enterprise', 'custom']:
-                return jsonify({'success': False, 'error': 'Plan does not include forecasts', 'code': 'FEATURE_NOT_AVAILABLE'}), 403
-
+        user, err = _dm_user_or_401()
+        if err:
+            return err
+        if not _dm_plan_ok(user, ['pro', 'business', 'enterprise', 'custom']):
+            return jsonify({'success': False, 'error': 'Plan does not include forecasting', 'code': 'FEATURE_NOT_AVAILABLE'}), 403
         data = request.get_json() or {}
-        # TODO: actual forecast logic. Return a stub prediction.
-        pred = Prediction(
-            title=data.get('title') or 'Generated Forecast',
-            type=data.get('type') or 'document_volume',
-            description=data.get('description'),
-            value=float(data.get('value', 0)),
-            unit=data.get('unit'),
-            timeframe=data.get('timeframe'),
-            confidence=float(data.get('confidence', 0.8)),
-            risk_score=int(data.get('risk_score', 0)),
-            supporting_data=json.dumps(data.get('supporting_data', [])),
-            company_id=user.company_id
-        )
-        db.session.add(pred)
-        db.session.commit()
-        return jsonify({'success': True, 'prediction': pred.to_dict(), 'message': 'Forecast generated'}), 201
+        horizon = data.get('horizon_days', 30)
+        result = _dm_forecast(user, data.get('type') or 'document_volume', horizon, data.get('confidence', 0.9))
+        preds = _dm_generate_insights(user, int(result['summary']['horizon_days']))
+        result['predictions'] = [p.to_dict() for p in preds]
+        return jsonify(result), 201
     except Exception as e:
         db.session.rollback()
         current_app.logger.error(f"dm_generate_forecast error: {str(e)}")
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': 'The forecast could not be made'}), 500
 
 
 @app.route('/api/dm-documents/predictive/export', methods=['POST'])
 @jwt_required
 @cross_origin()
 def dm_export_predictive_report():
-    """Export predictive report (placeholder)"""
+    """Export the forecast and the risk list (CSV, Excel or PDF)."""
     try:
-        user = getattr(request, 'user', None)
-        if not user:
-            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
-
-        is_super_admin = check_super_admin()
-        if not is_super_admin:
-            user_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
-            if user_plan not in ['pro', 'business', 'enterprise', 'custom']:
-                return jsonify({'success': False, 'error': 'Plan does not include predictive exports', 'code': 'FEATURE_NOT_AVAILABLE'}), 403
-
+        user, err = _dm_user_or_401()
+        if err:
+            return err
         data = request.get_json() or {}
-        content = f"Predictive Analytics Report\n\nGenerated: {datetime.utcnow()}\n".encode('utf-8')
-        return Response(content, mimetype='application/pdf',
-                        headers={'Content-Disposition': 'attachment; filename="predictive-report.pdf"'})
+        fc = _dm_forecast(user, data.get('prediction_type') or 'document_volume', data.get('horizon_days', 30))
+        rows = [{'date': t['date'], 'actual': t.get('actual'), 'forecast': t.get('forecast'),
+                 'lower_bound': t.get('lower_bound'), 'upper_bound': t.get('upper_bound')} for t in fc['timeline']]
+        fmt = str(data.get('format') or 'csv').lower()
+        if fmt == 'pdf':
+            preds = _DmPrediction.query.filter_by(company_id=user.company_id).order_by(_DmPrediction.risk_score.desc()).limit(30).all()
+            risk = ''.join(f'<tr><td>{_dm_esc(p.title)}</td><td>{p.risk_score}</td><td>{_dm_esc(p.description)}</td></tr>' for p in preds)
+            future = [r for r in rows if r['forecast'] is not None and r['actual'] is None]
+            body = (f'<h1>Forecast: {_dm_esc(fc["type"].replace("_", " "))}</h1><p class="muted">{_dm_esc(fc["method_note"])}</p>'
+                    f'<table><tr><td>Total expected</td><td>{fc["summary"]["total_predicted"]}</td></tr>'
+                    f'<tr><td>Average per day</td><td>{fc["summary"]["avg_per_day"]}</td></tr>'
+                    f'<tr><td>Change against the last 30 days</td><td>{fc["summary"]["trend_percent"]}%</td></tr></table>'
+                    f'<h2>Risk list</h2><table><tr><th>Item</th><th>Risk</th><th>Details</th></tr>{risk or "<tr><td colspan=3>None</td></tr>"}</table>'
+                    f'<h2>Daily forecast</h2><table><tr><th>Date</th><th>Forecast</th><th>Low</th><th>High</th></tr>'
+                    + ''.join(f'<tr><td>{r["date"]}</td><td>{r["forecast"]}</td><td>{r["lower_bound"]}</td><td>{r["upper_bound"]}</td></tr>' for r in future)
+                    + '</table>')
+            return Response(_dm_report_pdf('Forecast report', body), mimetype='application/pdf',
+                            headers={'Content-Disposition': 'attachment; filename="forecast-report.pdf"'})
+        out, mime, name = _dm_export_rows(rows, 'xlsx' if fmt in ('xlsx', 'excel') else 'csv', 'forecast-report')
+        return Response(out, mimetype=mime, headers={'Content-Disposition': f'attachment; filename="{name}"'})
     except Exception as e:
         current_app.logger.error(f"dm_export_predictive_report error: {str(e)}")
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': 'The report could not be exported'}), 500
 
 
 @app.route('/api/dm-documents/predictive/alerts', methods=['POST'])
@@ -147841,7 +147763,7 @@ def dm_create_predictive_alert():
 
         is_super_admin = check_super_admin()
         if not is_super_admin:
-            user_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
+            user_plan = (resolve_effective_plan(user).get('plan') or 'free').lower()
             if user_plan not in ['pro', 'business', 'enterprise', 'custom']:
                 return jsonify({'success': False, 'error': 'Plan does not include predictive alerts', 'code': 'FEATURE_NOT_AVAILABLE'}), 403
 
@@ -147868,23 +147790,23 @@ def dm_create_predictive_alert():
 @jwt_required
 @cross_origin()
 def dm_save_predictive_settings():
-    """Save predictive settings (placeholder)"""
+    """Save forecast settings for the company."""
     try:
-        user = getattr(request, 'user', None)
-        if not user:
-            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
-
-        is_super_admin = check_super_admin()
-        if not is_super_admin:
-            user_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
-            if user_plan not in ['pro', 'business', 'enterprise', 'custom']:
-                return jsonify({'success': False, 'error': 'Plan does not include predictive settings', 'code': 'FEATURE_NOT_AVAILABLE'}), 403
-
+        user, err = _dm_user_or_401()
+        if err:
+            return err
         data = request.get_json() or {}
-        return jsonify({'success': True, 'settings': data, 'message': 'Settings saved'})
+        cur = _dm_setting_get('dm_predictive_settings', user.company_id, DM_PREDICTIVE_DEFAULTS)
+        for k, v in data.items():
+            if k != 'company_id' and isinstance(v, (bool, int, float, str)):
+                cur[k] = v
+        _dm_setting_put('dm_predictive_settings', user.company_id, cur, user.id)
+        db.session.commit()
+        return jsonify({'success': True, 'settings': cur, 'message': 'Settings saved'})
     except Exception as e:
+        db.session.rollback()
         current_app.logger.error(f"dm_save_predictive_settings error: {str(e)}")
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': 'Settings could not be saved'}), 500
 
 # ============================================================
 # QUALITY MANAGEMENT ENDPOINTS
@@ -147960,7 +147882,7 @@ def dm_create_quality_record():
 
         is_super_admin = check_super_admin()
         if not is_super_admin:
-            user_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
+            user_plan = (resolve_effective_plan(user).get('plan') or 'free').lower()
             if user_plan not in ['pro', 'business', 'enterprise', 'custom']:
                 return jsonify({'success': False, 'error': 'Plan does not include QMS', 'code': 'FEATURE_NOT_AVAILABLE'}), 403
 
@@ -148391,7 +148313,7 @@ def dm_bulk_quality_action():
 
         is_super_admin = check_super_admin()
         if not is_super_admin:
-            user_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
+            user_plan = (resolve_effective_plan(user).get('plan') or 'free').lower()
             if user_plan not in ['pro', 'business', 'enterprise', 'custom']:
                 return jsonify({'success': False, 'error': 'Plan does not include bulk actions', 'code': 'FEATURE_NOT_AVAILABLE'}), 403
 
@@ -148464,7 +148386,7 @@ def dm_download_for_offline():
 
         is_super_admin = check_super_admin()
         if not is_super_admin:
-            user_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
+            user_plan = (resolve_effective_plan(user).get('plan') or 'free').lower()
             if user_plan not in ['basic', 'pro', 'business', 'enterprise', 'custom']:
                 return jsonify({'success': False, 'error': 'Plan does not include offline', 'code': 'FEATURE_NOT_AVAILABLE'}), 403
 
@@ -148576,38 +148498,55 @@ def dm_get_sync_conflicts():
 @jwt_required
 @cross_origin()
 def dm_sync_offline_changes():
-    """Process sync queue items (placeholder)"""
+    """Apply changes made while offline. A change to a document that was edited on the server meanwhile becomes a conflict."""
     try:
-        user = getattr(request, 'user', None)
-        if not user:
-            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
-
+        user, err = _dm_user_or_401()
+        if err:
+            return err
         data = request.get_json() or {}
-        changes = data.get('changes') or []
-        processed = 0
-        failed = 0
-        for change in changes:
+        for ch in (data.get('changes') or [])[:200]:
+            if isinstance(ch, dict) and ch.get('document_id'):
+                db.session.add(SyncQueueItem(user_id=user.id, document_id=ch.get('document_id'), action=str(ch.get('action') or 'update')[:30],
+                                             description=str(ch.get('description') or '')[:500], payload=json.dumps(ch.get('payload') or {}),
+                                             status='pending', company_id=user.company_id))
+        db.session.flush()
+        synced = conflicts = failed = 0
+        for it in SyncQueueItem.query.filter_by(user_id=user.id, status='pending').order_by(SyncQueueItem.id).limit(200).all():
             try:
-                item = SyncQueueItem(
-                    user_id=user.id,
-                    document_id=change.get('document_id'),
-                    action=change.get('action', 'update'),
-                    description=change.get('description'),
-                    payload=json.dumps(change.get('payload', {})),
-                    status='pending',
-                    company_id=user.company_id
-                )
-                db.session.add(item)
-                processed += 1
+                payload = json.loads(it.payload or '{}')
             except Exception:
+                payload = {}
+            d = Document.query.get(it.document_id) if it.document_id else None
+            if not d or not _user_can_access_document(user, d, check_super_admin()) or it.action != 'update':
+                it.status, it.error = 'failed', 'Document not found or this change type is not supported'
                 failed += 1
+                continue
+            base = payload.get('base_updated_at')
+            try:
+                base_dt = datetime.fromisoformat(str(base).replace('Z', '')) if base else None
+            except ValueError:
+                base_dt = None
+            if base_dt and d.updated_at and d.updated_at > base_dt + timedelta(seconds=1):
+                db.session.add(SyncConflict(user_id=user.id, document_id=d.id, document_title=d.title, conflict_type='edited_on_server',
+                                            local_content=str(payload.get('content') or payload.get('title') or '')[:200000],
+                                            remote_content=str(d.content or d.title or '')[:200000], local_modified=base_dt,
+                                            remote_modified=d.updated_at, resolved=False, company_id=user.company_id))
+                it.status = 'conflict'
+                conflicts += 1
+                continue
+            for k in ('title', 'description', 'content'):
+                if isinstance(payload.get(k), str):
+                    setattr(d, k, payload[k][:255] if k == 'title' else payload[k])
+            d.updated_by, d.updated_at = user.id, datetime.utcnow()
+            it.status = 'synced'
+            synced += 1
         db.session.commit()
-        return jsonify({'success': True, 'processed': processed, 'failed': failed,
-                        'message': f'{processed} changes queued'})
+        return jsonify({'success': True, 'synced': synced, 'conflicts': conflicts, 'failed': failed, 'processed': synced,
+                        'message': f'{synced} change(s) synced'})
     except Exception as e:
         db.session.rollback()
         current_app.logger.error(f"dm_sync_offline_changes error: {str(e)}")
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': 'Sync failed'}), 500
 
 
 @app.route('/api/dm-documents/offline/conflicts/<int:conflict_id>/resolve', methods=['POST'])
@@ -148804,53 +148743,41 @@ def dm_get_integrations():
 @jwt_required
 @cross_origin()
 def dm_connect_integration():
-    """Connect an integration"""
+    """Connect a URL-based connector (webhook, Slack, Microsoft Teams, Zapier, Make). Others are not available yet."""
     try:
-        user = getattr(request, 'user', None)
-        if not user:
-            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
-
-        is_super_admin = check_super_admin()
-        if not is_super_admin:
-            user_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
-            if user_plan not in ['pro', 'business', 'enterprise', 'custom']:
-                return jsonify({'success': False, 'error': 'Plan does not include integrations', 'code': 'FEATURE_NOT_AVAILABLE'}), 403
-
+        user, err = _dm_user_or_401()
+        if err:
+            return err
+        if not _dm_plan_ok(user, ['pro', 'business', 'enterprise', 'custom']):
+            return jsonify({'success': False, 'error': 'Plan does not include integrations', 'code': 'FEATURE_NOT_AVAILABLE'}), 403
         data = request.get_json() or {}
-        if not data.get('integration_id'):
-            return jsonify({'success': False, 'error': 'integration_id required', 'code': 'VALIDATION_ERROR'}), 400
-
-        existing = Integration.query.filter_by(
-            integration_id=data['integration_id'], company_id=user.company_id
-        ).first()
-
-        if existing:
-            existing.config = json.dumps(data.get('config', {}))
-            existing.status = 'connected'
-            existing.connected_at = datetime.utcnow()
-            existing.connected_by = user.id
-            existing.updated_at = datetime.utcnow()
-            db.session.commit()
-            return jsonify({'success': True, 'integration': existing.to_dict(),
-                            'message': 'Integration reconnected'})
-
-        integ = Integration(
-            integration_id=data['integration_id'],
-            name=data.get('name'),
-            category=data.get('category'),
-            config=json.dumps(data.get('config', {})),
-            status='connected',
-            connected_at=datetime.utcnow(),
-            company_id=user.company_id,
-            connected_by=user.id
-        )
-        db.session.add(integ)
+        iid = str(data.get('integration_id') or '')
+        if iid not in DM_URL_CONNECTORS:
+            return jsonify({'success': False, 'code': 'NOT_AVAILABLE',
+                            'error': 'This connector is not available yet. Slack, Microsoft Teams, Zapier, Make and webhooks work today.'}), 400
+        cfg = data.get('config') or {}
+        url = str(cfg.get('url') or cfg.get('webhook_url') or cfg.get('base_url') or '').strip()
+        ok, why = _dm_public_https_url(url)
+        if not ok:
+            return jsonify({'success': False, 'error': why, 'code': 'VALIDATION_ERROR'}), 400
+        clean = {'url': url[:500], 'events': [e for e in (cfg.get('events') or []) if isinstance(e, str)][:10],
+                 'secret': str(cfg.get('secret') or cfg.get('api_secret') or '')[:200] or None}
+        integ = Integration.query.filter_by(integration_id=iid, company_id=user.company_id).first()
+        is_new = integ is None
+        if is_new:
+            integ = Integration(integration_id=iid, company_id=user.company_id)
+            db.session.add(integ)
+        integ.name = str(data.get('name') or iid.title())[:255]
+        integ.category = str(data.get('category') or 'communication')[:30]
+        integ.config = json.dumps(clean)
+        integ.status, integ.connected_at, integ.connected_by, integ.updated_at = 'connected', datetime.utcnow(), user.id, datetime.utcnow()
         db.session.commit()
-        return jsonify({'success': True, 'integration': integ.to_dict(), 'message': 'Integration connected'}), 201
+        return jsonify({'success': True, 'integration': integ.to_dict(),
+                        'message': 'Connected. Use "Test" to send a test message.'}), 201 if is_new else 200
     except Exception as e:
         db.session.rollback()
         current_app.logger.error(f"dm_connect_integration error: {str(e)}")
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': 'The connector could not be saved'}), 500
 
 
 @app.route('/api/dm-documents/integrations/<integration_id>/disconnect', methods=['POST'])
@@ -148885,70 +148812,48 @@ def dm_disconnect_integration(integration_id):
 @jwt_required
 @cross_origin()
 def dm_test_integration(integration_id):
-    """Test an integration connection (placeholder)"""
+    """Send a real test message to the connector's address."""
     try:
-        user = getattr(request, 'user', None)
-        if not user:
-            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
-
-        is_super_admin = check_super_admin()
-        q = Integration.query.filter_by(integration_id=integration_id)
-        if not is_super_admin:
-            q = q.filter_by(company_id=user.company_id)
-        integ = q.first()
+        user, err = _dm_user_or_401()
+        if err:
+            return err
+        integ = Integration.query.filter_by(integration_id=integration_id, company_id=user.company_id).first()
         if not integ:
             return jsonify({'success': False, 'error': 'Integration not found'}), 404
-
-        # TODO: real connection test. Placeholder success.
-        return jsonify({'success': True, 'message': 'Connection test passed',
-                        'integration_id': integration_id, 'status': 'ok'})
+        if integ.integration_id not in DM_URL_CONNECTORS:
+            return jsonify({'success': False, 'error': 'This connector is not available yet'}), 400
+        try:
+            cfg = json.loads(integ.config or '{}')
+        except Exception:
+            cfg = {}
+        ok, msg = _dm_post(cfg.get('url'), _dm_connector_payload(integ.integration_id, 'test',
+                                                                  {'id': 0, 'title': 'Test message from SafeTrack Pro Global', 'version': 1, 'status': 'test'},
+                                                                  user.name), cfg.get('secret'))
+        return jsonify({'success': ok, 'status': 'ok' if ok else 'failed', 'message': msg, 'error': None if ok else msg}), 200 if ok else 502
     except Exception as e:
         current_app.logger.error(f"dm_test_integration error: {str(e)}")
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': 'The test could not run'}), 500
 
 
 @app.route('/api/dm-documents/integrations/<integration_id>/sync', methods=['POST'])
 @jwt_required
 @cross_origin()
 def dm_trigger_integration_sync(integration_id):
-    """Trigger a sync for an integration (placeholder)"""
+    """URL connectors send events as they happen, so there is nothing to pull. Sends the latest document instead."""
     try:
-        user = getattr(request, 'user', None)
-        if not user:
-            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
-
-        is_super_admin = check_super_admin()
-        q = Integration.query.filter_by(integration_id=integration_id)
-        if not is_super_admin:
-            q = q.filter_by(company_id=user.company_id)
-        integ = q.first()
+        user, err = _dm_user_or_401()
+        if err:
+            return err
+        integ = Integration.query.filter_by(integration_id=integration_id, company_id=user.company_id).first()
         if not integ:
             return jsonify({'success': False, 'error': 'Integration not found'}), 404
-
-        data = request.get_json() or {}
-        integ.last_sync_at = datetime.utcnow()
-        db.session.commit()
-
-        # Activity log
-        try:
-            act = IntegrationActivity(
-                integration_id=integration_id,
-                integration_name=integ.name,
-                action='sync',
-                description=data.get('description') or 'Manual sync triggered',
-                status='success',
-                company_id=integ.company_id
-            )
-            db.session.add(act)
-            db.session.commit()
-        except Exception:
-            db.session.rollback()
-
-        return jsonify({'success': True, 'integration': integ.to_dict(), 'message': 'Sync triggered'})
+        if integ.integration_id not in DM_URL_CONNECTORS:
+            return jsonify({'success': False, 'error': 'This connector is not available yet'}), 400
+        return jsonify({'success': True, 'integration': integ.to_dict(),
+                        'message': 'This connector receives events automatically when documents are created, updated, approved or deleted. Nothing to sync.'})
     except Exception as e:
-        db.session.rollback()
         current_app.logger.error(f"dm_trigger_integration_sync error: {str(e)}")
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': 'Sync could not run'}), 500
 
 
 # ---- Webhooks ----
@@ -148986,7 +148891,7 @@ def dm_create_webhook():
 
         is_super_admin = check_super_admin()
         if not is_super_admin:
-            user_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
+            user_plan = (resolve_effective_plan(user).get('plan') or 'free').lower()
             if user_plan not in ['pro', 'business', 'enterprise', 'custom']:
                 return jsonify({'success': False, 'error': 'Plan does not include webhooks', 'code': 'FEATURE_NOT_AVAILABLE'}), 403
 
@@ -149072,29 +148977,25 @@ def dm_delete_webhook(webhook_id):
 @jwt_required
 @cross_origin()
 def dm_test_webhook(webhook_id):
-    """Test a webhook (placeholder)"""
+    """Send a signed test event to the webhook address."""
     try:
-        user = getattr(request, 'user', None)
-        if not user:
-            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
-
+        user, err = _dm_user_or_401()
+        if err:
+            return err
         wh = Webhook.query.get(webhook_id)
-        if not wh:
+        if not wh or (not check_super_admin() and wh.company_id != user.company_id):
             return jsonify({'success': False, 'error': 'Webhook not found'}), 404
-
-        is_super_admin = check_super_admin()
-        if not is_super_admin and wh.company_id and user.company_id and wh.company_id != user.company_id:
-            return jsonify({'success': False, 'error': 'Access denied'}), 403
-
-        # TODO: actual HTTP POST. Placeholder.
-        wh.last_triggered_at = datetime.utcnow()
-        wh.trigger_count = (wh.trigger_count or 0) + 1
-        db.session.commit()
-        return jsonify({'success': True, 'message': 'Test delivered', 'webhook': wh.to_dict()})
+        ok, msg = _dm_post(wh.url, {'event': 'test', 'document': None, 'actor': user.name,
+                                    'sent_at': datetime.utcnow().isoformat() + 'Z', 'source': 'SafeTrack Pro Global'}, wh.secret)
+        if ok:
+            wh.last_triggered_at = datetime.utcnow()
+            wh.trigger_count = (wh.trigger_count or 0) + 1
+            db.session.commit()
+        return jsonify({'success': ok, 'message': msg, 'error': None if ok else msg, 'webhook': wh.to_dict()}), 200 if ok else 502
     except Exception as e:
         db.session.rollback()
         current_app.logger.error(f"dm_test_webhook error: {str(e)}")
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': 'The test could not run'}), 500
 
 
 # ---- API Keys ----
@@ -149132,7 +149033,7 @@ def dm_create_api_key():
 
         is_super_admin = check_super_admin()
         if not is_super_admin:
-            user_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
+            user_plan = (resolve_effective_plan(user).get('plan') or 'free').lower()
             if user_plan not in ['business', 'enterprise', 'custom']:
                 return jsonify({'success': False, 'error': 'Plan does not include API keys', 'code': 'FEATURE_NOT_AVAILABLE'}), 403
 
@@ -149292,40 +149193,15 @@ def dm_get_custom_reports():
 @jwt_required
 @cross_origin()
 def dm_run_custom_report():
-    """Run a custom report configuration (placeholder data source)"""
+    """Run a report on documents, users, activity, incidents or compliance assessments (company records only)."""
     try:
-        user = getattr(request, 'user', None)
-        if not user:
-            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
-
-        is_super_admin = check_super_admin()
-        data = request.get_json() or {}
-        data_source = data.get('data_source', 'documents')
-
-        q = Document.query
-        if not is_super_admin and user.company_id:
-            q = q.filter_by(company_id=user.company_id)
-        limit = min(int(data.get('limit', 100)), 1000)
-
-        docs = q.order_by(Document.updated_at.desc()).limit(limit).all()
-        rows = []
-        for d in docs:
-            rows.append({
-                'id': d.id,
-                'title': d.title,
-                'document_type': getattr(d, 'document_type', None),
-                'module': getattr(d, 'module', None),
-                'category': getattr(d, 'category', None),
-                'status': getattr(d, 'status', None),
-                'priority': getattr(d, 'priority', None),
-                'created_at': d.created_at.isoformat() if d.created_at else None,
-                'updated_at': d.updated_at.isoformat() if d.updated_at else None
-            })
-        return jsonify({'success': True, 'rows': rows, 'total': len(rows),
-                        'data_source': data_source})
+        user, err = _dm_user_or_401()
+        if err:
+            return err
+        return jsonify(_dm_run_report(user, request.get_json() or {}))
     except Exception as e:
         current_app.logger.error(f"dm_run_custom_report error: {str(e)}")
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': 'The report could not run'}), 500
 
 
 @app.route('/api/dm-documents/custom-reports', methods=['POST'])
@@ -149340,7 +149216,7 @@ def dm_save_custom_report():
 
         is_super_admin = check_super_admin()
         if not is_super_admin:
-            user_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
+            user_plan = (resolve_effective_plan(user).get('plan') or 'free').lower()
             if user_plan not in ['pro', 'business', 'enterprise', 'custom']:
                 return jsonify({'success': False, 'error': 'Plan does not include custom reports', 'code': 'FEATURE_NOT_AVAILABLE'}), 403
 
@@ -149408,20 +149284,21 @@ def dm_delete_custom_report(report_id):
 @jwt_required
 @cross_origin()
 def dm_export_custom_report():
-    """Export a custom report (CSV placeholder)"""
+    """Export report rows as CSV, Excel or PDF."""
     try:
-        user = getattr(request, 'user', None)
-        if not user:
-            return jsonify({'success': False, 'error': 'Not authenticated'}), 401
-
+        user, err = _dm_user_or_401()
+        if err:
+            return err
         data = request.get_json() or {}
-        # TODO: build real CSV from config. Placeholder.
-        content = "id,title\n".encode('utf-8')
-        return Response(content, mimetype='text/csv',
-                        headers={'Content-Disposition': 'attachment; filename="custom-report.csv"'})
+        rd = data.get('report_data')
+        rows = rd.get('data') or rd.get('rows') if isinstance(rd, dict) else rd
+        if not rows and data.get('config'):
+            rows = _dm_run_report(user, data['config'])['data']
+        out, mime, name = _dm_export_rows(rows or [], str(data.get('format') or 'csv').lower(), data.get('name') or 'custom-report')
+        return Response(out, mimetype=mime, headers={'Content-Disposition': f'attachment; filename="{name}"'})
     except Exception as e:
         current_app.logger.error(f"dm_export_custom_report error: {str(e)}")
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': 'The report could not be exported'}), 500
 
 
 # ============================================================
@@ -149685,7 +149562,7 @@ def dm_save_bi_dashboard():
 
         is_super_admin = check_super_admin()
         if not is_super_admin:
-            user_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
+            user_plan = (resolve_effective_plan(user).get('plan') or 'free').lower()
             if user_plan not in ['pro', 'business', 'enterprise', 'custom']:
                 return jsonify({'success': False, 'error': 'Plan does not include dashboards', 'code': 'FEATURE_NOT_AVAILABLE'}), 403
 
@@ -149803,7 +149680,7 @@ def dm_create_document_change(document_id):
             return jsonify({'success': False, 'error': 'Not authenticated'}), 401
 
         document = Document.query.get(document_id)
-        if not document:
+        if not document or not _user_can_access_document(user, document, check_super_admin()):
             return jsonify({'success': False, 'error': 'Document not found'}), 404
 
         data = request.get_json() or {}
@@ -149859,6 +149736,8 @@ def dm_accept_document_change(change_id):
             return jsonify({'success': False, 'error': 'Access denied'}), 403
 
         doc = Document.query.get(change.document_id)
+        if doc and not _user_can_access_document(user, doc, is_super_admin):
+            return jsonify({'success': False, 'error': 'Access denied'}), 403
         if doc:
             doc.content = change.proposed_content
             doc.updated_by = user.id
@@ -151326,7 +151205,7 @@ def apply_pdf_redactions(document_id):
 
         # Plan check — redaction is a premium feature
         if not is_super_admin:
-            user_plan = (getattr(user, 'subscription_plan', None) or 'free').lower()
+            user_plan = (resolve_effective_plan(user).get('plan') or 'free').lower()
             if user_plan not in ['business', 'enterprise', 'custom']:
                 return jsonify({
                     'success': False,
@@ -166959,12 +166838,28 @@ def _company_price(company, plan, duration):
     if _company_suspended(company):
         return None, None, (jsonify({'error': 'This company account is suspended. Please contact support.', 'code': 'COMPANY_SUSPENDED'}), 403)
     quote = _active_quote(company.id)
-    if not quote or not quote.amount:
-        return None, None, (jsonify({'error': 'Your price has not been agreed yet. Request it on the billing page.',
+    # 1) a price our team agreed with this company always wins for that plan
+    if quote and quote.amount and quote.plan == plan:
+        if duration != quote.billing_cycle:
+            return None, None, (jsonify({'error': f'Your agreed price is for {BILLING_CYCLE_TEXT.get(quote.billing_cycle, quote.billing_cycle)} billing. '
+                                                  'Reload the page to see it.', 'code': 'QUOTE_CHANGED'}), 409)
+        return float(quote.amount), quote.currency, None
+    # 2) Enterprise has a listed price per country (decision 2026-11-27); 3) Custom is always agreed with sales
+    if plan == 'enterprise':
+        listed = _enterprise_list_price(company)
+        amount = listed.get(duration)
+        if isinstance(amount, (int, float)) and amount > 0:
+            return float(amount), listed.get('currency', 'USD'), None
+    if plan == 'custom' or plan == 'enterprise':
+        return None, None, (jsonify({'error': 'The Custom plan is priced by our sales team. Request it on the billing page.',
                                      'requires_contact': True, 'code': 'NO_QUOTE'}), 400)
-    if plan != quote.plan or duration != quote.billing_cycle:
-        return None, None, (jsonify({'error': 'The agreed plan has changed. Reload the page to see the current price.', 'code': 'QUOTE_CHANGED'}), 409)
-    return float(quote.amount), quote.currency, None
+    return None, None, (jsonify({'error': 'Company accounts pay for Enterprise or Custom plans.', 'code': 'INVALID_PLAN'}), 400)
+
+
+def _enterprise_list_price(company):
+    """{'1_month', '6_month', '1_year', 'currency'} Enterprise list price for the company's country."""
+    row = get_pricing(_normalize_country_name(getattr(company, 'country', None))).get('enterprise') or {}
+    return {k: row.get(k) for k in ('1_month', '6_month', '1_year', 'currency')}
 
 
 def _find_payment(reference):
@@ -167124,7 +167019,8 @@ def billing_overview():
                        company={'name': company.name, 'industry': company.industry, 'employee_count': company.employee_count, 'country': company.country,
                                 'phone': company.phone, 'website': company.website, 'address': company.address},
                        suspended=_company_suspended(company), quote=_quote_dict(quote), request=_quote_dict(asked),
-                       methods=_pay_methods(quote.currency) if quote else {})
+                       enterprise=_enterprise_list_price(company),
+                       methods=_pay_methods(quote.currency if quote else _enterprise_list_price(company).get('currency')))
         elif user.user_type in ('admin', 'company_admin'):
             out.update(kind='no_company')
         elif user.user_type == 'employee':
@@ -168748,6 +168644,1873 @@ def hw_chemical_item_route(chem_id):
     return jsonify({'success': True, 'data': c.to_dict()}), 200
 
 
+# =====================================================================
+# DOCUMENT MANAGEMENT — REAL IMPLEMENTATIONS (2026-11-26)
+# Replaces placeholder logic in the /api/dm-documents routes.
+#   * Text answers (assistant) go to DeepSeek through call_gemini().
+#   * Classification, forecasts and unusual-activity checks are rule based on the company's own records
+#     (no trained model yet) and say so in their responses.
+# =====================================================================
+import io as _dm_io
+import csv as _dm_csv
+import html as _dm_html
+import hmac as _dm_hmac
+import socket as _dm_socket
+import zipfile as _dm_zipfile
+import hashlib as _dm_hashlib
+import ipaddress as _dm_ipaddress
+import threading as _dm_threading
+from datetime import timezone as _dm_dt_tz
+from usermodels import (Document as _DmDoc, DocumentAuditLog as _DmAudit, User as _DmUser, Incident as _DmIncident,
+                        IntakeQueueItem as _DmIntake, Anomaly as _DmAnomaly, DetectionRule as _DmRule,
+                        Prediction as _DmPrediction, MLPredictiveModel as _DmModel, WatermarkSettings as _DmWm,
+                        DocumentBundle as _DmBundle, BundleDocument as _DmBundleDoc, SyncQueueItem as _DmSyncItem,
+                        SyncConflict as _DmSyncConflict, Integration as _DmIntegration, Webhook as _DmWebhook,
+                        DocumentComplianceAssessment as _DmAssessment)
+from models import SystemSettings as _DmSettings, Company as _DmCompany
+
+DM_TEXT_CACHE = {}
+
+
+def _dm_upload_root():
+    return current_app.config.get('UPLOAD_FOLDER', 'uploads')
+
+
+def _dm_abs_file(doc):
+    """Absolute path of a document's stored file (inside the upload folder), or None."""
+    if not doc or not doc.file_url or not str(doc.file_url).startswith('/uploads/'):
+        return None
+    root = os.path.abspath(_dm_upload_root())
+    p = os.path.abspath(os.path.join(root, str(doc.file_url)[len('/uploads/'):]))
+    if not p.startswith(root + os.sep) or not os.path.isfile(p):
+        return None
+    return p
+
+
+def _dm_company_docs(user):
+    """Documents the user's company owns (or the user's own when they have no company)."""
+    q = _DmDoc.query
+    if user.company_id:
+        q = q.filter(_DmDoc.company_id == user.company_id)
+    else:
+        q = q.filter(_DmDoc.user_id == user.id)
+    return q.filter(func.coalesce(_DmDoc.status, 'draft') != 'deleted')
+
+
+def _dm_setting_get(name, company_id, default):
+    row = _DmSettings.query.filter_by(setting_key=f'{name}:{company_id}').first()
+    if not row:
+        return dict(default)
+    try:
+        return {**default, **json.loads(row.setting_value or '{}')}
+    except Exception:
+        return dict(default)
+
+
+def _dm_setting_put(name, company_id, values, user_id):
+    key = f'{name}:{company_id}'
+    row = _DmSettings.query.filter_by(setting_key=key).first()
+    if not row:
+        row = _DmSettings(setting_key=key, setting_value='{}', data_type='json', category='document_settings',
+                          description=f'{name} for company {company_id}', is_public=False)
+        db.session.add(row)
+    row.setting_value = json.dumps(values)[:20000]
+    row.updated_by = user_id
+    row.updated_at = datetime.utcnow()
+
+
+# ---------------------------------------------------------------- text extraction
+def _dm_html_to_text(h):
+    t = re.sub(r'(?is)<(script|style)[^>]*>.*?</\1>', ' ', str(h or ''))
+    t = re.sub(r'(?i)<br\s*/?>|</p>|</h\d>|</li>|</tr>|</div>', '\n', t)
+    t = _dm_html.unescape(re.sub(r'<[^>]+>', ' ', t))
+    t = re.sub(r'[ \t\r\f\v]+', ' ', t)
+    return re.sub(r'\n\s*\n+', '\n\n', t).strip()
+
+
+def _dm_ocr_image(img):
+    import pytesseract
+    return pytesseract.image_to_string(img.convert('L'))
+
+
+def _dm_file_text(path, ocr=False, max_pages=40):
+    ext = os.path.splitext(path)[1].lower()
+    try:
+        if ext == '.pdf':
+            import pymupdf as _fz
+            d = _fz.open(path)
+            try:
+                text = '\n'.join(d[i].get_text() for i in range(min(d.page_count, max_pages))).strip()
+                if len(text) < 20 and ocr:
+                    from PIL import Image as _Im
+                    parts = []
+                    for i in range(min(d.page_count, 3)):
+                        pix = d[i].get_pixmap(matrix=_fz.Matrix(2, 2), alpha=False)
+                        parts.append(_dm_ocr_image(_Im.frombytes('RGB', (pix.width, pix.height), pix.samples)))
+                    text = '\n'.join(parts).strip()
+                return text
+            finally:
+                d.close()
+        if ext == '.docx':
+            from docx import Document as _Dx
+            dx = _Dx(path)
+            parts = [p.text for p in dx.paragraphs]
+            for t in dx.tables[:30]:
+                for r in t.rows[:200]:
+                    parts.append(' | '.join(c.text for c in r.cells))
+            return '\n'.join(parts)
+        if ext == '.xlsx':
+            import openpyxl
+            wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+            parts = []
+            for ws in wb.worksheets[:5]:
+                for i, row in enumerate(ws.iter_rows(values_only=True)):
+                    if i > 500:
+                        break
+                    parts.append(' | '.join('' if v is None else str(v) for v in row))
+            return '\n'.join(parts)
+        if ext in ('.txt', '.csv', '.md'):
+            with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+                return f.read(400000)
+        if ext in ('.png', '.jpg', '.jpeg', '.tif', '.tiff', '.bmp', '.webp') and ocr:
+            from PIL import Image as _Im
+            return _dm_ocr_image(_Im.open(path))
+    except Exception as e:
+        logger.warning(f'dm text extraction failed for {os.path.basename(path)}: {e}')
+    return ''
+
+
+def _dm_doc_text(doc, limit=20000, ocr=False):
+    key = (doc.id, doc.file_hash or '', str(doc.updated_at), ocr)
+    text = DM_TEXT_CACHE.get(key)
+    if text is None:
+        parts = []
+        if doc.content:
+            parts.append(_dm_html_to_text(doc.content))
+        p = _dm_abs_file(doc)
+        if p:
+            parts.append(_dm_file_text(p, ocr=ocr))
+        text = '\n\n'.join(x for x in parts if x).strip()
+        if len(DM_TEXT_CACHE) > 300:
+            DM_TEXT_CACHE.clear()
+        DM_TEXT_CACHE[key] = text
+    return text[:limit]
+
+
+# ---------------------------------------------------------------- assistant (DeepSeek, answers from company documents)
+_DM_STOP = set('the a an and or of to in on for is are was were be by with what which who how when where does do did this '
+               'that these those it its from at as about please tell me our we i you can could any all list show give find '
+               'there their them have has had should would will shall not no yes into than then also more most'.split())
+
+
+def _dm_terms(q):
+    return [w for w in dict.fromkeys(re.findall(r'[a-z0-9]{3,}', str(q or '').lower())) if w not in _DM_STOP][:12]
+
+
+def _dm_snippets(text, terms, width=600, n=3):
+    low = text.lower()
+    starts = sorted({max(0, low.find(t) - width // 3) for t in terms if low.find(t) >= 0})[:n]
+    return [text[s:s + width].strip() for s in (starts or [0])]
+
+
+def _dm_rank_docs(user, question, limit=4):
+    terms = _dm_terms(question)
+    if not terms:
+        return []
+    scored = []
+    for d in _dm_company_docs(user).order_by(_DmDoc.updated_at.desc()).limit(400).all():
+        meta = ' '.join(str(x or '') for x in (d.title, d.description, d.document_type, d.category, d.module, d.tags)).lower()
+        s = sum(3 for t in terms if t in meta)
+        if d.content:
+            body = str(d.content)[:30000].lower()
+            s += sum(1 for t in terms if t in body)
+        scored.append((s, d))
+    scored.sort(key=lambda x: (-x[0], -(x[1].id or 0)))
+    out = []
+    for s, d in scored[:12]:
+        txt = _dm_doc_text(d, 80000)
+        low = txt.lower()
+        s2 = s + sum(min(low.count(t), 5) for t in terms)
+        if s2 > 0:
+            out.append((s2, d, txt))
+    out.sort(key=lambda x: -x[0])
+    return out[:limit]
+
+
+_DM_MODE_HINT = {
+    'summarize': 'Give a short summary with the key points as bullets.',
+    'compare': 'Compare the documents point by point and list the differences.',
+    'extract': 'Extract the requested facts (dates, names, numbers, responsibilities) as a list.',
+    'compliance': 'Check the documents against the question as a compliance reviewer and list gaps plainly.',
+    'qa': 'Answer the question directly.',
+}
+
+
+def _dm_assistant_answer(user, question, document_ids=None, history=None, mode='qa', temperature=0.3, max_tokens=1500):
+    terms = _dm_terms(question)
+    picked = []
+    for did in (document_ids or [])[:5]:
+        try:
+            d = _DmDoc.query.get(int(did))
+        except (TypeError, ValueError):
+            d = None
+        if d and _user_can_access_document(user, d, check_super_admin()):
+            picked.append((100, d, _dm_doc_text(d, 80000, ocr=True)))
+    if not picked:
+        picked = _dm_rank_docs(user, question)
+    ctx, sources, budget = [], [], 26000
+    for _, d, txt in picked:
+        txt = txt or (d.description or '')
+        chunk = txt[:min(budget, 14000)] if document_ids else '\n...\n'.join(_dm_snippets(txt, terms, 1500, 3))
+        budget -= len(chunk)
+        ctx.append(f'[Document {d.id}] "{d.title}" (type: {d.document_type}, status: {d.status}, version: {d.version})\n{chunk}')
+        sources.append({'document_id': d.id, 'title': d.title,
+                        'snippet': (_dm_snippets(txt, terms, 220, 1) or [''])[0][:220]})
+        if budget <= 0:
+            break
+    system = ("You are the document assistant inside SafeTrack Pro Global, a health, safety and environment platform. "
+              "Answer only from the company documents provided. If they do not contain the answer, say so plainly and say "
+              "which kind of document would contain it. Name the document titles you used. Never invent clause numbers, "
+              "dates or figures. " + _DM_MODE_HINT.get(mode, _DM_MODE_HINT['qa']) +
+              ' Reply as JSON: {"answer": "<markdown>", "suggestions": ["<up to 3 short follow-up questions>"]}')
+    hist = ''.join(f"{m.get('role')}: {str(m.get('content'))[:800]}\n" for m in (history or [])[-6:])
+    prompt = (f"Company documents:\n\n{chr(10).join(ctx) if ctx else '(no matching documents were found)'}\n\n"
+              f"Conversation so far:\n{hist or '(none)'}\nQuestion: {question}")
+    try:
+        parsed, _info, usage, _ms = call_gemini(prompt, system_instruction=system, json_mode=True,
+                                                temperature=max(0.0, min(1.0, float(temperature or 0.3))),
+                                                max_tokens=max(300, min(4000, int(max_tokens or 1500))),
+                                                feature='document_assistant', current_user=user, use_cache=False)
+        answer = str((parsed or {}).get('answer') or '').strip() or 'I could not form an answer from these documents.'
+        suggestions = [str(s)[:160] for s in ((parsed or {}).get('suggestions') or []) if s][:3]
+        tokens = int((usage or {}).get('total_tokens') or 0)
+        ai = True
+    except Exception as e:
+        logger.warning(f'document assistant AI unavailable: {e}')
+        ai, tokens, suggestions = False, 0, []
+        if sources:
+            answer = ('The AI service is not available right now. These passages from your documents match your question:\n\n'
+                      + '\n\n'.join(f"**{s['title']}**: {s['snippet']}" for s in sources))
+        else:
+            answer = 'The AI service is not available right now, and none of your documents matched the question.'
+    return {'answer': answer, 'sources': sources, 'suggestions': suggestions, 'tokens_used': tokens, 'ai_used': ai}
+
+
+# ---------------------------------------------------------------- smart intake (rule based)
+DM_INTAKE_EXT = {'.pdf', '.docx', '.xlsx', '.csv', '.txt', '.png', '.jpg', '.jpeg', '.tif', '.tiff'}
+DM_INTAKE_MAX = 25 * 1024 * 1024
+DM_TYPE_RULES = {
+    'incident_report': ['incident report', 'near miss', 'root cause', 'injured', 'injury', 'first aid case', 'lost time',
+                        'investigation', 'witness statement', 'incident number'],
+    'permit': ['permit to work', 'hot work', 'confined space entry', 'work permit', 'isolation', 'lockout', 'permit no',
+               'gas test', 'permit holder'],
+    'sds': ['safety data sheet', 'hazard identification', 'first-aid measures', 'first aid measures', 'cas no', 'cas number',
+            'firefighting measures', 'exposure controls', 'handling and storage'],
+    'policy': ['policy statement', 'this policy', 'shall ensure', 'commitment', 'policy objectives'],
+    'procedure': ['procedure', 'step 1', 'responsibilities', 'work instruction', 'standard operating', 'method statement'],
+    'certificate': ['certificate', 'certify that', 'certified', 'has successfully completed', 'valid until', 'calibration'],
+    'training': ['training', 'course outline', 'learning objectives', 'attendance', 'induction', 'toolbox talk'],
+    'contract': ['agreement', 'contract', 'hereinafter', 'terms and conditions', 'governing law', 'in witness whereof'],
+    'invoice': ['invoice', 'amount due', 'subtotal', 'bill to', 'payment terms', 'invoice no'],
+    'medical': ['patient', 'diagnosis', 'fitness to work', 'blood pressure', 'prescription', 'medical examination'],
+    'financial': ['balance sheet', 'budget', 'revenue', 'expenditure', 'profit and loss', 'cost centre', 'cost center'],
+    'report': ['report', 'findings', 'recommendations', 'conclusion', 'inspection', 'audit', 'executive summary'],
+}
+_DM_MONTHS = 'jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec'
+
+
+def _dm_classify(text, filename=''):
+    low, fn = (text or '').lower(), (filename or '').lower().replace('_', ' ').replace('-', ' ')
+    scores = {}
+    for t, words in DM_TYPE_RULES.items():
+        s = sum(min(low.count(w), 4) for w in words) + sum(3 for w in words if w in fn)
+        if s:
+            scores[t] = s
+    if not scores:
+        return 'unknown', 0.2, []
+    ranked = sorted(scores.items(), key=lambda x: -x[1])
+    top, second = ranked[0][1], (ranked[1][1] if len(ranked) > 1 else 0)
+    conf = round(min(0.97, 0.35 + 0.5 * (top - second) / (top + 1) + min(top, 12) / 40), 2)
+    hits = [w for w in DM_TYPE_RULES[ranked[0][0]] if w in low or w in fn]
+    return ranked[0][0], conf, hits
+
+
+def _dm_extract_fields(text):
+    t = text or ''
+    dates = re.findall(r'\b(\d{4}-\d{2}-\d{2}|\d{1,2}[/.]\d{1,2}[/.]\d{2,4}|\d{1,2}\s+(?:' + _DM_MONTHS + r')[a-z]*\.?\s+\d{4})\b', t, re.I)
+    refs = re.findall(r'\b([A-Z]{2,6}[-/][A-Z0-9]{1,6}(?:[-/][A-Z0-9]{1,8}){0,3})\b', t)
+    expiry = re.search(r'(?:expir\w*|valid until|valid to|due date)\W{0,5}(\d{4}-\d{2}-\d{2}|\d{1,2}[/.]\d{1,2}[/.]\d{2,4}|\d{1,2}\s+(?:'
+                       + _DM_MONTHS + r')[a-z]*\.?\s+\d{4})', t, re.I)
+    first = next((l.strip() for l in t.splitlines() if 4 <= len(l.strip()) <= 120), '')
+    out = {
+        'title': first[:120],
+        'dates': list(dict.fromkeys(dates))[:8],
+        'references': list(dict.fromkeys(refs))[:8],
+        'emails': list(dict.fromkeys(re.findall(r'[\w.+-]+@[\w-]+\.[\w.]+', t)))[:5],
+        'phones': list(dict.fromkeys(re.findall(r'\+?\d[\d \-]{8,}\d', t)))[:5],
+    }
+    if expiry:
+        out['expiry_date'] = expiry.group(1)
+    return {k: v for k, v in out.items() if v}
+
+
+def _dm_file_kind_ok(ext, head):
+    if ext == '.pdf':
+        return head[:5] == b'%PDF-'
+    if ext in ('.docx', '.xlsx'):
+        return head[:4] == b'PK\x03\x04'
+    if ext == '.png':
+        return head[:8] == b'\x89PNG\r\n\x1a\n'
+    if ext in ('.jpg', '.jpeg'):
+        return head[:3] == b'\xff\xd8\xff'
+    if ext in ('.tif', '.tiff'):
+        return head[:4] in (b'II*\x00', b'MM\x00*')
+    if ext in ('.csv', '.txt'):
+        return b'\x00' not in head
+    return False
+
+
+def _dm_save_upload(file, folder, allowed, max_bytes):
+    """Validate and store an uploaded file. Returns (abs_path, url, ext, size, sha256) or raises ValueError."""
+    name = os.path.basename(file.filename or '')
+    ext = os.path.splitext(name)[1].lower()
+    if ext not in allowed:
+        raise ValueError(f'File type {ext or "(none)"} is not accepted')
+    data = file.read(max_bytes + 1)
+    if len(data) > max_bytes:
+        raise ValueError(f'File is larger than {max_bytes // (1024 * 1024)} MB')
+    if not data:
+        raise ValueError('The file is empty')
+    if not _dm_file_kind_ok(ext, data[:16]):
+        raise ValueError('The file content does not match its type')
+    d = os.path.join(_dm_upload_root(), folder)
+    os.makedirs(d, exist_ok=True)
+    fname = f'{uuid.uuid4().hex}{ext}'
+    p = os.path.join(d, fname)
+    with open(p, 'wb') as f:
+        f.write(data)
+    return p, f'/uploads/{folder}/{fname}', ext, len(data), _dm_hashlib.sha256(data).hexdigest()
+
+
+def _dm_intake_process(item, abs_path, sha, user, opts):
+    item.stage, item.progress = 'extracting', 40
+    text = _dm_file_text(abs_path, ocr=True, max_pages=30)
+    item.ocr_text = text[:60000]
+    ptype, conf, hits = _dm_classify(text, item.file_name)
+    fields = _dm_extract_fields(text) if opts.get('auto_extract', True) else {}
+    fields['sha256'] = sha
+    fields['matched_words'] = hits[:8]
+    dup = None
+    if opts.get('check_duplicates', True):
+        dup = _dm_company_docs(user).filter(_DmDoc.file_hash == sha).first()
+        if not dup:
+            prev = _DmIntake.query.filter(_DmIntake.company_id == user.company_id, _DmIntake.id != item.id,
+                                          _DmIntake.extracted_data.like(f'%{sha}%')).first()
+            if prev:
+                item.duplicate_found, item.duplicate_title = True, f'Already sent through intake: {prev.file_name}'[:255]
+    if dup:
+        item.duplicate_found, item.duplicate_title = True, (dup.title or '')[:255]
+    item.predicted_type = ptype if opts.get('auto_classify', True) else 'unknown'
+    item.confidence = conf if opts.get('auto_classify', True) else 0.0
+    module = next((m for m, words in (('environmental', ['emission', 'waste', 'spill', 'environment']),
+                                       ('medical', ['patient', 'medical', 'clinic']),
+                                       ('quality', ['quality', 'iso 9001', 'nonconformance'])) if any(w in text.lower() for w in words)), 'safety')
+    item.suggested_tags = json.dumps(list(dict.fromkeys([ptype.replace('_', ' '), module] + hits[:3]))[:6])
+    item.extracted_data = json.dumps(fields)
+    reasons = []
+    if not text.strip():
+        reasons.append('No readable text found')
+    if ptype == 'unknown':
+        reasons.append('Type could not be recognised')
+    if item.duplicate_found:
+        reasons.append('Possible duplicate')
+    try:
+        threshold = float(opts.get('auto_approve_threshold', 0.9))
+        threshold = threshold / 100 if threshold > 1 else threshold
+    except (TypeError, ValueError):
+        threshold = 0.9
+    if item.confidence < threshold:
+        reasons.append(f'Confidence {round(item.confidence * 100)}% is below {round(threshold * 100)}%')
+    item.needs_review = bool(reasons)
+    item.review_reason = '; '.join(reasons)[:255] or None
+    item.status, item.progress, item.processed_at = 'completed', 100, datetime.utcnow()
+    if item.needs_review:
+        item.stage, item.message = 'review', 'Waiting for a person to check: ' + item.review_reason
+    else:
+        doc = _dm_intake_to_document(item, user, {})
+        item.stage, item.message = 'complete', f'Added to the library as document #{doc.id}'
+
+
+def _dm_intake_to_document(item, user, data):
+    """Create a library document from an intake item (copies the stored file)."""
+    fields = {}
+    try:
+        fields = json.loads(item.extracted_data or '{}')
+    except Exception:
+        pass
+    if fields.get('document_id'):
+        existing = _DmDoc.query.get(fields['document_id'])
+        if existing:
+            return existing
+    root = os.path.abspath(_dm_upload_root())
+    src = os.path.abspath(os.path.join(root, str(item.file_url or '')[len('/uploads/'):]))
+    if not src.startswith(root + os.sep) or not os.path.isfile(src):
+        raise ValueError('The intake file is no longer available')
+    ext = os.path.splitext(src)[1].lower()
+    ddir = os.path.join(root, 'documents')
+    os.makedirs(ddir, exist_ok=True)
+    fname = f'{uuid.uuid4().hex[:16]}{ext}'
+    import shutil as _sh
+    _sh.copyfile(src, os.path.join(ddir, fname))
+    ptype = re.sub(r'[^a-z0-9_]', '_', str(data.get('predicted_type') or item.predicted_type or 'general').lower())[:50] or 'general'
+    if ptype == 'unknown':
+        ptype = 'general'
+    tags = data.get('suggested_tags')
+    if tags is None:
+        try:
+            tags = json.loads(item.suggested_tags or '[]')
+        except Exception:
+            tags = []
+    title = (str(data.get('title') or '').strip() or os.path.splitext(item.file_name or 'Document')[0])[:255]
+    mime = {'.pdf': 'application/pdf', '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+            '.tif': 'image/tiff', '.tiff': 'image/tiff', '.csv': 'text/csv', '.txt': 'text/plain',
+            '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+            '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'}.get(ext, 'application/octet-stream')
+    doc = _DmDoc(user_id=user.id, created_by=user.id, company_id=item.company_id or user.company_id, title=title,
+                 description='Added through Smart intake', document_type=ptype, category=ptype, module='general',
+                 status='draft', version=1, file_url=f'/uploads/documents/{fname}', file_name=item.file_name,
+                 file_size=item.file_size, file_hash=fields.get('sha256'), mime_type=mime,
+                 tags=json.dumps([str(t)[:40] for t in (tags or [])][:10]), editing_source='intake',
+                 analysis_result={'source': 'smart_intake', 'intake_id': item.id, 'confidence': item.confidence})
+    exp = fields.get('expiry_date')
+    if exp:
+        for fmt in ('%Y-%m-%d', '%d/%m/%Y', '%d.%m.%Y', '%d %B %Y', '%d %b %Y'):
+            try:
+                doc.expires_at = datetime.strptime(exp, fmt)
+                break
+            except ValueError:
+                continue
+    db.session.add(doc)
+    db.session.flush()
+    fields['document_id'] = doc.id
+    item.extracted_data = json.dumps(fields)
+    try:
+        create_audit_log(document_id=doc.id, user_id=user.id, action='create', details={'source': 'smart_intake'})
+    except Exception:
+        pass
+    return doc
+
+
+# ---------------------------------------------------------------- watermarks (real PDF stamping)
+DM_WM_DIR = 'watermarks'
+
+
+def _dm_wm_opts(src):
+    g = (lambda k, d=None: src.get(k, d)) if isinstance(src, dict) else (lambda k, d=None: getattr(src, k, d))
+    color = str(g('color') or '#f5222d')
+    if not re.fullmatch(r'#[0-9a-fA-F]{6}', color):
+        color = '#f5222d'
+
+    def num(v, d, lo, hi):
+        try:
+            return max(lo, min(hi, float(v)))
+        except (TypeError, ValueError):
+            return d
+    opacity = num(g('opacity'), 0.15, 0.02, 1.0)
+    if opacity > 1:
+        opacity = opacity / 100
+    return {'text': str(g('text') or 'CONFIDENTIAL')[:80], 'color': color, 'opacity': opacity,
+            'font_size': num(g('font_size', g('fontSize')), 48, 8, 200), 'rotation': num(g('rotation'), -45, -90, 90),
+            'position': str(g('position') or 'center'),
+            'type': str(g('watermark_type', g('watermarkType')) or 'text'), 'image_url': g('image_url'),
+            'user_tracking': bool(g('dynamic_user_tracking'))}
+
+
+_DM_WM_POS = {'center': (50, 50), 'top_left': (15, 10), 'top_center': (50, 10), 'top_right': (85, 10),
+              'middle_left': (15, 50), 'middle_right': (85, 50), 'bottom_left': (15, 90), 'bottom_center': (50, 90),
+              'bottom_right': (85, 90)}
+
+
+def _dm_wm_image_path(url):
+    m = re.fullmatch(r'/api/dm-documents/watermark/images/([0-9]+_[0-9a-f]{32}\.png)', str(url or ''))
+    if not m:
+        return None
+    p = os.path.join(_dm_upload_root(), DM_WM_DIR, m.group(1))
+    return p if os.path.isfile(p) else None
+
+
+def _dm_watermark_pdf(pdf_bytes, opts, user=None):
+    """Stamp every page. Draws on a visible-size overlay page, then lays it over each page (works on rotated pages)."""
+    import pymupdf as _fz
+    src = _fz.open(stream=pdf_bytes, filetype='pdf')
+    try:
+        rgb = tuple(int(opts['color'][i:i + 2], 16) / 255 for i in (1, 3, 5))
+        text = opts['text']
+        if opts.get('user_tracking') and user is not None:
+            text = f"{text}  {getattr(user, 'name', '') or ''} {datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC".strip()
+        img_path = _dm_wm_image_path(opts.get('image_url')) if opts.get('type') == 'image' else None
+        img_bytes = None
+        if img_path:
+            from PIL import Image as _Im
+            im = _Im.open(img_path).convert('RGBA')
+            a = im.getchannel('A').point(lambda v: int(v * opts['opacity']))
+            im.putalpha(a)
+            b = _dm_io.BytesIO()
+            im.save(b, 'PNG')
+            img_bytes = b.getvalue()
+        cache = {}
+        for page in src:
+            vw, vh = page.rect.width, page.rect.height
+            key = (round(vw), round(vh))
+            if key not in cache:
+                ov = _fz.open()
+                op = ov.new_page(width=vw, height=vh)
+                spots = ([(x, y) for x in (20, 50, 80) for y in (15, 40, 65, 90)] if opts['position'] == 'tile'
+                         else [_DM_WM_POS.get(opts['position'], (50, 50))])
+                size = opts['font_size'] * (0.6 if opts['position'] == 'tile' else 1)
+                for px, py in spots:
+                    cx, cy = vw * px / 100, vh * py / 100
+                    if img_bytes:
+                        w = min(vw, vh) * (0.25 if opts['position'] == 'tile' else 0.45)
+                        op.insert_image(_fz.Rect(cx - w / 2, cy - w / 2, cx + w / 2, cy + w / 2), stream=img_bytes, keep_proportion=True)
+                    else:
+                        tw = _fz.get_text_length(text, fontname='hebo', fontsize=size)
+                        start = _fz.Point(cx - tw / 2, cy + size * 0.35)
+                        op.insert_text(start, text, fontsize=size, fontname='hebo', color=rgb, fill_opacity=opts['opacity'],
+                                       morph=(_fz.Point(cx, cy), _fz.Matrix(-opts['rotation'])))
+                cache[key] = ov
+            target = page.rect * page.derotation_matrix
+            target.normalize()
+            page.show_pdf_page(target, cache[key], 0, rotate=-page.rotation, overlay=True)
+        return src.tobytes(garbage=3, deflate=True)
+    finally:
+        src.close()
+
+
+def _dm_document_pdf_bytes(doc):
+    """The document as PDF bytes for previews and exports (PDF file, image, or editor content), or None."""
+    import pymupdf as _fz
+    p = _dm_abs_file(doc)
+    if p:
+        with open(p, 'rb') as f:
+            data = f.read()
+        if data[:5] == b'%PDF-':
+            return data
+        if data[:8] == b'\x89PNG\r\n\x1a\n' or data[:3] == b'\xff\xd8\xff':
+            import pdf_edit_engine
+            return pdf_edit_engine.image_to_pdf(data)
+    if doc.content and str(doc.content).strip():
+        import pdf_edit_engine
+        return pdf_edit_engine.html_to_pdf(str(doc.content), doc.title)
+    return None
+
+
+# ---------------------------------------------------------------- PDF reports built from real records
+def _dm_report_pdf(title, html_body):
+    import pdf_edit_engine
+    css = ('<style>* { font-family: sans-serif; } body { font-size: 10pt; } h1 { color: #0b3d91; font-size: 17pt; } '
+           'h2 { color: #0b3d91; font-size: 12pt; border-bottom: 1px solid #c9d6ea; } table { border-collapse: collapse; width: 100%; } '
+           'td, th { border: 1px solid #d0d7e2; padding: 3px; font-size: 9pt; text-align: left; } th { background: #eef3fb; } '
+           '.muted { color: #666; font-size: 8.5pt; }</style>')
+    return pdf_edit_engine.html_to_pdf(css + html_body, title)
+
+
+def _dm_esc(v):
+    return _dm_html.escape('' if v is None else str(v))
+
+
+def _dm_compliance_report_html(report, user):
+    q = _dm_company_docs(user)
+    start = datetime.combine(report.date_from, datetime.min.time()) if report.date_from else None
+    end = datetime.combine(report.date_to, datetime.max.time()) if report.date_to else None
+    docs = q.all()
+    in_range = [d for d in docs if (not start or (d.created_at and d.created_at >= start)) and (not end or (d.created_at and d.created_at <= end))]
+    now = datetime.utcnow()
+    by_status, by_type = {}, {}
+    for d in docs:
+        by_status[d.status or 'draft'] = by_status.get(d.status or 'draft', 0) + 1
+        by_type[d.document_type or 'other'] = by_type.get(d.document_type or 'other', 0) + 1
+    overdue = [d for d in docs if d.next_review_date and d.next_review_date < now and d.status not in ('archived', 'obsolete')]
+    expired = [d for d in docs if d.expires_at and d.expires_at < now and d.status not in ('archived', 'obsolete')]
+    soon = [d for d in docs if d.expires_at and now <= d.expires_at <= now + timedelta(days=60)]
+    no_review = [d for d in docs if d.status in ('published', 'approved') and not d.next_review_date]
+    assessments = _DmAssessment.query.filter_by(company_id=user.company_id).all() if user.company_id else []
+    rows = lambda items: ''.join(f'<tr><td>{_dm_esc(d.title)}</td><td>{_dm_esc(d.document_type)}</td><td>{_dm_esc(d.status)}</td>'
+                                 f'<td>{_dm_esc((d.next_review_date or d.expires_at).strftime("%d %b %Y") if (d.next_review_date or d.expires_at) else "")}</td></tr>'
+                                 for d in items[:60]) or '<tr><td colspan="4">None</td></tr>'
+    count_table = lambda m: ''.join(f'<tr><td>{_dm_esc(k)}</td><td>{v}</td></tr>' for k, v in sorted(m.items(), key=lambda x: -x[1]))
+    head = '<tr><th>Document</th><th>Type</th><th>Status</th><th>Date</th></tr>'
+    recs = []
+    if overdue:
+        recs.append(f'Review the {len(overdue)} document(s) that are past their review date.')
+    if expired:
+        recs.append(f'Renew or withdraw the {len(expired)} expired document(s).')
+    if no_review:
+        recs.append(f'Set a review date on {len(no_review)} published document(s) that have none.')
+    if not recs:
+        recs.append('No gaps were found in review dates or expiry dates.')
+    ass = ''.join(f'<tr><td>{_dm_esc(a.framework_id)}</td><td>{_dm_esc((a.requirement or "")[:120])}</td><td>{_dm_esc(a.status)}</td>'
+                  f'<td>{_dm_esc(a.score)}</td></tr>' for a in assessments[:80])
+    return (f'<h1>{_dm_esc(report.title or "Compliance report")}</h1>'
+            f'<p class="muted">Generated {now.strftime("%d %b %Y %H:%M")} UTC by {_dm_esc(user.name)}. '
+            f'Period: {_dm_esc(report.date_from or "start")} to {_dm_esc(report.date_to or "today")}. '
+            f'Frameworks: {_dm_esc(report.frameworks or "all")}. Figures come from the document register.</p>'
+            f'<h2>Summary</h2><table><tr><td>Documents in the register</td><td>{len(docs)}</td></tr>'
+            f'<tr><td>Created in the period</td><td>{len(in_range)}</td></tr><tr><td>Past review date</td><td>{len(overdue)}</td></tr>'
+            f'<tr><td>Expired</td><td>{len(expired)}</td></tr><tr><td>Expiring within 60 days</td><td>{len(soon)}</td></tr>'
+            f'<tr><td>Published without a review date</td><td>{len(no_review)}</td></tr></table>'
+            f'<h2>By status</h2><table>{count_table(by_status)}</table><h2>By type</h2><table>{count_table(by_type)}</table>'
+            f'<h2>Past review date</h2><table>{head}{rows(overdue)}</table>'
+            f'<h2>Expired or expiring</h2><table>{head}{rows(expired + soon)}</table>'
+            + (f'<h2>Framework assessments</h2><table><tr><th>Framework</th><th>Requirement</th><th>Status</th><th>Score</th></tr>{ass}</table>' if ass else '')
+            + (f'<h2>Recommendations</h2><ul>{"".join(f"<li>{_dm_esc(r)}</li>" for r in recs)}</ul>' if report.include_recommendations is not False else '')
+            + (f'<h2>Notes</h2><p>{_dm_esc(report.notes)}</p>' if report.notes else ''))
+
+
+def _dm_certificate_html(cert, company_name):
+    return (f'<h1>Certificate of Disposition</h1><p class="muted">{_dm_esc(company_name)}</p>'
+            f'<table><tr><td>Certificate number</td><td>{_dm_esc(cert.certificate_number)}</td></tr>'
+            f'<tr><td>Document</td><td>{_dm_esc(cert.document_title)} (ID {_dm_esc(cert.document_id)})</td></tr>'
+            f'<tr><td>Method of disposal</td><td>{_dm_esc(cert.disposal_method)}</td></tr>'
+            f'<tr><td>Reason</td><td>{_dm_esc(cert.disposal_reason)}</td></tr>'
+            f'<tr><td>Disposed on</td><td>{_dm_esc(cert.disposed_at.strftime("%d %b %Y %H:%M") + " UTC" if cert.disposed_at else "")}</td></tr>'
+            f'<tr><td>Disposed by</td><td>{_dm_esc(cert.disposed_by_name)}</td></tr>'
+            f'<tr><td>Witnessed by</td><td>{_dm_esc(cert.witnessed_by or "Not recorded")}</td></tr></table>'
+            f'<p class="muted">This certificate was produced from the retention record held in SafeTrack Pro Global document control.</p>')
+
+
+# ---------------------------------------------------------------- bundle export
+def _dm_bundle_export(bundle, user, fmt, include_manifest=True, include_metadata=False, password=None):
+    """Returns (bytes, mimetype, filename)."""
+    import pymupdf as _fz
+    items = _DmBundleDoc.query.filter_by(bundle_id=bundle.id).order_by(_DmBundleDoc.position, _DmBundleDoc.id).all()
+    docs = []
+    for it in items:
+        d = _DmDoc.query.get(it.document_id)
+        if d and _user_can_access_document(user, d, check_super_admin()):
+            docs.append(d)
+    safe = re.sub(r'[^A-Za-z0-9 _.-]', '_', bundle.name or 'bundle').strip() or 'bundle'
+    manifest = [['#', 'Title', 'Type', 'Status', 'Version', 'File', 'Included']]
+    if fmt == 'pdf':
+        out = _fz.open()
+        for i, d in enumerate(docs, 1):
+            data = None
+            try:
+                data = _dm_document_pdf_bytes(d)
+            except Exception as e:
+                logger.warning(f'bundle export: document {d.id} could not be converted: {e}')
+            if data:
+                src = _fz.open(stream=data, filetype='pdf')
+                out.insert_pdf(src)
+                src.close()
+            manifest.append([i, d.title, d.document_type, d.status, d.version, d.file_name or '', 'yes' if data else 'no (not a PDF, image or editor document)'])
+        if include_manifest or out.page_count == 0:
+            rows = ''.join('<tr>' + ''.join(f'<td>{_dm_esc(c)}</td>' for c in r) + '</tr>' for r in manifest[1:])
+            mpdf = _fz.open(stream=_dm_report_pdf(f'{safe} — contents', f'<h1>{_dm_esc(bundle.name)}</h1><p class="muted">Exported '
+                                                 f'{datetime.utcnow().strftime("%d %b %Y %H:%M")} UTC by {_dm_esc(user.name)}</p>'
+                                                 f'<table><tr><th>#</th><th>Title</th><th>Type</th><th>Status</th><th>Version</th><th>File</th><th>Included</th></tr>{rows}</table>'), filetype='pdf')
+            out.insert_pdf(mpdf, start_at=0)
+            mpdf.close()
+        kw = {}
+        if password:
+            kw = dict(encryption=_fz.PDF_ENCRYPT_AES_256, user_pw=str(password)[:64], owner_pw=uuid.uuid4().hex,
+                      permissions=int(_fz.PDF_PERM_PRINT | _fz.PDF_PERM_COPY))
+        data = out.tobytes(garbage=3, deflate=True, **kw)
+        out.close()
+        return data, 'application/pdf', f'{safe}.pdf'
+    buf = _dm_io.BytesIO()
+    with _dm_zipfile.ZipFile(buf, 'w', _dm_zipfile.ZIP_DEFLATED) as z:
+        used = set()
+        for i, d in enumerate(docs, 1):
+            p = _dm_abs_file(d)
+            name = None
+            if p:
+                base = re.sub(r'[^A-Za-z0-9 _.-]', '_', d.file_name or os.path.basename(p))
+                name = f'{i:02d} {base}'
+                while name in used:
+                    name = f'{i:02d}_{uuid.uuid4().hex[:4]} {base}'
+                used.add(name)
+                z.write(p, name)
+            elif d.content:
+                name = f'{i:02d} ' + re.sub(r'[^A-Za-z0-9 _.-]', '_', d.title or 'document')[:80] + '.html'
+                z.writestr(name, f'<!doctype html><meta charset="utf-8"><title>{_dm_esc(d.title)}</title>{d.content}')
+            manifest.append([i, d.title, d.document_type, d.status, d.version, name or '', 'yes' if name else 'no (no file)'])
+        if include_manifest:
+            s = _dm_io.StringIO()
+            _dm_csv.writer(s).writerows(manifest)
+            z.writestr('manifest.csv', s.getvalue())
+        if include_metadata:
+            z.writestr('metadata.json', json.dumps([{'id': d.id, 'title': d.title, 'type': d.document_type, 'status': d.status,
+                                                     'version': d.version, 'created_at': str(d.created_at), 'updated_at': str(d.updated_at),
+                                                     'tags': d.tags} for d in docs], indent=1))
+    return buf.getvalue(), 'application/zip', f'{safe}.zip'
+
+
+# ---------------------------------------------------------------- unusual activity (rules over the document access log)
+DM_ANOMALY_DEFAULTS = {'sensitivity': 'medium', 'off_hours_start': 22, 'off_hours_end': 6, 'lookback_days': 30}
+_DM_SENS = {'low': {'bulk': 30, 'volume': 25, 'night': 5, 'conf': 10},
+            'medium': {'bulk': 20, 'volume': 15, 'night': 3, 'conf': 6},
+            'high': {'bulk': 10, 'volume': 10, 'night': 2, 'conf': 4}}
+
+
+def _dm_company_tz(company_id):
+    try:
+        from zoneinfo import ZoneInfo
+        c = _DmCompany.query.get(company_id) if company_id else None
+        return ZoneInfo(c.timezone) if c and c.timezone else None
+    except Exception:
+        return None
+
+
+def _dm_detect_anomalies(user, sensitivity=None, methods=None):
+    cid = user.company_id
+    cfg = _dm_setting_get('dm_anomaly_settings', cid, DM_ANOMALY_DEFAULTS)
+    sens = _DM_SENS.get(str(sensitivity or cfg.get('sensitivity') or 'medium').lower(), _DM_SENS['medium'])
+    rules = {r.type: r for r in _DmRule.query.filter_by(company_id=cid).all()} if cid else {}
+    wanted = set(methods or []) or {'bulk_download', 'off_hours', 'unusual_volume', 'confidential_access', 'new_location'}
+    wanted = {m for m in wanted if not (m in rules and rules[m].enabled is False)}
+    since = datetime.utcnow() - timedelta(days=int(cfg.get('lookback_days') or 30))
+    doc_ids = [i for (i,) in _dm_company_docs(user).with_entities(_DmDoc.id).all()]
+    if not doc_ids:
+        return 0, 0
+    conf_ids = {i for (i,) in _dm_company_docs(user).filter(_DmDoc.is_confidential.is_(True)).with_entities(_DmDoc.id).all()}
+    events = (_DmAudit.query.filter(_DmAudit.document_id.in_(doc_ids), _DmAudit.created_at >= since,
+                                    _DmAudit.action.in_(['view', 'download']))
+              .order_by(_DmAudit.created_at).limit(50000).all())
+    tz = _dm_company_tz(cid)
+    by_user = {}
+    for e in events:
+        if e.user_id:
+            by_user.setdefault(e.user_id, []).append(e)
+    found = []
+    now = datetime.utcnow()
+    for uid, evs in by_user.items():
+        downloads = [e for e in evs if e.action == 'download']
+        if 'bulk_download' in wanted:
+            j = 0
+            for i in range(len(downloads)):
+                while downloads[i].created_at - downloads[j].created_at > timedelta(hours=1):
+                    j += 1
+                if i - j + 1 >= sens['bulk']:
+                    found.append((uid, 'bulk_download', 'high', 85, downloads[i].created_at.date(),
+                                  f'{i - j + 1} documents downloaded within one hour', downloads[j:i + 1]))
+                    break
+        if 'off_hours' in wanted:
+            per_day = {}
+            for e in evs:
+                t = e.created_at.replace(tzinfo=_dm_dt_tz.utc).astimezone(tz) if tz else e.created_at
+                if t.hour >= int(cfg.get('off_hours_start', 22)) or t.hour < int(cfg.get('off_hours_end', 6)):
+                    per_day.setdefault(t.date(), []).append(e)
+            for day, es in per_day.items():
+                if len(es) >= sens['night']:
+                    found.append((uid, 'off_hours', 'medium', 55, day, f'{len(es)} documents opened outside working hours', es))
+        if 'unusual_volume' in wanted:
+            recent = [e for e in evs if e.created_at >= now - timedelta(days=1)]
+            older = [e for e in evs if e.created_at < now - timedelta(days=1)]
+            days = max(1, (now - since).days - 1)
+            avg = len(older) / days
+            if len(recent) >= sens['volume'] and len(recent) > 3 * max(avg, 1):
+                found.append((uid, 'unusual_volume', 'high', 75, now.date(),
+                              f'{len(recent)} documents opened in the last 24 hours (usual: about {avg:.1f} a day)', recent))
+        if 'confidential_access' in wanted and conf_ids:
+            per_day = {}
+            for e in evs:
+                if e.document_id in conf_ids:
+                    per_day.setdefault(e.created_at.date(), []).append(e)
+            for day, es in per_day.items():
+                if len({e.document_id for e in es}) >= sens['conf']:
+                    found.append((uid, 'confidential_access', 'medium', 60, day,
+                                  f'{len({e.document_id for e in es})} different confidential documents opened in one day', es))
+        if 'new_location' in wanted:
+            seen = set()
+            for e in evs:
+                ip = (e.ip_address or '').strip()
+                if not ip:
+                    continue
+                if seen and ip not in seen and len(seen) >= 1 and len([x for x in evs if x.created_at < e.created_at]) >= 5:
+                    found.append((uid, 'new_location', 'low', 30, e.created_at.date(), f'Documents opened from a new network address {ip}', [e]))
+                seen.add(ip)
+    created = 0
+    for uid, kind, sev, score, day, desc, es in found:
+        key = f'{kind}:{uid}:{day}'
+        if _DmAnomaly.query.filter(_DmAnomaly.company_id == cid, _DmAnomaly.type == kind, _DmAnomaly.user_id == uid,
+                                   _DmAnomaly.related_events.like(f'%"key": "{key}"%')).first():
+            continue
+        u = _DmUser.query.get(uid)
+        db.session.add(_DmAnomaly(type=kind, severity=sev, user_id=uid, user_name=getattr(u, 'name', None),
+                                  user_email=getattr(u, 'email', None), description=desc, risk_score=score, status='open',
+                                  ip_address=(es[-1].ip_address if es else None), detection_method='rules',
+                                  related_events=json.dumps({'key': key, 'events': [e.id for e in es[:50]],
+                                                             'documents': sorted({e.document_id for e in es})[:50]}),
+                                  company_id=cid, created_at=datetime.utcnow()))
+        if kind in rules:
+            rules[kind].triggered_count = (rules[kind].triggered_count or 0) + 1
+        created += 1
+    db.session.commit()
+    return created, len(events)
+
+
+# ---------------------------------------------------------------- forecasts (trend lines from the company's records)
+DM_PREDICTIVE_DEFAULTS = {'confidence_level': 0.9, 'model_type': 'trend', 'alert_threshold': 70}
+_DM_Z = [(0.99, 2.576), (0.95, 1.96), (0.9, 1.645), (0.8, 1.282), (0.0, 1.0)]
+DM_METHOD_NOTE = ('Trend line fitted to your own records (least squares on daily counts). '
+                  'Expiry and review figures are dates already set on documents, not guesses.')
+
+
+def _dm_daily(user, ptype, days_back):
+    """{date: value} history for a prediction type, plus {date: value} known future values (for date-based types)."""
+    today = datetime.utcnow().date()
+    start = today - timedelta(days=days_back - 1)
+    hist = {start + timedelta(days=i): 0.0 for i in range(days_back)}
+    future = {}
+    docs_q = _dm_company_docs(user)
+    if ptype in ('document_volume', 'storage_growth'):
+        rows = docs_q.with_entities(_DmDoc.created_at, _DmDoc.file_size).all()
+        base = 0.0
+        for c, size in rows:
+            if not c:
+                continue
+            day = c.date()
+            v = 1.0 if ptype == 'document_volume' else (size or 0) / (1024 * 1024)
+            if day < start:
+                base += v
+            elif day in hist:
+                hist[day] += v
+        if ptype == 'storage_growth':
+            run = base
+            for d in sorted(hist):
+                run += hist[d]
+                hist[d] = round(run, 3)
+    elif ptype in ('user_activity', 'approval_bottleneck'):
+        ids = [i for (i,) in docs_q.with_entities(_DmDoc.id).all()]
+        if ids:
+            q = _DmAudit.query.filter(_DmAudit.document_id.in_(ids), _DmAudit.created_at >= datetime.combine(start, datetime.min.time()))
+            if ptype == 'approval_bottleneck':
+                q = q.filter(_DmAudit.action.in_(['submit', 'submitted_for_approval']))
+            per = {}
+            for created, uid in q.with_entities(_DmAudit.created_at, _DmAudit.user_id).all():
+                per.setdefault(created.date(), []).append(uid)
+            for d, uids in per.items():
+                if d in hist:
+                    hist[d] = float(len(set(uids)) if ptype == 'user_activity' else len(uids))
+    elif ptype in ('expiry_risk', 'compliance_risk'):
+        col = _DmDoc.expires_at if ptype == 'expiry_risk' else _DmDoc.next_review_date
+        for (dt,) in docs_q.filter(col.isnot(None)).with_entities(col).all():
+            day = dt.date()
+            if day in hist:
+                hist[day] += 1
+            elif day > today:
+                future[day] = future.get(day, 0) + 1
+    return hist, future
+
+
+def _dm_fit(values):
+    n = len(values)
+    if n < 2:
+        return 0.0, (values[0] if values else 0.0), 0.0
+    xs = list(range(n))
+    mx, my = sum(xs) / n, sum(values) / n
+    sxx = sum((x - mx) ** 2 for x in xs) or 1.0
+    slope = sum((x - mx) * (y - my) for x, y in zip(xs, values)) / sxx
+    icpt = my - slope * mx
+    resid = [y - (icpt + slope * x) for x, y in zip(xs, values)]
+    sd = (sum(r * r for r in resid) / max(1, n - 2)) ** 0.5
+    return slope, icpt, sd
+
+
+def _dm_forecast(user, ptype='document_volume', horizon=30, confidence=0.9, history_days=90):
+    ptype = ptype if ptype in ('document_volume', 'storage_growth', 'user_activity', 'approval_bottleneck',
+                               'expiry_risk', 'compliance_risk') else 'document_volume'
+    horizon = max(7, min(365, int(horizon or 30)))
+    try:
+        confidence = float(confidence)
+        confidence = confidence / 100 if confidence > 1 else confidence
+    except (TypeError, ValueError):
+        confidence = 0.9
+    z = next(v for c, v in _DM_Z if confidence >= c)
+    hist, future = _dm_daily(user, ptype, history_days)
+    days = sorted(hist)
+    vals = [hist[d] for d in days]
+    today = datetime.utcnow().date()
+    timeline = [{'date': d.isoformat(), 'actual': round(v, 2)} for d, v in zip(days, vals)]
+    fut = []
+    if ptype in ('expiry_risk', 'compliance_risk'):
+        for i in range(1, horizon + 1):
+            d = today + timedelta(days=i)
+            v = float(future.get(d, 0))
+            fut.append({'date': d.isoformat(), 'forecast': v, 'upper_bound': v, 'lower_bound': v})
+        method = 'Dates already set on your documents'
+        fit_quality = 1.0
+    else:
+        recent = vals[-60:]
+        slope, icpt, sd = _dm_fit(recent)
+        n = len(recent)
+        for i in range(1, horizon + 1):
+            d = today + timedelta(days=i)
+            v = max(0.0, icpt + slope * (n - 1 + i))
+            fut.append({'date': d.isoformat(), 'forecast': round(v, 2), 'upper_bound': round(v + z * sd, 2),
+                        'lower_bound': round(max(0.0, v - z * sd), 2)})
+        method = 'Trend line from your records'
+        mean = (sum(recent) / n) if n else 0
+        fit_quality = 0.0 if not mean else max(0.0, min(1.0, 1 - sd / (mean + sd)))
+    if timeline and fut:
+        timeline[-1].update({'forecast': timeline[-1]['actual'], 'upper_bound': timeline[-1]['actual'], 'lower_bound': timeline[-1]['actual']})
+    timeline += fut
+    total = round(sum(f['forecast'] for f in fut), 2) if ptype != 'storage_growth' else (fut[-1]['forecast'] if fut else 0)
+    last30 = vals[-30:]
+    base = (sum(last30) / len(last30)) if last30 else 0
+    avg_f = (sum(f['forecast'] for f in fut) / len(fut)) if fut else 0
+    peak = max(fut, key=lambda f: f['forecast']) if fut else None
+    return {'success': True, 'type': ptype, 'timeline': timeline, 'forecast_start': today.isoformat(), 'method': method,
+            'method_note': DM_METHOD_NOTE, 'summary': {
+                'total_predicted': total, 'avg_per_day': round(avg_f, 2),
+                'trend_percent': round(((avg_f - base) / base) * 100, 1) if base else 0.0,
+                'peak_date': peak['date'] if peak and peak['forecast'] > 0 else None,
+                'history_days': history_days, 'horizon_days': horizon, 'fit_quality': round(fit_quality, 2)}}
+
+
+def _dm_generate_insights(user, horizon=30):
+    """Store rule-based predictions (risk list + recommendations) for the company. Replaces the previous run."""
+    cid = user.company_id
+    now = datetime.utcnow()
+    for p in _DmPrediction.query.filter(_DmPrediction.company_id == cid, _DmPrediction.supporting_data.like('%"source": "rules"%')).all():
+        db.session.delete(p)
+    docs = _dm_company_docs(user).filter(~func.coalesce(_DmDoc.status, 'draft').in_(['archived', 'obsolete'])).all()
+    out = []
+
+    def add(ptype, title, desc, value, unit, risk, conf, items):
+        p = _DmPrediction(title=title[:255], type=ptype, description=desc, value=float(value), unit=unit, timeframe=f'next {horizon} days',
+                          confidence=conf, risk_score=int(max(0, min(100, risk))), company_id=cid, created_at=now,
+                          supporting_data=json.dumps({'source': 'rules', 'documents': [{'id': d.id, 'title': d.title} for d in items[:20]]}))
+        db.session.add(p)
+        out.append(p)
+    expiring = sorted([d for d in docs if d.expires_at and now <= d.expires_at <= now + timedelta(days=horizon)], key=lambda d: d.expires_at)
+    expired = [d for d in docs if d.expires_at and d.expires_at < now]
+    if expiring or expired:
+        add('expiry_risk', f'{len(expiring)} document(s) expire in the next {horizon} days' + (f', {len(expired)} already expired' if expired else ''),
+            'Renew or replace them before they lapse: ' + ', '.join(d.title for d in (expired + expiring)[:5]),
+            len(expiring) + len(expired), 'documents', 35 + 15 * len(expired) + 8 * len([d for d in expiring if d.expires_at <= now + timedelta(days=7)]),
+            1.0, expired + expiring)
+    overdue = [d for d in docs if d.next_review_date and d.next_review_date < now]
+    due = [d for d in docs if d.next_review_date and now <= d.next_review_date <= now + timedelta(days=horizon)]
+    if overdue or due:
+        add('compliance_risk', f'{len(overdue)} review(s) overdue, {len(due)} due in the next {horizon} days',
+            'Documents past their review date are a common audit finding: ' + ', '.join(d.title for d in (overdue + due)[:5]),
+            len(overdue) + len(due), 'documents', 30 + 12 * len(overdue), 1.0, overdue + due)
+    stuck = [d for d in docs if (d.status or '') in ('pending_approval', 'in_review', 'review', 'submitted', 'pending')
+             and d.updated_at and d.updated_at < now - timedelta(days=7)]
+    if stuck:
+        add('approval_bottleneck', f'{len(stuck)} document(s) waiting for approval for more than 7 days',
+            'Remind the approvers or reassign the step: ' + ', '.join(d.title for d in stuck[:5]), len(stuck), 'documents',
+            40 + 8 * len(stuck), 1.0, stuck)
+    vol = _dm_forecast(user, 'document_volume', horizon)
+    add('document_volume', f'About {round(vol["summary"]["total_predicted"])} new document(s) expected in the next {horizon} days',
+        f'Trend from the last 90 days ({vol["summary"]["trend_percent"]:+.0f}% against the last 30 days).',
+        vol['summary']['total_predicted'], 'documents', 10, vol['summary']['fit_quality'], [])
+    db.session.commit()
+    return out
+
+
+def _dm_backtest(user, ptype='document_volume'):
+    hist, _ = _dm_daily(user, ptype, 90)
+    vals = [hist[d] for d in sorted(hist)]
+    train, test = vals[-74:-14], vals[-14:]
+    if sum(train) == 0 and sum(test) == 0:
+        return None
+    slope, icpt, _sd = _dm_fit(train)
+    pred = [max(0.0, icpt + slope * (len(train) + i)) for i in range(len(test))]
+    total = sum(test)
+    if total == 0:
+        return None
+    wape = sum(abs(a - b) for a, b in zip(test, pred)) / total
+    return round(max(0.0, 1 - wape), 3)
+
+
+# ---------------------------------------------------------------- outgoing events (webhooks, Slack, Teams, Zapier, Make)
+DM_URL_CONNECTORS = {'webhook', 'slack', 'teams', 'zapier', 'make'}
+DM_EVENT_FOR_ACTION = {'create': 'document.created', 'update': 'document.updated', 'new_version': 'document.updated',
+                       'text_edit': 'document.updated', 'pdf_edit': 'document.updated', 'rollback': 'document.updated',
+                       'archive': 'document.deleted', 'delete': 'document.deleted', 'approve': 'document.approved',
+                       'publish': 'document.approved', 'share': 'document.shared'}
+
+
+def _dm_public_https_url(url):
+    """Only https URLs that resolve to public addresses (no internal network calls)."""
+    from urllib.parse import urlparse
+    try:
+        u = urlparse(str(url or '').strip())
+    except Exception:
+        return False, 'The address is not valid'
+    if u.scheme != 'https' or not u.hostname:
+        return False, 'The address must start with https://'
+    try:
+        infos = _dm_socket.getaddrinfo(u.hostname, u.port or 443, proto=_dm_socket.IPPROTO_TCP)
+    except Exception:
+        return False, 'The address could not be found'
+    for info in infos:
+        ip = _dm_ipaddress.ip_address(info[4][0])
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast or ip.is_unspecified:
+            return False, 'The address points to a private network'
+    return True, None
+
+
+def _dm_post(url, payload, secret=None, timeout=8):
+    ok, why = _dm_public_https_url(url)
+    if not ok:
+        return False, why
+    body = json.dumps(payload).encode()
+    headers = {'Content-Type': 'application/json', 'User-Agent': 'SafeTrack-Webhooks/1.0'}
+    if secret:
+        headers['X-SafeTrack-Signature'] = 'sha256=' + _dm_hmac.new(str(secret).encode(), body, _dm_hashlib.sha256).hexdigest()
+    try:
+        r = requests.post(url, data=body, headers=headers, timeout=timeout, allow_redirects=False)
+        if 200 <= r.status_code < 300:
+            return True, f'Delivered (HTTP {r.status_code})'
+        return False, f'The receiver answered HTTP {r.status_code}'
+    except Exception as e:
+        return False, f'Could not deliver: {str(e)[:120]}'
+
+
+def _dm_connector_payload(kind, event, doc, actor_name):
+    text = f"{event.replace('document.', 'Document ').replace('_', ' ')}: \"{doc.get('title')}\" (v{doc.get('version')}, {doc.get('status')}) by {actor_name or 'someone'}"
+    if kind in ('slack', 'teams'):
+        return {'text': text}
+    return {'event': event, 'document': doc, 'actor': actor_name, 'sent_at': datetime.utcnow().isoformat() + 'Z', 'source': 'SafeTrack Pro Global'}
+
+
+def _dm_emit_event(document_id, user_id, action):
+    """Send a document event to the company's webhooks and URL connectors (background thread, never raises)."""
+    event = DM_EVENT_FOR_ACTION.get(action)
+    if not event:
+        return
+
+    def run():
+        try:
+            with app.app_context():
+                d = _DmDoc.query.get(document_id)
+                if not d or not d.company_id:
+                    return
+                u = _DmUser.query.get(user_id) if user_id else None
+                doc = {'id': d.id, 'title': d.title, 'type': d.document_type, 'status': d.status, 'version': d.version}
+                for wh in _DmWebhook.query.filter_by(company_id=d.company_id, enabled=True).all():
+                    try:
+                        evs = json.loads(wh.events or '[]')
+                    except Exception:
+                        evs = []
+                    if evs and event not in evs:
+                        continue
+                    ok, _m = _dm_post(wh.url, _dm_connector_payload('webhook', event, doc, getattr(u, 'name', None)), wh.secret)
+                    if ok:
+                        wh.last_triggered_at = datetime.utcnow()
+                        wh.trigger_count = (wh.trigger_count or 0) + 1
+                for it in _DmIntegration.query.filter_by(company_id=d.company_id, status='connected').all():
+                    if it.integration_id not in DM_URL_CONNECTORS:
+                        continue
+                    try:
+                        cfg = json.loads(it.config or '{}')
+                    except Exception:
+                        cfg = {}
+                    if cfg.get('events') and event not in cfg['events']:
+                        continue
+                    ok, _m = _dm_post(cfg.get('url'), _dm_connector_payload(it.integration_id, event, doc, getattr(u, 'name', None)), cfg.get('secret'))
+                    if ok:
+                        it.last_sync_at = datetime.utcnow()
+                        it.documents_synced = (it.documents_synced or 0) + 1
+                db.session.commit()
+        except Exception as e:
+            logger.warning(f'document event delivery failed: {e}')
+    _dm_threading.Thread(target=run, daemon=True).start()
+
+
+# ---------------------------------------------------------------- report builder
+DM_REPORT_SOURCES = ('documents', 'users', 'activity', 'incidents', 'compliance')
+
+
+def _dm_report_rows(user, source):
+    cid = user.company_id
+    if source == 'documents':
+        names = {u.id: u.name for u in _DmUser.query.filter_by(company_id=cid).all()} if cid else {}
+        return [{'id': d.id, 'title': d.title, 'document_type': d.document_type, 'module': d.module, 'status': d.status,
+                 'priority': d.priority, 'created_at': d.created_at, 'updated_at': d.updated_at,
+                 'created_by': names.get(d.created_by, d.created_by), 'file_size': d.file_size or 0, 'version': d.version or 1}
+                for d in _dm_company_docs(user).limit(5000).all()]
+    if source == 'users':
+        if not cid:
+            return []
+        counts = dict(_DmDoc.query.filter(_DmDoc.company_id == cid).with_entities(_DmDoc.created_by, func.count(_DmDoc.id))
+                      .group_by(_DmDoc.created_by).all())
+        return [{'name': u.name, 'email': u.email, 'department': getattr(u, 'department', None), 'role': u.role or u.user_type,
+                 'last_login': u.last_activity, 'documents_count': counts.get(u.id, 0)}
+                for u in _DmUser.query.filter_by(company_id=cid).limit(5000).all()]
+    if source == 'activity':
+        docs = {d.id: d.title for d in _dm_company_docs(user).with_entities(_DmDoc.id, _DmDoc.title).all()}
+        if not docs:
+            return []
+        names = {u.id: u.name for u in _DmUser.query.filter_by(company_id=cid).all()} if cid else {}
+        return [{'action': e.action, 'user': names.get(e.user_id, e.user_id), 'document_id': docs.get(e.document_id, e.document_id),
+                 'timestamp': e.created_at, 'ip_address': e.ip_address, 'duration': None}
+                for e in _DmAudit.query.filter(_DmAudit.document_id.in_(list(docs))).order_by(_DmAudit.created_at.desc()).limit(5000).all()]
+    if source == 'incidents':
+        if not cid:
+            return []
+        return [{'incident_number': i.incident_number, 'type': i.incident_type, 'severity': i.severity,
+                 'date_occurred': i.date_occurred, 'department': getattr(i, 'department', None)}
+                for i in _DmIncident.query.filter_by(company_id=cid).limit(5000).all()]
+    if source == 'compliance':
+        if not cid:
+            return []
+        return [{'framework': a.framework_id, 'requirement': a.requirement, 'status': a.status, 'score': a.score,
+                 'assessed_at': a.last_assessed} for a in _DmAssessment.query.filter_by(company_id=cid).limit(5000).all()]
+    return []
+
+
+def _dm_cmp(v, op, target):
+    if isinstance(v, datetime):
+        v = v.isoformat()
+    sv, st = ('' if v is None else str(v)).lower(), ('' if target is None else str(target)).lower()
+    try:
+        fv, ft = float(v), float(target)
+        num = True
+    except (TypeError, ValueError):
+        num = False
+    if op == 'equals':
+        return (fv == ft) if num else sv == st
+    if op == 'not_equals':
+        return (fv != ft) if num else sv != st
+    if op == 'contains':
+        return st in sv
+    if op == 'not_contains':
+        return st not in sv
+    if op == 'greater_than':
+        return (fv > ft) if num else sv > st
+    if op == 'less_than':
+        return (fv < ft) if num else sv < st
+    if op == 'in':
+        items = target if isinstance(target, list) else str(target).split(',')
+        return sv in [str(x).strip().lower() for x in items]
+    if op == 'between':
+        rng = target if isinstance(target, list) else str(target).split(',')
+        if len(rng) == 2:
+            lo, hi = (str(x).strip().lower() for x in rng)
+            try:
+                return float(lo) <= float(v) <= float(hi)
+            except (TypeError, ValueError):
+                return lo <= sv <= hi
+    return True
+
+
+def _dm_run_report(user, cfg):
+    source = cfg.get('data_source') if cfg.get('data_source') in DM_REPORT_SOURCES else 'documents'
+    rows = _dm_report_rows(user, source)
+    for f in cfg.get('filters') or []:
+        if isinstance(f, dict) and f.get('field'):
+            rows = [r for r in rows if _dm_cmp(r.get(f['field']), f.get('operator', 'equals'), f.get('value'))]
+    fields = [f for f in (cfg.get('fields') or []) if isinstance(f, dict) and f.get('id')]
+    group = [g if isinstance(g, str) else (g or {}).get('id') for g in (cfg.get('group_by') or [])]
+    group = [g for g in group if g] or ([cfg['chart_config']['groupBy']] if isinstance(cfg.get('chart_config'), dict) and cfg['chart_config'].get('groupBy') else [])
+    if group:
+        buckets = {}
+        for r in rows:
+            buckets.setdefault(tuple(str(r.get(g)) if r.get(g) is not None else '(blank)' for g in group), []).append(r)
+        out = []
+        for key, items in buckets.items():
+            row = dict(zip(group, key))
+            for f in fields:
+                if f['id'] in group:
+                    continue
+                vals = [x.get(f['id']) for x in items if x.get(f['id']) is not None]
+                agg = f.get('aggregation') or 'count'
+                nums = []
+                for v in vals:
+                    try:
+                        nums.append(float(v))
+                    except (TypeError, ValueError):
+                        pass
+                if agg == 'sum':
+                    row[f['id']] = round(sum(nums), 2)
+                elif agg == 'avg':
+                    row[f['id']] = round(sum(nums) / len(nums), 2) if nums else 0
+                elif agg in ('min', 'max'):
+                    pool = nums if nums else [str(v) for v in vals]
+                    row[f['id']] = (min if agg == 'min' else max)(pool) if pool else None
+                elif agg == 'distinct':
+                    row[f['id']] = len({str(v) for v in vals})
+                else:
+                    row[f['id']] = len(vals) if vals else len(items)
+            out.append(row)
+        rows = out
+    elif fields:
+        ids = [f['id'] for f in fields]
+        rows = [{k: r.get(k) for k in ids} for r in rows]
+    for s in reversed(cfg.get('sort_by') or []):
+        fld = s if isinstance(s, str) else (s or {}).get('field') or (s or {}).get('id')
+        desc = isinstance(s, dict) and str(s.get('direction') or s.get('order') or '').lower() in ('desc', 'descend', 'descending')
+        if fld:
+            rows.sort(key=lambda r: (r.get(fld) is None, str(r.get(fld)) if not isinstance(r.get(fld), (int, float)) else r.get(fld)), reverse=desc)
+    try:
+        limit = max(1, min(5000, int(cfg.get('limit') or 100)))
+    except (TypeError, ValueError):
+        limit = 100
+    rows = rows[:limit]
+    for r in rows:
+        for k, v in list(r.items()):
+            if isinstance(v, datetime):
+                r[k] = v.isoformat()
+    return {'success': True, 'data': rows, 'rows': rows, 'total': len(rows), 'data_source': source}
+
+
+def _dm_export_rows(rows, fmt, name):
+    rows = [r for r in (rows or []) if isinstance(r, dict)][:20000]
+    cols = list(dict.fromkeys(k for r in rows for k in r))
+    safe = re.sub(r'[^A-Za-z0-9 _.-]', '_', str(name or 'report'))[:80] or 'report'
+    if fmt == 'xlsx':
+        import openpyxl
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = 'Report'
+        ws.append(cols)
+        for r in rows:
+            ws.append([('' if r.get(c) is None else (r.get(c) if isinstance(r.get(c), (int, float)) else str(r.get(c)))) for c in cols])
+        b = _dm_io.BytesIO()
+        wb.save(b)
+        return b.getvalue(), 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', f'{safe}.xlsx'
+    if fmt == 'pdf':
+        head = ''.join(f'<th>{_dm_esc(c)}</th>' for c in cols)
+        body = ''.join('<tr>' + ''.join(f'<td>{_dm_esc(r.get(c))}</td>' for c in cols) + '</tr>' for r in rows[:2000])
+        return _dm_report_pdf(safe, f'<h1>{_dm_esc(name)}</h1><p class="muted">{len(rows)} rows, exported '
+                                     f'{datetime.utcnow().strftime("%d %b %Y %H:%M")} UTC</p><table><tr>{head}</tr>{body}</table>'), 'application/pdf', f'{safe}.pdf'
+    s = _dm_io.StringIO()
+    w = _dm_csv.writer(s)
+    w.writerow(cols)
+    for r in rows:
+        w.writerow(['' if r.get(c) is None else str(r.get(c)) for c in cols])
+    return ('﻿' + s.getvalue()).encode('utf-8'), 'text/csv', f'{safe}.csv'
+
+
+@app.route('/api/dm-documents/watermark/images/<name>', methods=['GET'])
+@jwt_required
+def dm_watermark_image(name):
+    """Serve an uploaded watermark logo to people of the company that uploaded it."""
+    user = request.user
+    m = re.fullmatch(r'([0-9]+)_[0-9a-f]{32}\.png', name or '')
+    if not m or (not check_super_admin() and str(user.company_id or 0) != m.group(1)):
+        return jsonify({'success': False, 'error': 'Not found'}), 404
+    p = os.path.join(_dm_upload_root(), DM_WM_DIR, name)
+    if not os.path.isfile(p):
+        return jsonify({'success': False, 'error': 'Not found'}), 404
+    return send_file(p, mimetype='image/png', max_age=3600)
+
+
+@app.route('/api/dm-documents/<int:document_id>/watermark/download', methods=['GET'])
+@jwt_required
+def dm_download_watermarked(document_id):
+    """The document as a PDF with its saved watermark stamped on every page."""
+    user = request.user
+    d = _DmDoc.query.get(document_id)
+    if not d or not _user_can_access_document(user, d, check_super_admin()):
+        return jsonify({'success': False, 'error': 'Document not found'}), 404
+    wm = _DmWm.query.filter_by(document_id=document_id).first()
+    if not wm:
+        return jsonify({'success': False, 'error': 'Save a watermark for this document first'}), 400
+    try:
+        data = _dm_document_pdf_bytes(d)
+        if not data:
+            return jsonify({'success': False, 'error': 'Only PDF, image or editor documents can be watermarked'}), 400
+        out = _dm_watermark_pdf(data, _dm_wm_opts(wm), user)
+    except Exception as e:
+        logger.error(f'watermark download failed: {e}')
+        return jsonify({'success': False, 'error': 'The watermark could not be applied to this file'}), 500
+    try:
+        create_audit_log(document_id=d.id, user_id=user.id, action='download', details={'watermarked': True})
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+    base = os.path.splitext(d.file_name or d.title or 'document')[0]
+    return send_file(_dm_io.BytesIO(out), mimetype='application/pdf', as_attachment=True, download_name=f'{base} (watermarked).pdf')
+
+
+def _dm_user_or_401():
+    user = getattr(request, 'user', None)
+    if not user:
+        return None, (jsonify({'success': False, 'error': 'Not authenticated'}), 401)
+    return user, None
+
+
+def _dm_plan_ok(user, allowed):
+    if check_super_admin():
+        return True
+    return (resolve_effective_plan(user).get('plan') or 'free').lower() in allowed
+
+
+# =====================================================================
+# DOCUMENT CONTROL PLUS (2026-11-27)
+#   Read & acknowledge (with optional quiz), numbered controlled copies, point-of-use QR codes, change requests.
+#   Tables: sql/2026-11-27_document_control_plus.sql (auto migration).
+# =====================================================================
+class DocReadRequest(db.Model):
+    __tablename__ = 'doc_read_requests'
+    __table_args__ = {'extend_existing': True}
+    id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, nullable=True, index=True)
+    document_id = db.Column(db.Integer, nullable=False, index=True)
+    document_version = db.Column(db.Integer, nullable=False, default=1)
+    message = db.Column(db.Text)
+    due_date = db.Column(db.DateTime)
+    quiz = db.Column(db.Text)                      # JSON [{question, options[], answer}]
+    pass_mark = db.Column(db.Integer, nullable=False, default=80)
+    status = db.Column(db.String(20), nullable=False, default='open')
+    created_by = db.Column(db.Integer)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+
+class DocReadAssignment(db.Model):
+    __tablename__ = 'doc_read_assignments'
+    __table_args__ = {'extend_existing': True}
+    id = db.Column(db.Integer, primary_key=True)
+    request_id = db.Column(db.Integer, nullable=False, index=True)
+    user_id = db.Column(db.Integer, nullable=False, index=True)
+    status = db.Column(db.String(20), nullable=False, default='pending')   # pending | acknowledged
+    attempts = db.Column(db.Integer, nullable=False, default=0)
+    quiz_score = db.Column(db.Integer)
+    acknowledged_at = db.Column(db.DateTime)
+    ip_address = db.Column(db.String(64))
+    reminded_at = db.Column(db.DateTime)
+
+
+class DocControlledCopy(db.Model):
+    __tablename__ = 'doc_controlled_copies'
+    __table_args__ = {'extend_existing': True}
+    id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, nullable=True, index=True)
+    document_id = db.Column(db.Integer, nullable=False, index=True)
+    document_version = db.Column(db.Integer, nullable=False, default=1)
+    copy_number = db.Column(db.Integer, nullable=False)
+    holder = db.Column(db.String(255), nullable=False)
+    holder_user_id = db.Column(db.Integer)
+    location = db.Column(db.String(255))
+    purpose = db.Column(db.String(255))
+    status = db.Column(db.String(20), nullable=False, default='issued')    # issued | withdrawn
+    issued_by = db.Column(db.Integer)
+    issued_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    withdrawn_by = db.Column(db.Integer)
+    withdrawn_at = db.Column(db.DateTime)
+    note = db.Column(db.Text)
+
+
+class DocQrLink(db.Model):
+    __tablename__ = 'doc_qr_links'
+    __table_args__ = {'extend_existing': True}
+    id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, nullable=True, index=True)
+    document_id = db.Column(db.Integer, nullable=False, index=True)
+    token = db.Column(db.String(40), nullable=False, unique=True, index=True)
+    label = db.Column(db.String(255))
+    scans = db.Column(db.Integer, nullable=False, default=0)
+    active = db.Column(db.Boolean, nullable=False, default=True)
+    created_by = db.Column(db.Integer)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+
+class DocChangeRequest(db.Model):
+    __tablename__ = 'doc_change_requests'
+    __table_args__ = {'extend_existing': True}
+    id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, nullable=True, index=True)
+    document_id = db.Column(db.Integer, nullable=False, index=True)
+    number = db.Column(db.String(40), nullable=False)
+    title = db.Column(db.String(255), nullable=False)
+    reason = db.Column(db.Text, nullable=False)
+    proposed_change = db.Column(db.Text)
+    priority = db.Column(db.String(20), nullable=False, default='normal')
+    status = db.Column(db.String(20), nullable=False, default='open')     # open | approved | rejected | implemented
+    requested_by = db.Column(db.Integer)
+    requested_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    decided_by = db.Column(db.Integer)
+    decided_at = db.Column(db.DateTime)
+    decision_note = db.Column(db.Text)
+    implemented_version = db.Column(db.Integer)
+    implemented_at = db.Column(db.DateTime)
+
+
+def _dcp_doc_or_404(document_id, user):
+    d = _DmDoc.query.get(document_id) if document_id else None
+    if not d or not _user_can_access_document(user, d, check_super_admin()):
+        return None
+    return d
+
+
+def _dcp_staff(user):
+    return check_super_admin() or _rc_staff(user)
+
+
+def _dcp_name(uid, cache={}):  # noqa: B006 (small per-process cache of names)
+    if not uid:
+        return None
+    if uid not in cache:
+        u = _DmUser.query.get(uid)
+        cache[uid] = getattr(u, 'name', None)
+        if len(cache) > 2000:
+            cache.clear()
+    return cache.get(uid)
+
+
+def _dcp_notify(user_ids, title, msg, url):
+    for uid in set(user_ids):
+        try:
+            create_notification(uid, title, msg, type='info', priority='medium', action_url=url, expires_in_hours=24 * 30)
+        except Exception:
+            db.session.rollback()
+
+
+def _dcp_front():
+    return (app.config.get('FRONTEND_URL') or os.environ.get('FRONTEND_URL') or 'https://safetrackproglobal.com').rstrip('/')
+
+
+def _dcp_clean_quiz(raw):
+    out = []
+    for q in (raw or [])[:20]:
+        if not isinstance(q, dict):
+            continue
+        question = str(q.get('question') or '').strip()[:300]
+        options = [str(o).strip()[:200] for o in (q.get('options') or []) if str(o).strip()][:6]
+        try:
+            answer = int(q.get('answer'))
+        except (TypeError, ValueError):
+            answer = -1
+        if question and len(options) >= 2 and 0 <= answer < len(options):
+            out.append({'question': question, 'options': options, 'answer': answer})
+    return out
+
+
+# ---------------------------------------------------------------- read & acknowledge
+@app.route('/api/doc-control/people', methods=['GET'])
+@jwt_required
+def dcp_people():
+    """Active people in the user's company (for assigning required reading). Staff only."""
+    user = request.user
+    if not _dcp_staff(user) or not user.company_id:
+        return jsonify({'success': False, 'error': 'Not allowed'}), 403
+    rows = _DmUser.query.filter(_DmUser.company_id == user.company_id).order_by(_DmUser.name).limit(3000).all()
+    return jsonify({'success': True, 'data': [{'id': u.id, 'name': u.name, 'role': (u.role or u.user_type or '').replace('_', ' ')}
+                                              for u in rows if getattr(u, 'is_active', True) is not False]})
+
+
+@app.route('/api/doc-control/read-requests', methods=['POST'])
+@jwt_required
+def dcp_create_read_request():
+    user = request.user
+    if not _dcp_staff(user):
+        return jsonify({'success': False, 'error': 'Only safety staff and managers can assign reading'}), 403
+    data = request.get_json(silent=True) or {}
+    d = _dcp_doc_or_404(data.get('document_id'), user)
+    if not d:
+        return jsonify({'success': False, 'error': 'Document not found'}), 404
+    ids = set()
+    if data.get('everyone'):
+        ids = {u.id for u in _DmUser.query.filter(_DmUser.company_id == user.company_id).all() if getattr(u, 'is_active', True) is not False}
+    for uid in (data.get('user_ids') or [])[:2000]:
+        try:
+            ids.add(int(uid))
+        except (TypeError, ValueError):
+            pass
+    valid = {u.id for u in _DmUser.query.filter(_DmUser.id.in_(ids), _DmUser.company_id == user.company_id).all()} if ids else set()
+    if not valid:
+        return jsonify({'success': False, 'error': 'Choose at least one person from your company'}), 400
+    quiz = _dcp_clean_quiz(data.get('quiz'))
+    due = None
+    if data.get('due_date'):
+        try:
+            due = datetime.fromisoformat(str(data['due_date']).replace('Z', '')[:19])
+        except ValueError:
+            return jsonify({'success': False, 'error': 'Due date is not valid'}), 400
+    try:
+        pass_mark = max(0, min(100, int(data.get('pass_mark', 80))))
+    except (TypeError, ValueError):
+        pass_mark = 80
+    req = DocReadRequest(company_id=user.company_id, document_id=d.id, document_version=d.version or 1,
+                         message=str(data.get('message') or '')[:2000] or None, due_date=due, quiz=json.dumps(quiz) if quiz else None,
+                         pass_mark=pass_mark, created_by=user.id)
+    db.session.add(req)
+    db.session.flush()
+    for uid in valid:
+        db.session.add(DocReadAssignment(request_id=req.id, user_id=uid))
+    db.session.commit()
+    _dcp_notify(valid, 'Required reading', f'Please read and acknowledge "{d.title}" (version {d.version or 1})'
+                + (f' by {due.strftime("%d %b %Y")}' if due else '') + '.', '/document-management?tab=reading')
+    return jsonify({'success': True, 'request_id': req.id, 'assigned': len(valid), 'quiz_questions': len(quiz)}), 201
+
+
+def _dcp_request_dict(r, counts=True):
+    d = _DmDoc.query.get(r.document_id)
+    out = {'id': r.id, 'document_id': r.document_id, 'document_title': d.title if d else None, 'document_version': r.document_version,
+           'current_version': d.version if d else None, 'message': r.message, 'status': r.status,
+           'due_date': r.due_date.isoformat() if r.due_date else None, 'pass_mark': r.pass_mark,
+           'quiz_questions': len(json.loads(r.quiz)) if r.quiz else 0, 'created_by': _dcp_name(r.created_by),
+           'created_at': r.created_at.isoformat() if r.created_at else None}
+    if counts:
+        rows = DocReadAssignment.query.filter_by(request_id=r.id).all()
+        done = sum(1 for a in rows if a.status == 'acknowledged')
+        out.update({'assigned': len(rows), 'acknowledged': done,
+                    'overdue': sum(1 for a in rows if a.status != 'acknowledged' and r.due_date and r.due_date < datetime.utcnow()),
+                    'percent': round(100 * done / len(rows)) if rows else 0})
+    return out
+
+
+@app.route('/api/doc-control/read-requests', methods=['GET'])
+@jwt_required
+def dcp_list_read_requests():
+    user = request.user
+    if not _dcp_staff(user):
+        return jsonify({'success': False, 'error': 'Not allowed'}), 403
+    q = DocReadRequest.query.filter_by(company_id=user.company_id)
+    if request.args.get('document_id'):
+        q = q.filter_by(document_id=request.args.get('document_id', type=int))
+    return jsonify({'success': True, 'data': [_dcp_request_dict(r) for r in q.order_by(DocReadRequest.id.desc()).limit(200).all()]})
+
+
+@app.route('/api/doc-control/read-requests/<int:rid>', methods=['GET'])
+@jwt_required
+def dcp_read_request_detail(rid):
+    user = request.user
+    r = DocReadRequest.query.get(rid)
+    if not r or r.company_id != user.company_id or not _dcp_staff(user):
+        return jsonify({'success': False, 'error': 'Not found'}), 404
+    people = [{'user_id': a.user_id, 'name': _dcp_name(a.user_id), 'status': a.status, 'attempts': a.attempts, 'quiz_score': a.quiz_score,
+               'acknowledged_at': a.acknowledged_at.isoformat() if a.acknowledged_at else None}
+              for a in DocReadAssignment.query.filter_by(request_id=r.id).all()]
+    return jsonify({'success': True, 'data': {**_dcp_request_dict(r), 'people': sorted(people, key=lambda p: (p['status'] == 'acknowledged', p['name'] or ''))}})
+
+
+@app.route('/api/doc-control/read-requests/<int:rid>/remind', methods=['POST'])
+@jwt_required
+def dcp_read_request_remind(rid):
+    user = request.user
+    r = DocReadRequest.query.get(rid)
+    if not r or r.company_id != user.company_id or not _dcp_staff(user):
+        return jsonify({'success': False, 'error': 'Not found'}), 404
+    pending = DocReadAssignment.query.filter_by(request_id=r.id, status='pending').all()
+    d = _DmDoc.query.get(r.document_id)
+    for a in pending:
+        a.reminded_at = datetime.utcnow()
+    db.session.commit()
+    _dcp_notify([a.user_id for a in pending], 'Reminder: required reading', f'Please read and acknowledge "{d.title if d else "a document"}".',
+                '/document-management?tab=reading')
+    return jsonify({'success': True, 'reminded': len(pending)})
+
+
+@app.route('/api/doc-control/my-reading', methods=['GET'])
+@jwt_required
+def dcp_my_reading():
+    user = request.user
+    out = []
+    rows = (db.session.query(DocReadAssignment, DocReadRequest).join(DocReadRequest, DocReadRequest.id == DocReadAssignment.request_id)
+            .filter(DocReadAssignment.user_id == user.id, DocReadRequest.status == 'open')
+            .order_by(DocReadAssignment.status.desc(), DocReadRequest.due_date).limit(200).all())
+    for a, r in rows:
+        d = _DmDoc.query.get(r.document_id)
+        quiz = json.loads(r.quiz) if r.quiz else []
+        out.append({'assignment_id': a.id, 'status': a.status, 'document_id': r.document_id, 'document_title': d.title if d else None,
+                    'document_version': r.document_version, 'message': r.message, 'due_date': r.due_date.isoformat() if r.due_date else None,
+                    'pass_mark': r.pass_mark, 'attempts': a.attempts, 'quiz_score': a.quiz_score,
+                    'acknowledged_at': a.acknowledged_at.isoformat() if a.acknowledged_at else None,
+                    'quiz': [{'question': q['question'], 'options': q['options']} for q in quiz]})
+    return jsonify({'success': True, 'data': out, 'pending': sum(1 for x in out if x['status'] == 'pending')})
+
+
+@app.route('/api/doc-control/my-reading/<int:aid>/acknowledge', methods=['POST'])
+@jwt_required
+def dcp_acknowledge(aid):
+    user = request.user
+    a = DocReadAssignment.query.get(aid)
+    if not a or a.user_id != user.id:
+        return jsonify({'success': False, 'error': 'Not found'}), 404
+    if a.status == 'acknowledged':
+        return jsonify({'success': True, 'status': 'acknowledged', 'quiz_score': a.quiz_score})
+    r = DocReadRequest.query.get(a.request_id)
+    data = request.get_json(silent=True) or {}
+    if not data.get('confirm'):
+        return jsonify({'success': False, 'error': 'Tick "I have read and understood this document" to continue'}), 400
+    quiz = json.loads(r.quiz) if r.quiz else []
+    score = None
+    if quiz:
+        answers = data.get('answers') or []
+        right = sum(1 for i, q in enumerate(quiz) if i < len(answers) and str(answers[i]) == str(q['answer']))
+        score = round(100 * right / len(quiz))
+        a.attempts = (a.attempts or 0) + 1
+        a.quiz_score = score
+        if score < r.pass_mark:
+            db.session.commit()
+            return jsonify({'success': False, 'passed': False, 'quiz_score': score, 'pass_mark': r.pass_mark,
+                            'error': f'You scored {score}%. {r.pass_mark}% is needed. Read the document again and retry.'}), 200
+    a.status, a.acknowledged_at = 'acknowledged', datetime.utcnow()
+    a.ip_address = (request.headers.get('X-Forwarded-For', request.remote_addr) or '').split(',')[0][:64]
+    try:
+        create_audit_log(document_id=r.document_id, user_id=user.id, action='acknowledge',
+                         details={'version': r.document_version, 'quiz_score': score})
+    except Exception:
+        pass
+    db.session.commit()
+    return jsonify({'success': True, 'passed': True, 'status': 'acknowledged', 'quiz_score': score})
+
+
+# ---------------------------------------------------------------- controlled copies
+def _dcp_copy_dict(c, doc):
+    superseded = bool(doc and (doc.version or 1) > (c.document_version or 1) and c.status == 'issued')
+    return {'id': c.id, 'document_id': c.document_id, 'copy_number': c.copy_number, 'holder': c.holder, 'location': c.location,
+            'purpose': c.purpose, 'document_version': c.document_version, 'current_version': doc.version if doc else None,
+            'status': 'superseded' if superseded else c.status, 'needs_withdrawal': superseded,
+            'issued_by': _dcp_name(c.issued_by), 'issued_at': c.issued_at.isoformat() if c.issued_at else None,
+            'withdrawn_at': c.withdrawn_at.isoformat() if c.withdrawn_at else None, 'note': c.note}
+
+
+@app.route('/api/doc-control/documents/<int:document_id>/controlled-copies', methods=['GET'])
+@jwt_required
+def dcp_list_copies(document_id):
+    user = request.user
+    d = _dcp_doc_or_404(document_id, user)
+    if not d:
+        return jsonify({'success': False, 'error': 'Document not found'}), 404
+    rows = DocControlledCopy.query.filter_by(document_id=d.id).order_by(DocControlledCopy.copy_number).all()
+    return jsonify({'success': True, 'data': [_dcp_copy_dict(c, d) for c in rows]})
+
+
+@app.route('/api/doc-control/controlled-copies', methods=['GET'])
+@jwt_required
+def dcp_all_copies():
+    """Copy register for the whole company, superseded copies first."""
+    user = request.user
+    if not user.company_id:
+        return jsonify({'success': True, 'data': []})
+    rows = DocControlledCopy.query.filter_by(company_id=user.company_id).order_by(DocControlledCopy.issued_at.desc()).limit(1000).all()
+    docs = {d.id: d for d in _DmDoc.query.filter(_DmDoc.id.in_({c.document_id for c in rows})).all()} if rows else {}
+    out = [{**_dcp_copy_dict(c, docs.get(c.document_id)), 'document_title': getattr(docs.get(c.document_id), 'title', None)} for c in rows]
+    out.sort(key=lambda x: (not x['needs_withdrawal'], x['status'] != 'issued'))
+    return jsonify({'success': True, 'data': out, 'needs_withdrawal': sum(1 for x in out if x['needs_withdrawal'])})
+
+
+@app.route('/api/doc-control/documents/<int:document_id>/controlled-copies', methods=['POST'])
+@jwt_required
+def dcp_issue_copy(document_id):
+    user = request.user
+    if not _dcp_staff(user):
+        return jsonify({'success': False, 'error': 'Only safety staff and managers can issue controlled copies'}), 403
+    d = _dcp_doc_or_404(document_id, user)
+    if not d:
+        return jsonify({'success': False, 'error': 'Document not found'}), 404
+    data = request.get_json(silent=True) or {}
+    holder = str(data.get('holder') or '').strip()[:255]
+    if not holder:
+        return jsonify({'success': False, 'error': 'Who holds this copy? (person, team or location)'}), 400
+    last = db.session.query(func.max(DocControlledCopy.copy_number)).filter(DocControlledCopy.document_id == d.id).scalar() or 0
+    c = DocControlledCopy(company_id=d.company_id, document_id=d.id, document_version=d.version or 1, copy_number=last + 1, holder=holder,
+                          location=str(data.get('location') or '')[:255] or None, purpose=str(data.get('purpose') or '')[:255] or None,
+                          issued_by=user.id)
+    db.session.add(c)
+    db.session.commit()
+    return jsonify({'success': True, 'data': _dcp_copy_dict(c, d)}), 201
+
+
+@app.route('/api/doc-control/controlled-copies/<int:cid>/withdraw', methods=['POST'])
+@jwt_required
+def dcp_withdraw_copy(cid):
+    user = request.user
+    c = DocControlledCopy.query.get(cid)
+    d = _dcp_doc_or_404(c.document_id, user) if c else None
+    if not c or not d or not _dcp_staff(user):
+        return jsonify({'success': False, 'error': 'Not found'}), 404
+    c.status, c.withdrawn_by, c.withdrawn_at = 'withdrawn', user.id, datetime.utcnow()
+    c.note = str((request.get_json(silent=True) or {}).get('note') or '')[:1000] or c.note
+    db.session.commit()
+    return jsonify({'success': True, 'data': _dcp_copy_dict(c, d)})
+
+
+def _dcp_qr_png(url, box=6):
+    import qrcode
+    img = qrcode.make(url, box_size=box, border=2)
+    b = _dm_io.BytesIO()
+    img.save(b, format='PNG')
+    return b.getvalue()
+
+
+def _dcp_get_qr(d, user):
+    link = DocQrLink.query.filter_by(document_id=d.id, active=True).first()
+    if not link:
+        link = DocQrLink(company_id=d.company_id, document_id=d.id, token=secrets.token_urlsafe(16)[:22], created_by=user.id,
+                         label=(d.title or '')[:255])
+        db.session.add(link)
+        db.session.commit()
+    return link
+
+
+@app.route('/api/doc-control/controlled-copies/<int:cid>/pdf', methods=['GET'])
+@jwt_required
+def dcp_copy_pdf(cid):
+    """The document stamped "CONTROLLED COPY No. N" with holder, version, date and a QR code to the current version."""
+    import pymupdf as _fz
+    user = request.user
+    c = DocControlledCopy.query.get(cid)
+    d = _dcp_doc_or_404(c.document_id, user) if c else None
+    if not c or not d:
+        return jsonify({'success': False, 'error': 'Not found'}), 404
+    if c.status == 'withdrawn':
+        return jsonify({'success': False, 'error': 'This copy was withdrawn'}), 400
+    if (d.version or 1) > (c.document_version or 1):
+        return jsonify({'success': False, 'error': f'This copy is for version {c.document_version}; the document is now version {d.version}. '
+                                                   'Withdraw it and issue a new copy.'}), 409
+    data = _dm_document_pdf_bytes(d)
+    if not data:
+        return jsonify({'success': False, 'error': 'Only PDF, image or editor documents can be issued as controlled copies'}), 400
+    qr = _dcp_qr_png(f'{_dcp_front()}/d/{_dcp_get_qr(d, user).token}', box=4)
+    company = _DmCompany.query.get(d.company_id) if d.company_id else None
+    pdf = _fz.open(stream=data, filetype='pdf')
+    try:
+        for i, page in enumerate(pdf):
+            vw, vh = page.rect.width, page.rect.height
+            ov = _fz.open()
+            op = ov.new_page(width=vw, height=vh)
+            red = (0.75, 0.05, 0.05)
+            box = _fz.Rect(vw - 230, 12, vw - 12, 70)
+            op.draw_rect(box, color=red, fill=(1, 1, 1), fill_opacity=0.85, width=1.4)
+            op.insert_text((box.x0 + 6, box.y0 + 16), f'CONTROLLED COPY No. {c.copy_number}', fontsize=11, fontname='hebo', color=red)
+            op.insert_text((box.x0 + 6, box.y0 + 30), f'Holder: {c.holder}'[:48], fontsize=7.5, fontname='helv', color=red)
+            op.insert_text((box.x0 + 6, box.y0 + 41), f'Version {c.document_version}  Issued {c.issued_at.strftime("%d %b %Y")}', fontsize=7.5, fontname='helv', color=red)
+            op.insert_text((box.x0 + 6, box.y0 + 52), (company.name if company else '')[:48], fontsize=7, fontname='helv', color=red)
+            op.insert_image(_fz.Rect(box.x1 - 50, box.y0 + 4, box.x1 - 4, box.y0 + 50), stream=qr)
+            op.insert_text((14, vh - 10), f'Copy {c.copy_number} of "{(d.title or "")[:60]}", page {i + 1} of {pdf.page_count}. '
+                                          'Scan the code to check this is still the current version. Any other printed copy is UNCONTROLLED.',
+                           fontsize=6.5, fontname='helv', color=(0.3, 0.3, 0.3))
+            target = page.rect * page.derotation_matrix
+            target.normalize()
+            page.show_pdf_page(target, ov, 0, rotate=-page.rotation, overlay=True)
+        out = pdf.tobytes(garbage=3, deflate=True)
+    finally:
+        pdf.close()
+    try:
+        create_audit_log(document_id=d.id, user_id=user.id, action='controlled_copy', details={'copy_number': c.copy_number, 'holder': c.holder})
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+    base = re.sub(r'[^A-Za-z0-9 _.-]', '_', os.path.splitext(d.file_name or d.title or 'document')[0])[:80]
+    return send_file(_dm_io.BytesIO(out), mimetype='application/pdf', as_attachment=True,
+                     download_name=f'{base} - controlled copy {c.copy_number}.pdf')
+
+
+# ---------------------------------------------------------------- point-of-use QR codes
+@app.route('/api/doc-control/documents/<int:document_id>/qr', methods=['GET'])
+@jwt_required
+def dcp_qr(document_id):
+    """QR label that always opens the current version (people must sign in; access rules still apply)."""
+    user = request.user
+    d = _dcp_doc_or_404(document_id, user)
+    if not d:
+        return jsonify({'success': False, 'error': 'Document not found'}), 404
+    link = _dcp_get_qr(d, user)
+    url = f'{_dcp_front()}/d/{link.token}'
+    if request.args.get('format') == 'png':
+        return send_file(_dm_io.BytesIO(_dcp_qr_png(url, 10)), mimetype='image/png', download_name=f'qr-document-{d.id}.png')
+    return jsonify({'success': True, 'url': url, 'token': link.token, 'scans': link.scans, 'title': d.title})
+
+
+@app.route('/api/doc-control/qr/<token>', methods=['GET'])
+@jwt_required
+def dcp_qr_resolve(token):
+    user = request.user
+    link = DocQrLink.query.filter_by(token=str(token)[:40], active=True).first()
+    d = _dcp_doc_or_404(link.document_id, user) if link else None
+    if not d:
+        return jsonify({'success': False, 'error': 'This code does not open a document you can see'}), 404
+    link.scans = (link.scans or 0) + 1
+    try:
+        create_audit_log(document_id=d.id, user_id=user.id, action='view', details={'via': 'qr'})
+    except Exception:
+        pass
+    db.session.commit()
+    return jsonify({'success': True, 'document_id': d.id, 'title': d.title, 'version': d.version, 'status': d.status,
+                    'updated_at': d.updated_at.isoformat() if d.updated_at else None})
+
+
+# ---------------------------------------------------------------- change requests
+def _dcp_cr_dict(r, doc=None):
+    doc = doc or _DmDoc.query.get(r.document_id)
+    return {'id': r.id, 'number': r.number, 'document_id': r.document_id, 'document_title': doc.title if doc else None,
+            'document_version': doc.version if doc else None, 'title': r.title, 'reason': r.reason, 'proposed_change': r.proposed_change,
+            'priority': r.priority, 'status': r.status, 'requested_by': _dcp_name(r.requested_by), 'requested_by_id': r.requested_by,
+            'requested_at': r.requested_at.isoformat() if r.requested_at else None, 'decided_by': _dcp_name(r.decided_by),
+            'decided_at': r.decided_at.isoformat() if r.decided_at else None, 'decision_note': r.decision_note,
+            'implemented_version': r.implemented_version, 'implemented_at': r.implemented_at.isoformat() if r.implemented_at else None}
+
+
+@app.route('/api/doc-control/change-requests', methods=['POST'])
+@jwt_required
+def dcp_create_cr():
+    """Anyone who can see a document can ask for it to be changed."""
+    user = request.user
+    data = request.get_json(silent=True) or {}
+    d = _dcp_doc_or_404(data.get('document_id'), user)
+    if not d:
+        return jsonify({'success': False, 'error': 'Document not found'}), 404
+    title, reason = str(data.get('title') or '').strip()[:255], str(data.get('reason') or '').strip()[:5000]
+    if not title or not reason:
+        return jsonify({'success': False, 'error': 'Give the request a title and say why the change is needed'}), 400
+    n = DocChangeRequest.query.filter_by(company_id=d.company_id).count() + 1
+    r = DocChangeRequest(company_id=d.company_id, document_id=d.id, number=f'DCR-{datetime.utcnow().year}-{n:04d}', title=title, reason=reason,
+                         proposed_change=str(data.get('proposed_change') or '')[:10000] or None,
+                         priority=data.get('priority') if data.get('priority') in ('low', 'normal', 'high', 'urgent') else 'normal',
+                         requested_by=user.id)
+    db.session.add(r)
+    db.session.commit()
+    owners = {x for x in (d.created_by, d.user_id, getattr(d, 'approved_by', None)) if x and x != user.id}
+    owners |= {u.id for u in _rc_staff_users(d.company_id, exclude=user.id)[:20]}
+    _dcp_notify(owners, f'Change request {r.number}', f'{user.name} asked to change "{d.title}": {title}', '/document-management?tab=change-requests')
+    return jsonify({'success': True, 'data': _dcp_cr_dict(r, d)}), 201
+
+
+@app.route('/api/doc-control/change-requests', methods=['GET'])
+@jwt_required
+def dcp_list_cr():
+    user = request.user
+    q = DocChangeRequest.query.filter_by(company_id=user.company_id) if user.company_id else DocChangeRequest.query.filter_by(requested_by=user.id)
+    if not _dcp_staff(user):
+        q = q.filter_by(requested_by=user.id)
+    if request.args.get('status') in ('open', 'approved', 'rejected', 'implemented'):
+        q = q.filter_by(status=request.args['status'])
+    if request.args.get('document_id'):
+        q = q.filter_by(document_id=request.args.get('document_id', type=int))
+    rows = q.order_by(DocChangeRequest.id.desc()).limit(300).all()
+    return jsonify({'success': True, 'data': [_dcp_cr_dict(r) for r in rows], 'can_decide': _dcp_staff(user)})
+
+
+@app.route('/api/doc-control/change-requests/<int:rid>/decide', methods=['POST'])
+@jwt_required
+def dcp_decide_cr(rid):
+    user = request.user
+    r = DocChangeRequest.query.get(rid)
+    if not r or (r.company_id != user.company_id and not check_super_admin()) or not _dcp_staff(user):
+        return jsonify({'success': False, 'error': 'Not found'}), 404
+    data = request.get_json(silent=True) or {}
+    decision = data.get('decision')
+    if decision not in ('approved', 'rejected', 'implemented'):
+        return jsonify({'success': False, 'error': 'Decision must be approved, rejected or implemented'}), 400
+    if decision == 'implemented' and r.status != 'approved':
+        return jsonify({'success': False, 'error': 'Only an approved request can be marked as done'}), 400
+    if decision in ('approved', 'rejected') and r.status != 'open':
+        return jsonify({'success': False, 'error': f'This request is already {r.status}'}), 400
+    if decision == 'rejected' and not str(data.get('note') or '').strip():
+        return jsonify({'success': False, 'error': 'Say why the request is rejected'}), 400
+    d = _DmDoc.query.get(r.document_id)
+    if decision == 'implemented':
+        r.status, r.implemented_at = 'implemented', datetime.utcnow()
+        r.implemented_version = d.version if d else None
+    else:
+        r.status, r.decided_by, r.decided_at = decision, user.id, datetime.utcnow()
+        r.decision_note = str(data.get('note') or '')[:2000] or None
+    db.session.commit()
+    _dcp_notify([r.requested_by], f'Change request {r.number} {r.status}',
+                f'Your request "{r.title}" was {r.status}' + (f': {r.decision_note}' if r.decision_note and decision != "implemented" else '.'),
+                '/document-management?tab=change-requests')
+    return jsonify({'success': True, 'data': _dcp_cr_dict(r, d)})
+
+
 # =====================================================================================================
 # AUTO MIGRATIONS (2026-11-23)
 # Railway's Data tab appends LIMIT to every query, so CREATE/ALTER statements fail there. Instead the
@@ -168758,7 +170521,7 @@ def hw_chemical_item_route(chem_id):
 #   - a failing statement is logged and the file is retried on the next start
 # Set AUTO_MIGRATE=0 on Railway to switch this off.
 # =====================================================================================================
-AUTO_MIGRATIONS = ('DEPLOY_2026-11-23_FULL.sql', '2026-11-24_company_quotes.sql', '2026-11-25_ready_checks.sql', '2026-11-26_muster_contractors.sql')
+AUTO_MIGRATIONS = ('DEPLOY_2026-11-23_FULL.sql', '2026-11-24_company_quotes.sql', '2026-11-25_ready_checks.sql', '2026-11-26_muster_contractors.sql', '2026-11-27_document_control_plus.sql')
 _MIGRATION_LOCK_KEY = 74230115
 
 
