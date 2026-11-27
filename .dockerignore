@@ -71,3 +71,8 @@ te.py
 download.py
 quick_fix_detections.py
 test_dataset.py
+
+# safety detection model shipped with the app (2026-11-27)
+!detector/
+!detector/safetrack38.pt
+!detector/thresholds.json

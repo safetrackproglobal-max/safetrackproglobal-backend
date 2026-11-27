@@ -1,0 +1,318 @@
+{
+ "Fall-Detected": {
+  "enabled": true,
+  "threshold": 0.317,
+  "pictures": 123,
+  "ap50": 0.778,
+  "precision": 0.653,
+  "recall": 0.797
+ },
+ "Gloves": {
+  "enabled": true,
+  "threshold": 0.423,
+  "pictures": 179,
+  "ap50": 0.892,
+  "precision": 0.81,
+  "recall": 0.87
+ },
+ "Goggles": {
+  "enabled": true,
+  "threshold": 0.374,
+  "pictures": 74,
+  "ap50": 0.829,
+  "precision": 0.687,
+  "recall": 0.88
+ },
+ "Hardhat": {
+  "enabled": true,
+  "threshold": 0.2,
+  "pictures": 509,
+  "ap50": 0.775,
+  "precision": 0.845,
+  "recall": 0.667
+ },
+ "Ladder": {
+  "enabled": true,
+  "threshold": 0.493,
+  "pictures": 100,
+  "ap50": 0.905,
+  "precision": 0.906,
+  "recall": 0.873
+ },
+ "Mask": {
+  "enabled": true,
+  "threshold": 0.249,
+  "pictures": 52,
+  "ap50": 0.687,
+  "precision": 0.717,
+  "recall": 0.786
+ },
+ "NO-Gloves": {
+  "enabled": true,
+  "threshold": 0.326,
+  "pictures": 147,
+  "ap50": 0.838,
+  "precision": 0.795,
+  "recall": 0.788
+ },
+ "NO-Goggles": {
+  "enabled": true,
+  "threshold": 0.322,
+  "pictures": 84,
+  "ap50": 0.853,
+  "precision": 0.725,
+  "recall": 0.826
+ },
+ "NO-Hardhat": {
+  "enabled": true,
+  "threshold": 0.396,
+  "pictures": 141,
+  "ap50": 0.863,
+  "precision": 0.77,
+  "recall": 0.795
+ },
+ "NO-Mask": {
+  "enabled": true,
+  "threshold": 0.379,
+  "pictures": 74,
+  "ap50": 0.733,
+  "precision": 0.71,
+  "recall": 0.752
+ },
+ "NO-Safety Vest": {
+  "enabled": false,
+  "threshold": 0.23,
+  "pictures": 45,
+  "ap50": 0.379,
+  "precision": 0.407,
+  "recall": 0.413
+ },
+ "Person": {
+  "enabled": true,
+  "threshold": 0.378,
+  "pictures": 566,
+  "ap50": 0.904,
+  "precision": 0.898,
+  "recall": 0.884
+ },
+ "Safety Cone": {
+  "enabled": true,
+  "threshold": 0.416,
+  "pictures": 135,
+  "ap50": 0.781,
+  "precision": 0.717,
+  "recall": 0.735
+ },
+ "Safety Vest": {
+  "enabled": true,
+  "threshold": 0.232,
+  "pictures": 156,
+  "ap50": 0.801,
+  "precision": 0.851,
+  "recall": 0.707
+ },
+ "Working-at-Height": {
+  "enabled": false,
+  "threshold": 0.966,
+  "pictures": 1,
+  "ap50": 0.995,
+  "precision": 0.8,
+  "recall": 1.0
+ },
+ "Missing-Harness": {
+  "enabled": false,
+  "threshold": 0.2,
+  "pictures": 7,
+  "ap50": 0.455,
+  "precision": 0.817,
+  "recall": 0.185
+ },
+ "Unsafe-Barricade": {
+  "enabled": false,
+  "reason": "no test pictures"
+ },
+ "Scaffolding": {
+  "enabled": true,
+  "threshold": 0.251,
+  "pictures": 305,
+  "ap50": 0.879,
+  "precision": 0.866,
+  "recall": 0.788
+ },
+ "Scaffolding-Unsafe": {
+  "enabled": false,
+  "threshold": 0.2,
+  "pictures": 4,
+  "ap50": 0.701,
+  "precision": 0.697,
+  "recall": 0.472
+ },
+ "Unsecured-Load": {
+  "enabled": false,
+  "reason": "no test pictures"
+ },
+ "Chemical-Placard": {
+  "enabled": false,
+  "threshold": 0.2,
+  "pictures": 2,
+  "ap50": 0.828,
+  "precision": 0.746,
+  "recall": 0.5
+ },
+ "Chemical-Spill": {
+  "enabled": true,
+  "threshold": 0.509,
+  "pictures": 92,
+  "ap50": 0.884,
+  "precision": 0.953,
+  "recall": 0.833
+ },
+ "Gas-Cylinder": {
+  "enabled": false,
+  "reason": "no test pictures"
+ },
+ "Fire": {
+  "enabled": true,
+  "threshold": 0.33,
+  "pictures": 220,
+  "ap50": 0.821,
+  "precision": 0.793,
+  "recall": 0.744
+ },
+ "Smoke": {
+  "enabled": true,
+  "threshold": 0.287,
+  "pictures": 98,
+  "ap50": 0.65,
+  "precision": 0.682,
+  "recall": 0.667
+ },
+ "Dust-Cloud": {
+  "enabled": false,
+  "reason": "no test pictures"
+ },
+ "Electrical-Hazard": {
+  "enabled": false,
+  "reason": "no test pictures"
+ },
+ "Wet-Floor": {
+  "enabled": false,
+  "threshold": 0.682,
+  "pictures": 13,
+  "ap50": 0.29,
+  "precision": 0.591,
+  "recall": 0.269
+ },
+ "Open-Trench": {
+  "enabled": false,
+  "reason": "no test pictures"
+ },
+ "Excavation-Edge": {
+  "enabled": false,
+  "reason": "no test pictures"
+ },
+ "Spoil-Pile": {
+  "enabled": true,
+  "threshold": 0.582,
+  "pictures": 30,
+  "ap50": 0.874,
+  "precision": 0.831,
+  "recall": 0.855
+ },
+ "Confined-Space-Entry": {
+  "enabled": true,
+  "threshold": 0.2,
+  "pictures": 17,
+  "ap50": 0.648,
+  "precision": 0.608,
+  "recall": 0.647
+ },
+ "Heavy-Machinery": {
+  "enabled": true,
+  "threshold": 0.392,
+  "pictures": 177,
+  "ap50": 0.837,
+  "precision": 0.93,
+  "recall": 0.674
+ },
+ "Aerial-Lift": {
+  "enabled": true,
+  "threshold": 0.34,
+  "pictures": 172,
+  "ap50": 0.877,
+  "precision": 0.847,
+  "recall": 0.803
+ },
+ "Suspended-Load": {
+  "enabled": false,
+  "threshold": 0.227,
+  "pictures": 38,
+  "ap50": 0.194,
+  "precision": 0.215,
+  "recall": 0.162
+ },
+ "Site-Vehicle": {
+  "enabled": true,
+  "threshold": 0.773,
+  "pictures": 37,
+  "ap50": 0.708,
+  "precision": 0.609,
+  "recall": 0.69
+ },
+ "Cluttered-Walkway": {
+  "enabled": false,
+  "threshold": 0.2,
+  "pictures": 5,
+  "ap50": 0.065,
+  "precision": 0.0,
+  "recall": 0.0
+ },
+ "Trailing-Cable": {
+  "enabled": false,
+  "threshold": 0.489,
+  "pictures": 8,
+  "ap50": 0.321,
+  "precision": 0.347,
+  "recall": 0.312
+ },
+ "Safety-Harness": {
+  "enabled": true,
+  "threshold": 0.286,
+  "pictures": 443,
+  "ap50": 0.827,
+  "precision": 0.804,
+  "recall": 0.757
+ },
+ "Lanyard-Hook": {
+  "enabled": false,
+  "threshold": 0.531,
+  "pictures": 7,
+  "ap50": 0.995,
+  "precision": 0.652,
+  "recall": 1.0
+ },
+ "Crane-Hook": {
+  "enabled": false,
+  "threshold": 0.244,
+  "pictures": 28,
+  "ap50": 0.335,
+  "precision": 0.905,
+  "recall": 0.31
+ },
+ "Safety-Shoes": {
+  "enabled": false,
+  "threshold": 0.264,
+  "pictures": 1,
+  "ap50": 0.995,
+  "precision": 0.901,
+  "recall": 1.0
+ },
+ "Construction-Debris": {
+  "enabled": false,
+  "threshold": 0.75,
+  "pictures": 4,
+  "ap50": 0.494,
+  "precision": 0.978,
+  "recall": 0.429
+ }
+}

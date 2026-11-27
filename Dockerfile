@@ -45,6 +45,7 @@ COPY permit_templates.py .
 COPY env_documents.py .
 COPY env_analytics.py .
 COPY sql/ ./sql/
+COPY detector/ ./detector/
 
 RUN mkdir -p uploads detection_results generated_certificates generated_documents sessions static model_cache
 

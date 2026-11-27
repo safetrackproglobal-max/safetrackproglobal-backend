@@ -174938,6 +174938,544 @@ IN_LIBRARY.update({
 })
 
 
+# ============================================================================
+# SAFETY VISION: 43-CLASS DETECTOR + HAZARD REPORT (2026-11-27)
+# ============================================================================
+# Photo / video check with the SafeTrack 43-class model. The report is about what is WRONG or MISSING: boxes are drawn
+# only on hazards (a person without a hard hat, a spill, a person at height with no harness seen, a person next to
+# moving plant ...), never on things that are fine. Every finding has a risk rating, controls in the order of the
+# hierarchy of controls and the standard it relates to. Classes the model was not validated on (thresholds.json
+# "enabled": false) are never reported as facts: strong ones are listed as "possible, please confirm".
+# Model: $SAFETRACK38_MODEL, or <volume>/yolov8/safetrack38.pt (drop a newer model there), or detector/safetrack38.pt.
+# DB: vision_reports -> sql/2026-11-27_vision_reports.sql (auto migration)
+
+
+class VisionReport(db.Model):
+    __tablename__ = 'vision_reports'
+    __table_args__ = {'extend_existing': True}
+    id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id', ondelete='CASCADE'), nullable=True, index=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True, index=True)
+    title = db.Column(db.String(200))
+    location = db.Column(db.String(200))
+    site_type = db.Column(db.String(20))
+    kind = db.Column(db.String(8), nullable=False)                           # image | video
+    source_name = db.Column(db.String(200))
+    findings = db.Column(db.Text)                                            # JSON list
+    summary = db.Column(db.Text)                                             # JSON
+    files = db.Column(db.Text)                                               # JSON: annotated images + original frames on the volume
+    model_version = db.Column(db.String(80))
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+
+VI_SITE_PPE = {      # PPE that must be seen on every person, by type of site (the user can change it per check)
+    'construction': ['hardhat', 'vest'], 'industrial': ['hardhat', 'vest', 'goggles'], 'warehouse': ['vest'],
+    'lab': ['goggles', 'gloves'], 'healthcare': ['mask', 'gloves'], 'office': [],
+}
+VI_PPE = {   # key -> (positive class, negative class, label)
+    'hardhat': ('Hardhat', 'NO-Hardhat', 'hard hat'), 'vest': ('Safety Vest', 'NO-Safety Vest', 'high-visibility vest'),
+    'goggles': ('Goggles', 'NO-Goggles', 'eye protection'), 'gloves': ('Gloves', 'NO-Gloves', 'gloves'),
+    'mask': ('Mask', 'NO-Mask', 'mask / respirator'), 'harness': ('Safety-Harness', 'Missing-Harness', 'harness'),
+}
+# key -> title, category, severity 1-5, controls (hierarchy order), reference
+VI_KB = {
+    'no_hardhat': ('Person without a hard hat', 'PPE', 4, ['Stop and fit a hard hat before re-entering the area', 'Keep overhead work and materials secured (toe boards, nets)', 'Make hard hats mandatory at the site entrance and in the toolbox talk'], 'OSHA 1926.100 / 1910.135 head protection'),
+    'no_vest': ('Person without a high-visibility vest', 'PPE', 3, ['Issue a high-visibility vest', 'Separate people from vehicles with barriers and marked walkways', 'Make hi-vis mandatory where plant or vehicles move'], 'ANSI/ISEA 107 high-visibility apparel; site traffic rules'),
+    'no_goggles': ('Person without eye protection', 'PPE', 3, ['Issue safety glasses or goggles for the task', 'Guard or enclose the source of particles / splashes', 'Mark eye-protection areas'], 'OSHA 1910.133 / 1926.102 eye and face protection'),
+    'no_gloves': ('Person without gloves', 'PPE', 2, ['Issue gloves suited to the hazard (cut, chemical, heat)', 'Use tools that keep hands away from the hazard'], 'OSHA 1910.138 hand protection'),
+    'no_mask': ('Person without a mask / respirator', 'PPE', 3, ['Issue the respirator the assessment requires and check the fit', 'Control dust or fumes at the source (extraction, wet cutting)'], 'OSHA 1910.134 respiratory protection'),
+    'fall_detected': ('Person down / possible fall', 'Emergency', 5, ['Send help now: check the person, call first aid / emergency services', 'Secure the area so nobody else is hurt', 'Report and investigate the incident'], 'OSHA 1910.151 medical services and first aid'),
+    'height_no_harness': ('Work at height with no harness seen', 'Work at height', 5, ['Stop the work until fall protection is in place', 'Use guardrails or a platform with edge protection first', 'Harness clipped to an anchor point where guardrails are not possible'], 'OSHA 1926.501 / 1926.502(d) fall protection; 1926.453 aerial lifts'),
+    'ladder_use': ('Person on or at a ladder', 'Work at height', 3, ['Check the ladder is secured, on firm ground, at about 1 in 4', 'Keep three points of contact; do not overreach', 'Use a platform or mobile tower for longer work'], 'OSHA 1926.1053 ladders'),
+    'near_plant': ('Person close to moving plant or vehicle', 'Plant and vehicles', 4, ['Keep people out of the machine swing / travel zone (exclusion zone)', 'Use barriers, a banksman and marked walkways', 'Make sure the operator can see the person (eye contact rule)'], 'OSHA 1926.600-602 equipment and motor vehicles (struck-by)'),
+    'chemical_spill': ('Chemical spill', 'Chemicals', 4, ['Keep people away; identify the chemical from the label / SDS', 'Contain with the spill kit and stop the source', 'Clean up and dispose as hazardous waste'], 'OSHA 1910.1200 hazard communication; 1910.120 emergency response'),
+    'fire': ('Fire', 'Fire and emergency', 5, ['Raise the alarm and evacuate', 'Fight only small fires with the right extinguisher if trained', 'Investigate the cause before work restarts'], 'OSHA 1910.38 emergency action plan; 1910.157 portable extinguishers'),
+    'smoke': ('Smoke', 'Fire and emergency', 3, ['Find the source; raise the alarm if it is a fire', 'Keep people out of the smoke', 'Check ventilation and hot work controls'], 'OSHA 1910.38 emergency action plan'),
+    'confined_space': ('Confined space entry', 'Confined space', 4, ['Confirm the entry permit, gas test and attendant before entry', 'Ventilate the space and monitor the atmosphere', 'Have a rescue plan and equipment ready'], 'OSHA 1910.146 permit-required confined spaces'),
+    'spoil_pile': ('Spoil pile', 'Excavation', 2, ['Keep spoil at least 0.6 m (2 ft) back from the excavation edge', 'Keep the excavation edge protected'], 'OSHA 1926.651(j)(2)'),
+    'wet_floor': ('Wet or slippery floor', 'Walkways and housekeeping', 3, ['Clean and dry it; put out a wet-floor sign until dry', 'Fix the leak or source', 'Use anti-slip flooring where it keeps happening'], 'OSHA 1910.22 walking-working surfaces'),
+    'cluttered_walkway': ('Blocked or cluttered walkway', 'Walkways and housekeeping', 3, ['Clear the walkway now', 'Give materials a marked storage place', 'Add housekeeping to the daily check'], 'OSHA 1910.22 / 1910.37 exit routes kept clear'),
+    'trailing_cable': ('Trailing cable across the walkway', 'Walkways and housekeeping', 3, ['Re-route the cable overhead or along the wall', 'Use cable covers / ramps where it must cross', 'Check the cable for damage'], 'OSHA 1910.22 walking-working surfaces; 1926.416 electrical'),
+    'unsafe_barricade': ('Missing or unsafe barricade', 'Edges and barriers', 4, ['Put the barrier back / close the gap now', 'Use rigid barriers at open edges, not tape', 'Check barriers at every shift start'], 'OSHA 1926.502 guardrails; 1926.200-203 signs and barricades'),
+    'scaffold_unsafe': ('Scaffold that looks unsafe', 'Work at height', 4, ['Stop use and tag the scaffold "do not use"', 'Have a competent person inspect and fix it', 'Check boards, guardrails, ties and base plates'], 'OSHA 1926.451 scaffolds'),
+    'unsecured_load': ('Unsecured load', 'Lifting and loads', 4, ['Secure the load (straps, chains) before moving', 'Keep people clear of the load path'], 'OSHA 1926.251 rigging; load securing'),
+    'open_trench': ('Open trench', 'Excavation', 4, ['Protect the trench (shoring, sloping or a trench box) if 1.5 m (5 ft) or deeper', 'Barrier the edge; ladder within 7.6 m (25 ft) of workers', 'Daily inspection by a competent person'], 'OSHA 1926.651-652 excavations'),
+    'excavation_edge': ('Unprotected excavation edge', 'Excavation', 4, ['Put barriers or guardrails at the edge', 'Keep plant and materials back from the edge'], 'OSHA 1926.651'),
+    'electrical': ('Electrical hazard', 'Electrical', 5, ['Keep people away; isolate the supply', 'Repair by a qualified electrician; close open panels', 'Inspect cords and tools before use'], 'OSHA 1910.303 / 1926.405 electrical'),
+    'dust_cloud': ('Dust cloud', 'Health', 3, ['Control at the source: water suppression or extraction', 'Respiratory protection for people in the dust', 'Check whether the dust contains silica'], 'OSHA 1926.1153 respirable crystalline silica; 1910.1000 air contaminants'),
+    'suspended_load': ('Person near a suspended load', 'Lifting and loads', 5, ['Nobody under or in the swing path of a suspended load', 'Use tag lines and a banksman', 'Mark the lift exclusion zone'], 'OSHA 1926.1425 keeping clear of the load'),
+    'debris': ('Construction debris', 'Walkways and housekeeping', 2, ['Clear debris into skips', 'Keep walkways and stairs clear'], 'OSHA 1926.25 housekeeping'),
+    'gas_cylinder': ('Gas cylinder', 'Gas cylinders', 2, ['Check it is upright, chained and capped when not in use', 'Keep oxygen away from fuel gases'], 'OSHA 1910.101 / 1926.350 compressed gas'),
+}
+VI_DIRECT = {   # model class -> finding key (reported as found when the class is validated)
+    'NO-Hardhat': 'no_hardhat', 'NO-Safety Vest': 'no_vest', 'NO-Goggles': 'no_goggles', 'NO-Gloves': 'no_gloves', 'NO-Mask': 'no_mask',
+    'Missing-Harness': 'height_no_harness', 'Fall-Detected': 'fall_detected', 'Chemical-Spill': 'chemical_spill', 'Fire': 'fire', 'Smoke': 'smoke',
+    'Confined-Space-Entry': 'confined_space', 'Spoil-Pile': 'spoil_pile', 'Wet-Floor': 'wet_floor', 'Cluttered-Walkway': 'cluttered_walkway',
+    'Trailing-Cable': 'trailing_cable', 'Unsafe-Barricade': 'unsafe_barricade', 'Scaffolding-Unsafe': 'scaffold_unsafe', 'Unsecured-Load': 'unsecured_load',
+    'Open-Trench': 'open_trench', 'Excavation-Edge': 'excavation_edge', 'Electrical-Hazard': 'electrical', 'Dust-Cloud': 'dust_cloud',
+    'Construction-Debris': 'debris', 'Gas-Cylinder': 'gas_cylinder',
+}
+VI_PLANT = ('Heavy-Machinery', 'Site-Vehicle')
+VI_HEIGHT = ('Aerial-Lift', 'Scaffolding')
+VI_POSSIBLE_MIN = 0.5            # minimum confidence for "possible" findings from classes that are not validated yet
+_vi_lock = threading.Lock()
+_vi_state = {'model': None, 'path': None, 'thr': {}, 'loaded_at': None}
+
+
+def _vi_model():
+    with _vi_lock:
+        if _vi_state['model'] is not None:
+            return _vi_state
+        vol = os.environ.get('RAILWAY_VOLUME_MOUNT_PATH', '/app/data')
+        here = os.path.dirname(os.path.abspath(__file__))
+        for p in (os.environ.get('SAFETRACK38_MODEL'), os.path.join(vol, 'yolov8', 'safetrack38.pt'), os.path.join(here, 'detector', 'safetrack38.pt')):
+            if p and os.path.exists(p):
+                from ultralytics import YOLO as _Y
+                m = _Y(p)
+                thr = {}
+                tj = os.path.join(os.path.dirname(p), 'thresholds.json')
+                if os.path.exists(tj):
+                    thr = json.load(open(tj, encoding='utf-8'))
+                _vi_state.update(model=m, path=p, thr=thr, loaded_at=datetime.utcnow())
+                logger.info(f'safety vision model loaded: {p} ({len(m.names)} classes, {sum(1 for v in thr.values() if v.get("enabled"))} validated)')
+                return _vi_state
+        raise RuntimeError('The safety detection model is not installed on the server.')
+
+
+def _vi_box_area(b):
+    return max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
+
+
+def _vi_inter(a, b):
+    return _vi_box_area([max(a[0], b[0]), max(a[1], b[1]), min(a[2], b[2]), min(a[3], b[3])])
+
+
+def _vi_center_in(inner, outer, pad=0.1):
+    cx, cy = (inner[0] + inner[2]) / 2, (inner[1] + inner[3]) / 2
+    w, h = outer[2] - outer[0], outer[3] - outer[1]
+    return outer[0] - pad * w <= cx <= outer[2] + pad * w and outer[1] - pad * h <= cy <= outer[3] + pad * h
+
+
+def _vi_analyse(dets, img_w, img_h, thr, site_type, required):
+    """dets: [{'cls': name, 'conf': float, 'box': [x1,y1,x2,y2]}] for one picture.
+    Returns findings (each with key, level 'found' | 'inferred' | 'possible', box, conf) and what was checked fine."""
+    enabled = {k for k, v in thr.items() if v.get('enabled')} if thr else None
+    def ok_cls(c, conf):
+        if enabled is None:
+            return conf >= 0.35
+        t = (thr.get(c) or {}).get('threshold', 0.35)
+        return c in enabled and conf >= t
+    def possible_cls(c, conf):
+        return enabled is not None and c not in enabled and conf >= max(VI_POSSIBLE_MIN, (thr.get(c) or {}).get('threshold', 0) or 0)
+    good = [d for d in dets if ok_cls(d['cls'], d['conf'])]
+    maybe = [d for d in dets if possible_cls(d['cls'], d['conf'])]
+    people = [d for d in good if d['cls'] == 'Person']
+    findings, fine = [], {'people': len(people), 'ppe_seen': {}, 'checked': []}
+    # 1. hazards the model sees directly
+    for d in good:
+        if d['cls'] in VI_DIRECT:
+            findings.append({'key': VI_DIRECT[d['cls']], 'level': 'found', 'box': d['box'], 'conf': d['conf'], 'from': d['cls']})
+    for d in maybe:
+        if d['cls'] in VI_DIRECT:
+            findings.append({'key': VI_DIRECT[d['cls']], 'level': 'possible', 'box': d['box'], 'conf': d['conf'], 'from': d['cls']})
+        elif d['cls'] == 'Suspended-Load':
+            for p in people:
+                if p['box'][1] > d['box'][1] and min(p['box'][2], d['box'][2]) - max(p['box'][0], d['box'][0]) > 0:
+                    findings.append({'key': 'suspended_load', 'level': 'possible', 'box': d['box'], 'conf': d['conf'], 'from': 'Suspended-Load'})
+                    break
+    # 2. every person: required PPE, height, moving plant
+    plant = [d for d in good if d['cls'] in VI_PLANT]
+    height = [d for d in good if d['cls'] in VI_HEIGHT]
+    ladders = [d for d in good if d['cls'] == 'Ladder']
+    for p in people:
+        pb = p['box']
+        ph = pb[3] - pb[1]
+        small = ph < max(60, 0.08 * img_h)               # too small to judge PPE reliably
+        mine = [d for d in dets if d['cls'] != 'Person' and _vi_center_in(d['box'], pb, 0.08)]
+        has = {d['cls'] for d in mine if d['conf'] >= max(0.25, (thr.get(d['cls']) or {}).get('threshold', 0.25) * 0.8)}
+        for k in required:
+            pos, neg, label = VI_PPE[k]
+            if pos in has:
+                fine['ppe_seen'][label] = fine['ppe_seen'].get(label, 0) + 1
+                continue
+            key = {'hardhat': 'no_hardhat', 'vest': 'no_vest', 'goggles': 'no_goggles', 'gloves': 'no_gloves', 'mask': 'no_mask'}[k]
+            if any(f['key'] == key and f['level'] in ('found', 'possible') and _vi_inter(f['box'], pb) > 0.3 * (_vi_box_area(f['box']) or 1) for f in findings):
+                continue                                  # already reported directly for this person
+            if small:
+                continue
+            hb = [pb[0], pb[1], pb[2], pb[1] + 0.3 * ph] if k == 'hardhat' else pb
+            findings.append({'key': key, 'level': 'inferred', 'box': hb, 'conf': p['conf'], 'from': f'no {label} seen on a person', 'pbox': pb, 'ppe': k})
+        at_height = [h for h in height if _vi_inter(pb, h['box']) > 0.4 * _vi_box_area(pb)]
+        if at_height and 'Safety-Harness' not in has and not small:
+            findings.append({'key': 'height_no_harness', 'level': 'inferred', 'box': pb, 'conf': p['conf'], 'from': f'person on {at_height[0]["cls"].lower()}, no harness seen', 'pbox': pb, 'ppe': 'harness'})
+        elif any(_vi_inter(pb, l['box']) > 0.3 * _vi_box_area(pb) for l in ladders):
+            findings.append({'key': 'ladder_use', 'level': 'inferred', 'box': pb, 'conf': p['conf'], 'from': 'person on or at a ladder'})
+        for m in plant:
+            mb = m['box']
+            gap = max(mb[0] - pb[2], pb[0] - mb[2], mb[1] - pb[3], pb[1] - mb[3], 0)
+            if gap < 0.5 * ph and _vi_inter(pb, mb) < 0.6 * _vi_box_area(pb):   # inside the machine box = probably the operator
+                findings.append({'key': 'near_plant', 'level': 'inferred', 'box': pb, 'conf': min(p['conf'], m['conf']), 'from': f'person within half a body height of {m["cls"].lower()}'})
+                break
+    fine['checked'] = sorted({VI_KB[f['key']][1] for f in findings} | {'PPE' if people else None} - {None})
+    return findings, fine
+
+
+def _vi_risk(key, level):
+    sev = VI_KB[key][2]
+    lik = {'found': 4, 'inferred': 3, 'possible': 2}[level]
+    score = sev * lik
+    return score, ('critical' if score >= 15 else 'high' if score >= 10 else 'medium' if score >= 5 else 'low')
+
+
+VI_COLORS = {'critical': (0, 0, 220), 'high': (0, 60, 255), 'medium': (0, 165, 255), 'low': (0, 215, 255), 'possible': (0, 230, 230)}   # BGR
+
+
+def _vi_draw(img, findings):
+    import cv2 as _cv
+    out = img.copy()
+    h, w = out.shape[:2]
+    t = max(2, int(round(min(h, w) / 300)))
+    used = []                                                                   # label boxes already drawn
+    for n, f in enumerate(findings, 1):
+        x1, y1, x2, y2 = [int(round(v)) for v in f['box']]
+        col = VI_COLORS['possible' if f['level'] == 'possible' else f['risk']]
+        _cv.rectangle(out, (x1, y1), (x2, y2), col, t)
+        label = f'{n}. {VI_KB[f["key"]][0]}' + (' ?' if f['level'] == 'possible' else '')
+        fs = max(0.45, min(h, w) / 1100)
+        (tw, th), _ = _cv.getTextSize(label, _cv.FONT_HERSHEY_SIMPLEX, fs, 1)
+        ty = y1 - 4 if y1 - th - 8 > 0 else y2 + th + 4
+        for _ in range(20):                                                     # move down until it does not cover another label
+            if not any(not (x1 + tw + 6 < ux1 or x1 > ux2 or ty + 4 < uy1 or ty - th - 4 > uy2) for ux1, uy1, ux2, uy2 in used):
+                break
+            ty += th + 10
+        used.append((x1, ty - th - 4, x1 + tw + 6, ty + 4))
+        _cv.rectangle(out, (x1, ty - th - 4), (min(w - 1, x1 + tw + 6), ty + 4), col, -1)
+        _cv.putText(out, label, (x1 + 3, ty), _cv.FONT_HERSHEY_SIMPLEX, fs, (255, 255, 255), 1, _cv.LINE_AA)
+    return out
+
+
+def _vi_run(img_bgr, st, site_type, required):
+    r = st['model'].predict(img_bgr, conf=0.2, iou=0.5, verbose=False, imgsz=640)[0]
+    names = st['model'].names
+    dets = [{'cls': names[int(c)], 'conf': float(s), 'box': [float(v) for v in b]}
+            for b, s, c in zip(r.boxes.xyxy.tolist(), r.boxes.conf.tolist(), r.boxes.cls.tolist())]
+    h, w = img_bgr.shape[:2]
+    findings, fine = _vi_analyse(dets, w, h, st['thr'], site_type, required)
+    # second look before saying something is MISSING: zoom into the person and search again with a lower bar
+    keep = []
+    for f in findings:
+        if f['level'] != 'inferred' or not f.get('ppe'):
+            keep.append(f)
+            continue
+        x1, y1, x2, y2 = f['pbox']
+        pw, ph = x2 - x1, y2 - y1
+        crop = img_bgr[max(0, int(y1 - 0.15 * ph)):min(h, int(y2 + 0.05 * ph)), max(0, int(x1 - 0.2 * pw)):min(w, int(x2 + 0.2 * pw))]
+        if crop.size == 0:
+            keep.append(f)
+            continue
+        rr = st['model'].predict(crop, conf=0.2, iou=0.5, verbose=False, imgsz=640)[0]
+        seen = {names[int(c)] for c in rr.boxes.cls.tolist()}
+        if VI_PPE[f['ppe']][0] in seen:
+            fine['ppe_seen'][VI_PPE[f['ppe']][2]] = fine['ppe_seen'].get(VI_PPE[f['ppe']][2], 0) + 1
+            continue
+        keep.append(f)
+    return keep, fine
+
+
+def _vi_merge(findings):
+    """Same hazard on overlapping boxes (e.g. found + inferred) -> keep the strongest."""
+    rank = {'found': 0, 'inferred': 1, 'possible': 2}
+    out = []
+    for f in sorted(findings, key=lambda x: (rank[x['level']], -x['conf'])):
+        if any(o['key'] == f['key'] and o.get('frame') == f.get('frame') and _vi_inter(o['box'], f['box']) > 0.5 * min(_vi_box_area(o['box']), _vi_box_area(f['box']) or 1) for o in out):
+            continue
+        out.append(f)
+    return out
+
+
+def _vi_dir(cid):
+    d = os.path.join(BASE_UPLOAD_DIR, 'vision', str(cid or 'personal'))
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _vi_report_dict(v):
+    return {'id': v.id, 'title': v.title, 'location': v.location, 'site_type': v.site_type, 'kind': v.kind, 'source_name': v.source_name,
+            'findings': _tbt_json(v.findings, []), 'summary': _tbt_json(v.summary, {}), 'images': len(_tbt_json(v.files, {}).get('annotated', [])),
+            'model_version': v.model_version, 'created_at': _in_iso(v.created_at)}
+
+
+@app.route('/api/safety-vision/analyze', methods=['POST'])
+@jwt_required
+@limiter.limit("20 per minute")
+def vi_analyze():
+    """A photo (JPG/PNG) or a short video. Returns the hazard findings and keeps a report."""
+    import cv2 as _cv
+    import numpy as _np
+    user = request.user
+    up = request.files.get('file')
+    if not up or not up.filename:
+        return jsonify({'success': False, 'error': 'Choose a photo or a video.'}), 400
+    site_type = request.form.get('site_type') or 'construction'
+    if site_type not in VI_SITE_PPE:
+        return jsonify({'success': False, 'error': 'Unknown site type.'}), 400
+    req = request.form.get('required_ppe')
+    required = [k for k in (json.loads(req) if req else VI_SITE_PPE[site_type]) if k in VI_PPE and k != 'harness'][:6]
+    try:
+        st = _vi_model()
+    except Exception as e:
+        logger.error(f'safety vision model: {e}')
+        return jsonify({'success': False, 'error': 'The detection model is not available on the server right now.'}), 503
+    raw = up.read(200 * 1024 * 1024 + 1)
+    if len(raw) > 200 * 1024 * 1024:
+        return jsonify({'success': False, 'error': 'The file is larger than 200 MB.'}), 400
+    frames = []                                                               # (seconds or None, BGR image)
+    kind = 'image'
+    if raw[:3] == b'\xff\xd8\xff' or raw[:8] == b'\x89PNG\r\n\x1a\n':
+        img = _cv.imdecode(_np.frombuffer(raw, _np.uint8), _cv.IMREAD_COLOR)
+        if img is None:
+            return jsonify({'success': False, 'error': 'The picture could not be read.'}), 400
+        frames.append((None, img))
+    elif raw[4:8] == b'ftyp' or raw[:4] in (b'\x1aE\xdf\xa3', b'RIFF'):
+        kind = 'video'
+        tmp = os.path.join(_vi_dir(user.company_id), f'tmp_{uuid.uuid4().hex}.vid')
+        open(tmp, 'wb').write(raw)
+        try:
+            cap = _cv.VideoCapture(tmp)
+            n = int(cap.get(_cv.CAP_PROP_FRAME_COUNT) or 0)
+            fps = cap.get(_cv.CAP_PROP_FPS) or 25
+            if n <= 0:
+                return jsonify({'success': False, 'error': 'The video could not be read.'}), 400
+            picks = sorted({int(i * (n - 1) / 29) for i in range(30)}) if n > 30 else list(range(n))
+            for i in picks:
+                cap.set(_cv.CAP_PROP_POS_FRAMES, i)
+                okf, fr = cap.read()
+                if okf:
+                    frames.append((round(i / fps, 1), fr))
+            cap.release()
+        finally:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        if not frames:
+            return jsonify({'success': False, 'error': 'No frames could be read from the video.'}), 400
+    else:
+        return jsonify({'success': False, 'error': 'Use a JPG or PNG photo, or an MP4 / MOV / WEBM / AVI video.'}), 400
+    allf, fine_total = [], {'people_max': 0, 'ppe_seen': {}}
+    for idx, (sec, img) in enumerate(frames):
+        if max(img.shape[:2]) > 1920:
+            s = 1920 / max(img.shape[:2])
+            img = _cv.resize(img, (int(img.shape[1] * s), int(img.shape[0] * s)))
+            frames[idx] = (sec, img)
+        f, fine = _vi_run(img, st, site_type, required)
+        for x in f:
+            x['frame'], x['time'] = idx, sec
+        allf += f
+        fine_total['people_max'] = max(fine_total['people_max'], fine['people'])
+        for k, v in fine['ppe_seen'].items():
+            fine_total['ppe_seen'][k] = max(fine_total['ppe_seen'].get(k, 0), v)
+    allf = _vi_merge(allf)
+    for f in allf:
+        f['score'], f['risk'] = _vi_risk(f['key'], f['level'])
+    # one picture per frame that has findings, boxes only on hazards
+    folder = _vi_dir(user.company_id)
+    files = {'annotated': [], 'frames': []}
+    shown = sorted({f['frame'] for f in allf}) or [0]
+    if kind == 'video' and len(shown) > 6:     # keep the frames with the worst findings
+        worst = {}
+        for f in allf:
+            worst[f['frame']] = max(worst.get(f['frame'], 0), f['score'])
+        shown = sorted(sorted(worst, key=lambda k: -worst[k])[:6])
+    order = {fr: i for i, fr in enumerate(shown)}
+    allf = [f for f in allf if f['frame'] in order]
+    for fr in shown:
+        ff = [f for f in allf if f['frame'] == fr]
+        name = f'{uuid.uuid4().hex}.jpg'
+        _cv.imwrite(os.path.join(folder, name), _vi_draw(frames[fr][1], ff), [_cv.IMWRITE_JPEG_QUALITY, 85])
+        orig = f'{uuid.uuid4().hex}.jpg'
+        _cv.imwrite(os.path.join(folder, orig), frames[fr][1], [_cv.IMWRITE_JPEG_QUALITY, 92])     # kept for retraining feedback
+        files['annotated'].append(name)
+        files['frames'].append(orig)
+    out = []
+    for n, f in enumerate(sorted(allf, key=lambda x: (order[x['frame']], -x['score'])), 1):
+        t, cat, sev, ctrl, ref = VI_KB[f['key']]
+        out.append({'id': n, 'key': f['key'], 'title': t, 'category': cat, 'level': f['level'], 'risk': f['risk'], 'score': f['score'],
+                    'confidence': round(f['conf'], 2), 'evidence': f['from'], 'image': order[f['frame']], 'time': f['time'],
+                    'box': [round(v, 1) for v in f['box']], 'controls': ctrl, 'reference': ref, 'feedback': None})
+    real = [f for f in out if f['level'] != 'possible']
+    worst = max([f['score'] for f in real] or [0])
+    summary = {'overall': 'critical' if worst >= 15 else 'high' if worst >= 10 else 'medium' if worst >= 5 else 'low' if real else 'none',
+               'hazards': len(real), 'possible': len(out) - len(real),
+               'by_category': {c: sum(1 for f in real if f['category'] == c) for c in sorted({f['category'] for f in real})},
+               'people': fine_total['people_max'], 'ppe_seen': fine_total['ppe_seen'], 'required_ppe': [VI_PPE[k][2] for k in required],
+               'frames_checked': len(frames),
+               'not_validated': sorted(k for k, v in st['thr'].items() if not v.get('enabled')) if st['thr'] else []}
+    title = _rc_text(request.form.get('title'), 200) or f'{"Video" if kind == "video" else "Photo"} check {datetime.utcnow().strftime("%d %b %Y %H:%M")}'
+    v = VisionReport(company_id=getattr(user, 'company_id', None), user_id=user.id, title=title, location=_rc_text(request.form.get('location'), 200) or None,
+                     site_type=site_type, kind=kind, source_name=_rc_text(up.filename, 200), findings=json.dumps(out), summary=json.dumps(summary),
+                     files=json.dumps(files), model_version=os.path.basename(st['path'] or ''))
+    db.session.add(v)
+    db.session.commit()
+    return jsonify({'success': True, 'data': _vi_report_dict(v)}), 201
+
+
+def _vi_get(user, rid):
+    v = db.session.get(VisionReport, rid)
+    if not v:
+        return None
+    if v.company_id:
+        return v if v.company_id == getattr(user, 'company_id', None) else None
+    return v if v.user_id == user.id else None
+
+
+@app.route('/api/safety-vision/reports', methods=['GET'])
+@jwt_required
+def vi_reports():
+    user = request.user
+    q = VisionReport.query.filter(VisionReport.company_id == user.company_id) if getattr(user, 'company_id', None) else VisionReport.query.filter(VisionReport.user_id == user.id)
+    return jsonify({'success': True, 'data': [_vi_report_dict(v) for v in q.order_by(VisionReport.created_at.desc()).limit(200).all()]}), 200
+
+
+@app.route('/api/safety-vision/reports/<int:rid>', methods=['GET', 'DELETE'])
+@jwt_required
+def vi_report_one(rid):
+    user = request.user
+    v = _vi_get(user, rid)
+    if not v:
+        return jsonify({'success': False, 'error': 'Report not found.'}), 404
+    if request.method == 'DELETE':
+        if v.user_id != user.id and not _rc_staff(user):
+            return jsonify({'success': False, 'error': 'Only the person who made it or a supervisor can delete it.'}), 403
+        for n in sum(_tbt_json(v.files, {}).values(), []):
+            try:
+                os.remove(os.path.join(_vi_dir(v.company_id), n))
+            except OSError:
+                pass
+        db.session.delete(v)
+        db.session.commit()
+        return jsonify({'success': True}), 200
+    return jsonify({'success': True, 'data': _vi_report_dict(v)}), 200
+
+
+@app.route('/api/safety-vision/reports/<int:rid>/image/<int:n>', methods=['GET'])
+@jwt_required
+def vi_report_image(rid, n):
+    user = request.user
+    v = _vi_get(user, rid)
+    names = _tbt_json(v.files, {}).get('annotated', []) if v else []
+    if not v or not (0 <= n < len(names)) or not re.fullmatch(r'[0-9a-f]{32}\.jpg', names[n]):
+        return jsonify({'success': False, 'error': 'Image not found.'}), 404
+    resp = send_file(os.path.join(_vi_dir(v.company_id), names[n]), mimetype='image/jpeg')
+    resp.headers['Cache-Control'] = 'private, no-store'
+    resp.headers['X-Content-Type-Options'] = 'nosniff'
+    return resp
+
+
+@app.route('/api/safety-vision/reports/<int:rid>/feedback', methods=['PUT'])
+@jwt_required
+def vi_feedback(rid):
+    """Mark a finding right or wrong. Wrong ones and missed hazards are what the next training round needs."""
+    user = request.user
+    v = _vi_get(user, rid)
+    if not v:
+        return jsonify({'success': False, 'error': 'Report not found.'}), 404
+    data = request.get_json(silent=True) or {}
+    verdict = data.get('verdict')
+    if verdict not in ('correct', 'wrong', None):
+        return jsonify({'success': False, 'error': 'Verdict must be correct or wrong.'}), 400
+    fs = _tbt_json(v.findings, [])
+    f = next((x for x in fs if x.get('id') == data.get('finding_id')), None)
+    if not f:
+        return jsonify({'success': False, 'error': 'Finding not found.'}), 404
+    f['feedback'] = {'verdict': verdict, 'by': user.id, 'at': datetime.utcnow().isoformat()} if verdict else None
+    v.findings = json.dumps(fs)
+    db.session.commit()
+    return jsonify({'success': True, 'data': _vi_report_dict(v)}), 200
+
+
+def _vi_pdf(v, user):
+    import fitz as _fz
+    import html as _h
+    fs = _tbt_json(v.findings, [])
+    s = _tbt_json(v.summary, {})
+    folder = _vi_dir(v.company_id)
+    arch = _fz.Archive(folder)
+    esc = lambda x: _h.escape(str(x or ''))
+    RC = {'critical': '#a8071a', 'high': '#d4380d', 'medium': '#d48806', 'low': '#389e0d', 'none': '#389e0d'}
+    real = [f for f in fs if f['level'] != 'possible']
+    poss = [f for f in fs if f['level'] == 'possible']
+    parts = [f'<h1>Safety hazard report</h1><p><b>{esc(v.title)}</b><br/>{esc(v.location or "")}'
+             f'{"<br/>" if v.location else ""}Checked {v.created_at.strftime("%d %b %Y %H:%M")} UTC by {esc(getattr(user, "name", "") or "")} '
+             f'| site type: {esc(v.site_type)} | {s.get("frames_checked", 1)} picture(s) checked | model {esc(v.model_version)}</p>',
+             f'<p style="font-size:14pt;color:{RC.get(s.get("overall"), "#000")}"><b>Overall risk: {esc((s.get("overall") or "none").upper())}</b> '
+             f'- {s.get("hazards", 0)} hazard(s) found, {s.get("possible", 0)} to confirm</p>']
+    if s.get('by_category'):
+        parts.append('<table><tr><th>Area</th><th>Hazards</th></tr>' + ''.join(f'<tr><td>{esc(k)}</td><td>{n}</td></tr>' for k, n in s['by_category'].items()) + '</table>')
+    for i, name in enumerate(_tbt_json(v.files, {}).get('annotated', [])):
+        parts.append(f'<p><b>Picture {i + 1}</b> (numbers match the findings below)</p><img src="{name}" width="500"/>')
+    def block(f):
+        when = ' at %s s' % f['time'] if f.get('time') is not None else ''
+        return (f'<h3 style="color:{RC[f["risk"]] if f["level"] != "possible" else "#8c8c8c"}">{f["id"]}. {esc(f["title"])} '
+                f'- {"POSSIBLE, PLEASE CONFIRM" if f["level"] == "possible" else f["risk"].upper()}</h3>'
+                f'<p>{esc(f["category"])} | picture {f["image"] + 1}{when} | '
+                f'{"seen by the camera" if f["level"] == "found" else "not seen on the person / worked out from the scene" if f["level"] == "inferred" else "model not validated for this yet"}'
+                f' ({esc(f["evidence"])}, confidence {f["confidence"]})</p>'
+                '<p><b>What to do</b></p><ol>' + ''.join(f'<li>{esc(c)}</li>' for c in f['controls']) + '</ol>'
+                f'<p style="font-size:8pt;color:#666">Reference: {esc(f["reference"])}'
+                f'{" | marked " + f["feedback"]["verdict"] if f.get("feedback") else ""}</p>')
+    parts.append('<h2>Hazards found</h2>' + (''.join(block(f) for f in real) if real else '<p>No hazards found in the checked pictures.</p>'))
+    if poss:
+        parts.append('<h2>Possible hazards to confirm on site</h2><p>The model is still being trained for these. Check them with your own eyes.</p>' + ''.join(block(f) for f in poss))
+    seen = ', '.join(f'{n} with {k}' for k, n in (s.get('ppe_seen') or {}).items())
+    parts.append(f'<h2>Checked</h2><p>People seen (most in one picture): {s.get("people", 0)}. Required PPE checked: '
+                 f'{esc(", ".join(s.get("required_ppe") or []) or "none")}.{" Seen: " + esc(seen) + "." if seen else ""}</p>')
+    nv = s.get('not_validated') or []
+    parts.append('<h2>What this check cannot tell you</h2><p>A camera only sees what is in the picture: it cannot check permits, training, '
+                 'gas levels, hidden faults or anything out of view. People who are small or partly hidden are not judged for PPE. '
+                 f'Not yet reliable in the model (shown only as "possible"): {esc(", ".join(nv)) if nv else "none"}. '
+                 'This report supports, and does not replace, an inspection by a competent person.</p>')
+    html_ = '<html><body style="font-family:sans-serif;font-size:10pt">' + ''.join(parts) + '</body></html>'
+    css = 'h1{font-size:18pt;margin:0} h2{font-size:13pt;margin-top:14px;border-bottom:1px solid #ccc} h3{font-size:11pt;margin:10px 0 2px} table{border-collapse:collapse} td,th{border:1px solid #ccc;padding:3px 8px;text-align:left} p{margin:3px 0}'
+    story = _fz.Story(html=html_, user_css=css, archive=arch)
+    buf = io.BytesIO()
+    w = _fz.DocumentWriter(buf)
+    more = True
+    while more:
+        dev = w.begin_page(_fz.paper_rect('a4'))
+        more, _ = story.place(_fz.paper_rect('a4') + (40, 40, -40, -40))
+        story.draw(dev)
+        w.end_page()
+    w.close()
+    return buf.getvalue()
+
+
+@app.route('/api/safety-vision/reports/<int:rid>/pdf', methods=['GET'])
+@jwt_required
+def vi_report_pdf(rid):
+    user = request.user
+    v = _vi_get(user, rid)
+    if not v:
+        return jsonify({'success': False, 'error': 'Report not found.'}), 404
+    resp = send_file(io.BytesIO(_vi_pdf(v, user)), mimetype='application/pdf', as_attachment=True,
+                     download_name=re.sub(r'[^A-Za-z0-9_-]+', '_', v.title or 'safety_report')[:60] + '.pdf')
+    resp.headers['Cache-Control'] = 'private, no-store'
+    return resp
+
+
+@app.route('/api/safety-vision/model', methods=['GET'])
+@jwt_required
+def vi_model_info():
+    try:
+        st = _vi_model()
+    except Exception:
+        return jsonify({'success': True, 'data': {'installed': False}}), 200
+    thr = st['thr']
+    return jsonify({'success': True, 'data': {'installed': True, 'file': os.path.basename(st['path']), 'classes': len(st['model'].names),
+                    'validated': sorted(k for k, v in thr.items() if v.get('enabled')), 'not_validated': sorted(k for k, v in thr.items() if not v.get('enabled')),
+                    'site_types': {k: [VI_PPE[x][2] for x in v] for k, v in VI_SITE_PPE.items()}}}), 200
+
+
 # =====================================================================================================
 # AUTO MIGRATIONS (2026-11-23)
 # Railway's Data tab appends LIMIT to every query, so CREATE/ALTER statements fail there. Instead the
@@ -174948,7 +175486,7 @@ IN_LIBRARY.update({
 #   - a failing statement is logged and the file is retried on the next start
 # Set AUTO_MIGRATE=0 on Railway to switch this off.
 # =====================================================================================================
-AUTO_MIGRATIONS = ('DEPLOY_2026-11-23_FULL.sql', '2026-11-24_company_quotes.sql', '2026-11-25_ready_checks.sql', '2026-11-26_muster_contractors.sql', '2026-11-27_document_control_plus.sql', '2026-11-27_inspections.sql', '2026-11-27_chemical_safety.sql', '2026-11-27_chemical_waste.sql', '2026-11-27_equipment.sql', '2026-11-27_incident_outcomes.sql', '2026-11-27_oil_gas.sql')
+AUTO_MIGRATIONS = ('DEPLOY_2026-11-23_FULL.sql', '2026-11-24_company_quotes.sql', '2026-11-25_ready_checks.sql', '2026-11-26_muster_contractors.sql', '2026-11-27_document_control_plus.sql', '2026-11-27_inspections.sql', '2026-11-27_chemical_safety.sql', '2026-11-27_chemical_waste.sql', '2026-11-27_equipment.sql', '2026-11-27_incident_outcomes.sql', '2026-11-27_oil_gas.sql', '2026-11-27_vision_reports.sql')
 _MIGRATION_LOCK_KEY = 74230115
 
 
