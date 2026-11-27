@@ -171646,6 +171646,1104 @@ if os.environ.get('READY_CHECK_WATCHER', '1') == '1':
     threading.Thread(target=_in_watch_loop, name='inspection-reminder-watcher', daemon=True).start()
 
 
+# ============================================================================
+# CHEMICAL SAFETY (2026-11-27)
+# ============================================================================
+# Chemical register with identification from PubChem (US National Library of Medicine, free public data), GHS hazards,
+# a compatibility checker built on the EPA chart (EPA-600/2-80-076, Hatayama et al. 1980, public domain), storage
+# checks, shelf-life and peroxide-former test tracking, a chemical safety summary with first aid (each section names its
+# source), the supplier SDS attached to the chemical, and the country's rules shown beside the international ones.
+# Only chemical names / CAS numbers are sent to PubChem, never company or user data.
+# DB: chem_substances (shared PubChem cache), chem_items, chem_tests -> sql/2026-11-27_chemical_safety.sql (auto migration)
+
+
+class ChemSubstance(db.Model):
+    __tablename__ = 'chem_substances'
+    __table_args__ = {'extend_existing': True}
+    id = db.Column(db.Integer, primary_key=True)
+    cid = db.Column(db.Integer, unique=True, index=True)                    # PubChem compound id
+    name = db.Column(db.String(200), nullable=False)
+    cas = db.Column(db.String(40), index=True)
+    formula = db.Column(db.String(120))
+    data = db.Column(db.Text)                                                # JSON: properties, GHS, sections with sources
+    fetched_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+
+class ChemItem(db.Model):
+    __tablename__ = 'chem_items'
+    __table_args__ = {'extend_existing': True}
+    id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id', ondelete='CASCADE'), nullable=False, index=True)
+    substance_id = db.Column(db.Integer, db.ForeignKey('chem_substances.id', ondelete='SET NULL'), nullable=True)
+    name = db.Column(db.String(200), nullable=False)
+    cas = db.Column(db.String(40))
+    location = db.Column(db.String(160))
+    quantity = db.Column(db.Float)
+    unit = db.Column(db.String(12))
+    containers = db.Column(db.Integer)
+    supplier = db.Column(db.String(160))
+    groups = db.Column(db.Text)                                              # JSON list of EPA reactivity group ids, e.g. ["19","101"]
+    groups_confirmed = db.Column(db.Boolean, nullable=False, default=False)
+    peroxide_class = db.Column(db.String(2))                                 # A | B | C | None
+    received_on = db.Column(db.Date)
+    opened_on = db.Column(db.Date)
+    expires_on = db.Column(db.Date)
+    status = db.Column(db.String(12), nullable=False, default='in_use')     # in_use | disposed
+    notes = db.Column(db.Text)
+    sds_file = db.Column(db.String(60))
+    sds_mime = db.Column(db.String(40))
+    sds_uploaded_at = db.Column(db.DateTime)
+    legacy_id = db.Column(db.Integer)                                        # row of the old chemical_inventory table it came from
+    notified_on = db.Column(db.Date)
+    created_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class ChemTest(db.Model):
+    __tablename__ = 'chem_tests'
+    __table_args__ = {'extend_existing': True}
+    id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id', ondelete='CASCADE'), nullable=False, index=True)
+    item_id = db.Column(db.Integer, db.ForeignKey('chem_items.id', ondelete='CASCADE'), nullable=False, index=True)
+    kind = db.Column(db.String(20), nullable=False, default='peroxide')     # peroxide | visual | other
+    tested_on = db.Column(db.Date, nullable=False)
+    result_ppm = db.Column(db.Float)
+    result = db.Column(db.String(300))
+    tested_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+
+# ---------------------------------------------------------------- EPA compatibility chart (verified data)
+# Group names and every cell were read from two independent copies of the published chart (Yale EHS and Rutgers REHS
+# reproductions of EPA-600/2-80-076); the 296 cells both copies show agree exactly, the 7 cells only one copy shows
+# (columns 102-107) were checked by eye against the chart. Group 107 is not to be mixed with anything.
+CS_EPA_GROUPS = {
+    '1': 'Acids, Mineral, Non-oxidizing', '2': 'Acids, Mineral, Oxidizing', '3': 'Acids, Organic', '4': 'Alcohols and Glycols',
+    '5': 'Aldehydes', '6': 'Amides', '7': 'Amines, Aliphatic and Aromatic', '8': 'Azo Compounds, Diazo Compounds and Hydrazines',
+    '9': 'Carbamates', '10': 'Caustics', '11': 'Cyanides', '12': 'Dithiocarbamates', '13': 'Esters', '14': 'Ethers',
+    '15': 'Fluorides, Inorganic', '16': 'Hydrocarbons, Aromatic', '17': 'Halogenated Organics', '18': 'Isocyanates', '19': 'Ketones',
+    '20': 'Mercaptans and Other Organic Sulfides', '21': 'Metals, Alkali and Alkaline Earth, Elemental',
+    '22': 'Metals, Other Elemental & Alloys as Powders, Vapors, or Sponges', '23': 'Metals, Other Elemental & Alloys as Sheets, Rods, Drops, etc.',
+    '24': 'Metals and Metal Compounds, Toxic', '25': 'Nitrides', '26': 'Nitriles', '27': 'Nitro Compounds, Organic',
+    '28': 'Hydrocarbons, Aliphatic, Unsaturated', '29': 'Hydrocarbons, Aliphatic, Saturated', '30': 'Peroxides and Hydroperoxides, Organic',
+    '31': 'Phenols and Cresols', '32': 'Organophosphates, Phosphothioates, Phosphodithioates', '33': 'Sulfides, Inorganic', '34': 'Epoxides',
+    '101': 'Combustible and Flammable Materials, Miscellaneous', '102': 'Explosives', '103': 'Polymerizable Compounds',
+    '104': 'Oxidizing Agents, Strong', '105': 'Reducing Agents, Strong', '106': 'Water and Mixtures Containing Water', '107': 'Water Reactive Substances',
+}
+CS_CODES = {'H': 'Heat generation', 'F': 'Fire', 'G': 'Innocuous and non-flammable gas generation', 'GT': 'Toxic gas formation',
+            'GF': 'Flammable gas formation', 'E': 'Explosion', 'P': 'Violent polymerization', 'S': 'Solubilization of toxic substance',
+            'U': 'May be hazardous, but unknown', 'HF': 'Heat and fire'}
+CS_SEVERITY = {'E': 5, 'F': 4, 'HF': 4, 'GT': 4, 'GF': 3, 'P': 3, 'S': 2, 'H': 2, 'U': 1, 'G': 1}
+
+CS_EPA_MATRIX = {
+    '3,2': 'G,H', '4,1': 'H', '4,2': 'H,F', '4,3': 'H,P', '5,1': 'H,P', '5,2': 'H,F', '5,3': 'H,P', '6,1': 'H',
+    '6,2': 'H,GT', '7,1': 'H', '7,2': 'H,GT', '7,3': 'H', '7,5': 'H', '8,1': 'H,G', '8,2': 'H,GT', '8,3': 'H,G',
+    '8,4': 'H,G', '8,5': 'H', '9,1': 'H,G', '9,2': 'H,GT', '9,8': 'G,H', '10,1': 'H', '10,2': 'H', '10,3': 'H',
+    '10,5': 'H', '10,9': 'H,G', '11,1': 'GT,GF', '11,2': 'GT,GF', '11,3': 'GT,GF', '11,8': 'G', '12,1': 'H,F,GF',
+    '12,2': 'H,F,GF', '12,3': 'H,GT,GF', '12,5': 'GF,GT', '12,7': 'U', '12,8': 'H,G', '13,1': 'H', '13,2': 'H,F',
+    '13,8': 'H,G', '13,10': 'H', '14,1': 'H', '14,2': 'H,F', '15,1': 'GT', '15,2': 'GT', '15,3': 'GT', '16,2': 'H,F',
+    '17,1': 'H,GT', '17,2': 'H,F,GT', '17,7': 'H,GT', '17,8': 'H,G', '17,10': 'H,GF', '17,11': 'H', '18,1': 'H,G',
+    '18,2': 'H,F,GT', '18,3': 'H,G', '18,4': 'H,P', '18,7': 'H,P', '18,8': 'H,G', '18,10': 'H,P,G', '18,11': 'H,G',
+    '18,12': 'U', '19,1': 'H', '19,2': 'H,F', '19,8': 'H,G', '19,10': 'H', '19,11': 'H', '20,1': 'GT,GF',
+    '20,2': 'H,F,GT', '20,8': 'H,G', '20,17': 'H', '20,18': 'H', '20,19': 'H', '21,1': 'H,F,GF', '21,2': 'H,F,GF',
+    '21,3': 'H,F,GF', '21,4': 'H,F,GF', '21,5': 'H,F,GF', '21,6': 'GF,H', '21,7': 'GF,H', '21,8': 'GF,H', '21,9': 'GF,H',
+    '21,10': 'GF,H', '21,11': 'GF,H', '21,12': 'GF,H,GT', '21,13': 'GF,H', '21,17': 'H,E', '21,18': 'GF,H',
+    '21,19': 'GF,H', '21,20': 'GF,H', '22,1': 'H,F,GF', '22,2': 'H,F,GF', '22,3': 'G,F', '22,8': 'H,F,GT', '22,9': 'U',
+    '22,10': 'GF,H', '22,17': 'H,E', '22,18': 'GF,H', '22,20': 'H,F,GF', '23,1': 'H,F,GF', '23,2': 'H,F,GF',
+    '23,8': 'H,F,G', '23,17': 'H,F', '24,1': 'S', '24,2': 'S', '24,3': 'S', '24,6': 'S', '24,7': 'S', '24,10': 'S',
+    '25,1': 'GF,HF', '25,2': 'H,F,E', '25,3': 'H,GF', '25,4': 'H,E,GF', '25,5': 'GF,H', '25,8': 'U', '25,9': 'H,G',
+    '25,10': 'U', '25,11': 'GF,H', '25,12': 'GF,H', '25,13': 'GF,H', '25,17': 'GF,H', '25,18': 'U', '25,19': 'GF,H',
+    '25,20': 'GF,H', '25,21': 'E', '26,1': 'H,GT,GF', '26,2': 'H,F,GT', '26,3': 'H', '26,10': 'U', '26,21': 'H,P',
+    '26,24': 'S', '26,25': 'GF,H', '27,2': 'H,F,GT', '27,5': 'H', '27,10': 'H,E', '27,21': 'H,E,GF', '27,25': 'H,E,GF',
+    '28,1': 'H', '28,2': 'H,F', '28,5': 'H', '28,22': 'H,E', '29,2': 'H,F', '30,1': 'H,G', '30,2': 'H,E', '30,4': 'H,F',
+    '30,5': 'H,G', '30,7': 'H,GT', '30,8': 'H,F,E', '30,9': 'H,F,GT', '30,11': 'H,E,GT', '30,12': 'H,F,GT',
+    '30,17': 'H,E', '30,18': 'H', '30,19': 'E', '30,20': 'H,F,GT', '30,21': 'H,E', '30,22': 'H,G', '30,24': 'H,G',
+    '30,25': 'H,E,GF', '30,26': 'H,P,GT', '30,28': 'H,P', '31,1': 'H', '31,2': 'H,F', '31,8': 'H,G', '31,18': 'H,P',
+    '31,21': 'GF,H', '31,25': 'GF,H', '31,30': 'H', '32,1': 'H,GT', '32,2': 'H,GT', '32,8': 'U', '32,10': 'H,E',
+    '32,21': 'H', '32,30': 'U', '33,1': 'GT,GF', '33,2': 'HF,GF', '33,3': 'GT', '33,5': 'H', '33,8': 'E', '33,18': 'H',
+    '33,30': 'H,GT', '34,1': 'H,P', '34,2': 'H,P', '34,3': 'H,P', '34,4': 'H,P', '34,5': 'U', '34,7': 'H,P',
+    '34,8': 'H,P', '34,10': 'H,P', '34,11': 'H,P', '34,12': 'U', '34,20': 'H,P', '34,21': 'H,P', '34,22': 'H,P',
+    '34,24': 'H,P', '34,25': 'H,P', '34,30': 'H,P', '34,31': 'H,P', '34,32': 'U', '34,33': 'H,P', '101,1': 'H,G',
+    '101,2': 'H,F,GT', '101,21': 'H,F,G', '101,25': 'H,F,GF', '101,30': 'H,F,GT', '102,1': 'H,E', '102,2': 'H,E',
+    '102,3': 'H,E', '102,8': 'H,E', '102,10': 'H,E', '102,13': 'H,E', '102,21': 'H,E', '102,22': 'H,E', '102,23': 'H,E',
+    '102,24': 'E', '102,25': 'E', '102,30': 'H,E', '102,31': 'H,E', '102,33': 'H,E', '102,34': 'H,E', '102,101': 'H,E',
+    '103,1': 'P,H', '103,2': 'P,H', '103,3': 'P,H', '103,8': 'P,H', '103,10': 'P,H', '103,11': 'P,H', '103,12': 'U',
+    '103,21': 'P,H', '103,22': 'P,H', '103,23': 'P,H', '103,24': 'P,H', '103,25': 'P,H', '103,30': 'P,H',
+    '103,31': 'P,H', '103,33': 'P,H', '103,102': 'H,E', '104,1': 'H,GT', '104,3': 'H,GT', '104,4': 'H,F', '104,5': 'H,F',
+    '104,6': 'H,F,GT', '104,7': 'H,F,GT', '104,8': 'H,E', '104,9': 'H,F,GT', '104,11': 'H,E,GT', '104,12': 'H,F,GT',
+    '104,13': 'H,F', '104,14': 'H,F', '104,16': 'H,F', '104,17': 'H,GT', '104,18': 'H,F,GT', '104,19': 'H,F',
+    '104,20': 'H,F,GT', '104,21': 'H,F,E', '104,22': 'H,F,E', '104,23': 'H,F', '104,25': 'H,F,E', '104,26': 'H,F,GT',
+    '104,27': 'H,E', '104,28': 'H,F', '104,29': 'H,F', '104,30': 'H,G', '104,31': 'H,F', '104,32': 'H,F,GT',
+    '104,33': 'H,F,GT', '104,34': 'H,F,G', '104,101': 'H,F,G', '104,102': 'H,E', '104,103': 'H,F,GT', '105,1': 'H,GF',
+    '105,2': 'H,F,GT', '105,3': 'H,GF', '105,4': 'H,F,GF', '105,5': 'H,F,GF', '105,6': 'H,GF', '105,7': 'H,G',
+    '105,11': 'H,GT', '105,12': 'H,F', '105,16': 'H,F,E', '105,17': 'H,E', '105,18': 'H,GF', '105,19': 'H,GF',
+    '105,20': 'H,GF', '105,26': 'H,GF', '105,27': 'H,E', '105,30': 'H,E', '105,31': 'H,GF', '105,32': 'H,GT,GF',
+    '105,34': 'H', '105,101': 'H,GF', '105,102': 'H,E', '105,103': 'H,P,GF', '105,104': 'H,F,E', '106,1': 'H',
+    '106,2': 'H', '106,8': 'G', '106,18': 'H,G', '106,21': 'H,GF', '106,22': 'H,GF', '106,24': 'S', '106,25': 'H,GF',
+    '106,33': 'GT,GF', '106,105': 'GF,GT'
+}
+
+
+def _cs_pair(a, b):
+    """codes for mixing EPA groups a and b; None = no rating in the chart (which does not prove the mix is safe)"""
+    a, b = str(a), str(b)
+    if a == '107' or b == '107':
+        return ['WR']
+    if a == b:
+        return None
+    order = list(CS_EPA_GROUPS)
+    hi, lo = (a, b) if order.index(a) > order.index(b) else (b, a)
+    raw = CS_EPA_MATRIX.get(f'{hi},{lo}')
+    if not raw:
+        return None
+    out = []
+    for c in raw.split(','):
+        for x in (['H', 'F'] if c == 'HF' else [c]):      # 'HF' is printed for heat + fire
+            if x not in out:
+                out.append(x)
+    return out
+
+
+def _cs_explain(codes):
+    if codes == ['WR']:
+        return 'Water-reactive substance: EPA chart says do not mix with any chemical or waste.'
+    return ', '.join(CS_CODES.get(c, c) for c in codes)
+
+
+def _cs_rank(codes):
+    if not codes:
+        return 0
+    if codes == ['WR']:
+        return 5
+    return max(CS_SEVERITY.get(c, 1) for c in codes)
+
+
+# CAMEO Chemicals reactive group (as PubChem returns it) -> EPA chart group(s). Only clear matches; anything else is
+# left for a person to choose. Suggestions are always shown as "suggested" until confirmed.
+CS_CAMEO_TO_EPA = {
+    'Acids, Strong Non-oxidizing': ['1'], 'Acids, Strong Oxidizing': ['2', '104'], 'Acids, Carboxylic': ['3'],
+    'Alcohols and Polyols': ['4'], 'Aldehydes': ['5'], 'Amides and Imides': ['6'], 'Amines, Phosphines, and Pyridines': ['7'],
+    'Amines, Aromatic': ['7'], 'Azo, Diazo, Azido, Hydrazine, and Azide Compounds': ['8'], 'Diazonium Salts': ['8'], 'Carbamates': ['9'],
+    'Bases, Strong': ['10'], 'Cyanides, Inorganic': ['11'], 'Thiocarbamate Esters and Salts/Dithiocarbamate Esters and Salts': ['12'],
+    'Esters, Sulfate Esters, Phosphate Esters, Thiophosphate Esters, and Borate Esters': ['13'], 'Ethers': ['14'],
+    'Fluoride Salts, Soluble': ['15'], 'Hydrocarbons, Aromatic': ['16'], 'Halogenated Organic Compounds': ['17'], 'Aryl Halides': ['17'],
+    'Isocyanates and Isothiocyanates': ['18'], 'Ketones': ['19'], 'Sulfides, Organic': ['20'], 'Metals, Alkali, Very Active': ['21', '107'],
+    'Metals, Elemental and Powder, Active': ['22'], 'Metals, Less Reactive': ['23'], 'Nitrides, Phosphides, Carbides, and Silicides': ['25', '107'],
+    'Nitriles': ['26'], 'Nitro, Nitroso, Nitrate, and Nitrite Compounds, Organic': ['27'], 'Hydrocarbons, Aliphatic Unsaturated': ['28'],
+    'Alkynes, with Acetylenic Hydrogen': ['28'], 'Alkynes, with No Acetylenic Hydrogen': ['28'], 'Conjugated Dienes': ['28', '103'],
+    'Hydrocarbons, Aliphatic Saturated': ['29'], 'Peroxides, Organic': ['30'], 'Phenols and Cresols': ['31'],
+    'Sulfonates, Phosphonates, and Thiophosphonates, Organic': ['32'], 'Sulfides, Inorganic': ['33'], 'Epoxides': ['34'],
+    'Polymerizable Compounds': ['103'], 'Acrylates and Acrylic Acids': ['103'], 'Oxidizing Agents, Strong': ['104'],
+    'Nitrate and Nitrite Compounds, Inorganic': ['104'], 'Reducing Agents, Strong': ['105'], 'Water and Aqueous Solutions': ['106'],
+    'Metal Hydrides, Metal Alkyls, Metal Aryls, and Silanes': ['105', '107'], 'Chlorosilanes': ['107'],
+    'Acyl Halides, Sulfonyl Halides, and Chloroformates': ['107'],
+}
+# GHS hazard statement -> EPA group (the special groups that have no CAMEO equivalent)
+CS_H_TO_EPA = {('H200', 'H201', 'H202', 'H203', 'H204', 'H205'): '102', ('H260', 'H261'): '107', ('H270', 'H271', 'H272'): '104',
+               ('H220', 'H221', 'H222', 'H223', 'H224', 'H225', 'H226', 'H228'): '101'}
+
+# Peroxide formers: example lists and test intervals of the University of Iowa EHS guidance
+# (https://ehs.research.uiowa.edu/peroxide-formers). Examples only: other chemicals can form peroxides too.
+CS_PEROXIDE = {
+    'A': ['butadiene', '1,3-butadiene', 'isopropyl ether', 'diisopropyl ether', 'sodium amide', 'chloroprene', 'potassium',
+          'potassium metal', 'vinylidene chloride', '1,1-dichloroethylene', 'divinyl ether', 'potassium amide'],
+    'B': ['acetal', 'dicyclopentadiene', 'methyl acetylene', 'propyne', 't-butyl alcohol', 'tert-butyl alcohol', 'tert-butanol',
+          'diethylene glycol dimethyl ether', 'diglyme', 'methyl cyclopentane', 'methylcyclopentane', 'cumene', 'isopropylbenzene',
+          '1,4-dioxane', 'dioxane', 'methyl isobutyl ketone', '4-methyl-2-pentanone', 'cyclohexene', 'ethyl ether', 'diethyl ether',
+          'ether', 'tetrahydrofuran', 'thf', 'cyclooctene', 'ethylene glycol dimethyl ether', '1,2-dimethoxyethane', 'tetrahydronaphthalene',
+          'tetralin', 'diacetylene', 'furan', 'vinyl ether'],
+    'C': ['acrylic acid', 'styrene', 'vinyl chloride', 'acrylonitrile', 'tetrafluoroethylene', 'vinyl pyridine', '2-vinylpyridine',
+          '4-vinylpyridine', 'chlorotrifluoroethylene', 'vinyl acetate', 'methyl methacrylate', 'vinyl acetylene'],
+}
+CS_PEROXIDE_MONTHS = {'A': 3, 'B': 6, 'C': 6}          # opened containers; unopened: 12 months or the expiry date
+CS_PEROXIDE_LIMIT_PPM = 25.0
+
+
+def _cs_peroxide_guess(*names):
+    for n in names:
+        k = re.sub(r'\s+', ' ', (n or '').strip().lower())
+        for cls, lst in CS_PEROXIDE.items():
+            if k in lst:
+                return cls
+    return None
+
+
+# ---------------------------------------------------------------- rules by country, always beside the international ones
+CS_INTERNATIONAL = [
+    {'title': 'UN Globally Harmonized System of Classification and Labelling of Chemicals (GHS)', 'body': 'United Nations',
+     'what': 'Classification, labels (pictograms, signal word, H and P statements) and the 16-section safety data sheet.',
+     'url': 'https://unece.org/transport/standards/transport/dangerous-goods/ghs-rev10-2023'},
+    {'title': 'ILO Chemicals Convention, 1990 (No. 170) and Recommendation No. 177', 'body': 'International Labour Organization',
+     'what': 'Employers identify, label, keep safety data sheets for, assess and control hazardous chemicals; workers have the right to know.',
+     'url': 'https://normlex.ilo.org/dyn/nrmlx_en/f?p=NORMLEXPUB:12100:0::NO::P12100_ILO_CODE:C170'},
+    {'title': 'ISO 45001:2018 Occupational health and safety management systems', 'body': 'ISO',
+     'what': 'Hazard identification, risk assessment and control of chemical hazards inside the OH&S management system.',
+     'url': 'https://www.iso.org/standard/63787.html'},
+    {'title': 'ISO 11014:2009 Safety data sheet for chemical products', 'body': 'ISO',
+     'what': 'Content and order of the 16 sections of a safety data sheet.', 'url': 'https://www.iso.org/standard/40295.html'},
+]
+CS_LOCAL = {
+    'ghana': [
+        {'title': 'Environmental Protection Act, 2025 (Act 1124)', 'body': 'Environmental Protection Authority',
+         'what': 'Replaced Act 917 and Act 528: hazardous waste, pesticides and chemical control. Check the regulations issued under it.',
+         'url': 'https://leap.unep.org/en/countries/gh/national-legislation/environmental-protection-act-2025-act-1124'},
+        {'title': 'Labour Act, 2003 (Act 651), Part XV Occupational Health, Safety and Environment', 'body': 'Ministry of Employment and Labour Relations',
+         'what': 'Employer duty to provide a safe workplace, information, instruction and protective equipment.', 'url': None},
+        {'title': 'Factories, Offices and Shops Act, 1970 (Act 328)', 'body': 'Department of Factories Inspectorate',
+         'what': 'Workplace safety in factories, offices and shops, including dangerous substances and fumes.', 'url': None},
+    ],
+    'qatar': [
+        {'title': 'Labour Law No. 14 of 2004', 'body': 'Ministry of Labour',
+         'what': 'Employer duties for occupational safety and health; inspections cover chemical hazards.', 'url': None},
+        {'title': 'GCC alignment with the UN GHS', 'body': 'Gulf Cooperation Council',
+         'what': 'Gulf states have worked on GHS-based classification and labelling. Check the current status in Qatar before relying on it.', 'url': None},
+    ],
+    'nigeria': [
+        {'title': 'Factories Act, 1990', 'body': 'Federal Ministry of Labour and Employment (Inspectorate)',
+         'what': 'Main workplace safety law. Check whether newer OSH legislation applies.', 'url': None},
+    ],
+    'kenya': [
+        {'title': 'Occupational Safety and Health Act, 2007, Part IX Chemical Safety (sections 83-90)', 'body': 'DOSHS',
+         'what': 'Handling and disposal of chemicals, safety data sheets, labelling, classification and exposure limits.',
+         'url': 'https://new.kenyalaw.org/akn/ke/act/2007/15/eng@2007-11-09'},
+    ],
+    'south africa': [
+        {'title': 'Regulations for Hazardous Chemical Agents, 2021 (GN R280, OHS Act 85 of 1993)', 'body': 'Department of Employment and Labour',
+         'what': 'Risk assessment, exposure monitoring, GHS classification, labels and SDS; SANS 10234 as the guide.',
+         'url': 'https://lawlibrary.org.za/akn/za/act/gn/2021/r280'},
+    ],
+    'united states': [
+        {'title': 'OSHA Hazard Communication Standard, 29 CFR 1910.1200 (2024 update)', 'body': 'OSHA',
+         'what': 'Labels, SDS, written programme and training. The 2024 update aligns with GHS Rev. 7; compliance dates were extended in 2026.',
+         'url': 'https://www.osha.gov/hazcom'},
+        {'title': 'OSHA Laboratory Standard, 29 CFR 1910.1450', 'body': 'OSHA',
+         'what': 'Chemical hygiene plan, exposure monitoring and training in laboratories.', 'url': 'https://www.osha.gov/laboratories'},
+    ],
+    'united kingdom': [
+        {'title': 'Control of Substances Hazardous to Health Regulations 2002 (COSHH)', 'body': 'HSE',
+         'what': 'Assess, prevent or control exposure, monitor and give health surveillance where needed.', 'url': 'https://www.hse.gov.uk/coshh/'},
+        {'title': 'Dangerous Substances and Explosive Atmospheres Regulations 2002 (DSEAR)', 'body': 'HSE',
+         'what': 'Fire and explosion risks from dangerous substances.', 'url': 'https://www.hse.gov.uk/fireandexplosion/dsear.htm'},
+        {'title': 'GB CLP Regulation', 'body': 'HSE', 'what': 'Classification, labelling and packaging in Great Britain.',
+         'url': 'https://www.hse.gov.uk/chemical-classification/'},
+    ],
+    'eu': [
+        {'title': 'CLP Regulation (EC) No 1272/2008', 'body': 'European Union / ECHA',
+         'what': 'GHS-based classification, labelling and packaging; harmonised classifications in Annex VI.',
+         'url': 'https://echa.europa.eu/regulations/clp/understanding-clp'},
+        {'title': 'REACH Regulation (EC) No 1907/2006', 'body': 'European Union / ECHA',
+         'what': 'Registration, safety data sheets (Annex II), restrictions and authorisation.', 'url': 'https://echa.europa.eu/regulations/reach/understanding-reach'},
+        {'title': 'Chemical Agents Directive 98/24/EC', 'body': 'European Union',
+         'what': 'Employer risk assessment and protection of workers from chemical agents.', 'url': None},
+    ],
+}
+CS_EU = {'austria', 'belgium', 'bulgaria', 'croatia', 'cyprus', 'czech republic', 'czechia', 'denmark', 'estonia', 'finland', 'france', 'germany',
+         'greece', 'hungary', 'ireland', 'italy', 'latvia', 'lithuania', 'luxembourg', 'malta', 'netherlands', 'poland', 'portugal', 'romania',
+         'slovakia', 'slovenia', 'spain', 'sweden'}
+CS_COUNTRY_ALIAS = {'gh': 'ghana', 'qa': 'qatar', 'ng': 'nigeria', 'ke': 'kenya', 'za': 'south africa', 'us': 'united states', 'usa': 'united states',
+                    'united states of america': 'united states', 'uk': 'united kingdom', 'gb': 'united kingdom', 'great britain': 'united kingdom',
+                    'england': 'united kingdom', 'scotland': 'united kingdom', 'wales': 'united kingdom'}
+
+
+def _cs_country(user):
+    c = None
+    try:
+        comp = db.session.get(_TbtCompany, user.company_id) if getattr(user, 'company_id', None) else None
+        c = getattr(comp, 'country', None)
+    except Exception:
+        c = None
+    c = (c or getattr(user, 'country', None) or '').strip()
+    return '' if c.lower() in ('', 'default', 'none') else c
+
+
+def _cs_standards(country):
+    key = CS_COUNTRY_ALIAS.get(country.lower(), country.lower())
+    local = CS_LOCAL.get('eu' if key in CS_EU else key, [])
+    return {'country': country or None, 'local': local, 'international': CS_INTERNATIONAL,
+            'note': ('No country-specific references are built in for this country yet; the international rules apply as a minimum. '
+                     'Check your national labour and environment authority.') if not local else
+                    'Local rules are shown beside the international ones. Where they differ, follow the stricter one and check the current text with the authority.'}
+
+
+# ---------------------------------------------------------------- PubChem
+CS_PUBCHEM = 'https://pubchem.ncbi.nlm.nih.gov/rest'
+CS_GHS_SOURCE_ORDER = ('Regulation (EC) No 1272/2008', 'European Chemicals Agency', 'NITE-CMC', 'Safe Work Australia', 'Hazardous Substances Data Bank')
+CS_SECTIONS = {   # our section -> (PubChem headings in order, preferred sources in order)
+    'first_aid': (('First Aid',), ('CAMEO Chemicals', 'The National Institute for Occupational Safety and Health (NIOSH)', 'ILO-WHO International Chemical Safety Cards (ICSCs)')),
+    'fire': (('Fire Fighting Procedures', 'Firefighting Hazards'), ('CAMEO Chemicals', 'ILO-WHO International Chemical Safety Cards (ICSCs)', 'Hazardous Substances Data Bank (HSDB)')),
+    'spill': (('Spillage Disposal', 'Cleanup Methods', 'Isolation and Evacuation'), ('ILO-WHO International Chemical Safety Cards (ICSCs)', 'CAMEO Chemicals', 'Hazardous Substances Data Bank (HSDB)')),
+    'storage': (('Safe Storage', 'Storage Conditions'), ('ILO-WHO International Chemical Safety Cards (ICSCs)', 'Hazardous Substances Data Bank (HSDB)')),
+    'ppe': (('Personal Protective Equipment (PPE)',), ('CAMEO Chemicals', 'ILO-WHO International Chemical Safety Cards (ICSCs)', 'Hazardous Substances Data Bank (HSDB)')),
+    'reactivity': (('Reactivity Profile', 'Hazardous Reactivities and Incompatibilities', 'Chemical Dangers'), ('CAMEO Chemicals', 'ILO-WHO International Chemical Safety Cards (ICSCs)', 'Hazardous Substances Data Bank (HSDB)')),
+    'exposure': (('Permissible Exposure Limit (PEL)', 'Recommended Exposure Limit (REL)', 'Threshold Limit Values (TLV)', 'Immediately Dangerous to Life or Health (IDLH)'),
+                 ('Occupational Safety and Health Administration (OSHA)', 'The National Institute for Occupational Safety and Health (NIOSH)', 'Hazardous Substances Data Bank (HSDB)')),
+}
+_cs_http = None
+
+
+def _cs_get(path, timeout=15):
+    """GET from PubChem. Only the chemical name, CAS number or compound id is in the URL."""
+    global _cs_http
+    import requests as _rq
+    if _cs_http is None:
+        _cs_http = _rq.Session()
+        _cs_http.headers['User-Agent'] = 'SafeTrackPro-ChemicalSafety/1.0'
+    r = _cs_http.get(CS_PUBCHEM + path, timeout=timeout)
+    if r.status_code == 404:
+        return None
+    if r.status_code in (429, 503):
+        raise RuntimeError('PubChem is busy. Try again in a minute.')
+    r.raise_for_status()
+    return r.json()
+
+
+def _cs_texts(info):
+    v = info.get('Value', {}) or {}
+    out = [m.get('String', '') for m in v.get('StringWithMarkup', []) if m.get('String')]
+    if not out and v.get('Number') is not None:
+        out = [f"{v.get('Number')[0] if isinstance(v.get('Number'), list) else v.get('Number')} {v.get('Unit', '')}".strip()]
+    return [re.sub(r'\s+', ' ', t).strip() for t in out if t.strip()]
+
+
+def _cs_find(sec, heading):
+    for s in sec.get('Section', []) or []:
+        if s.get('TOCHeading') == heading:
+            return s
+        r = _cs_find(s, heading)
+        if r is not None:
+            return r
+    return None
+
+
+def _cs_parse_safety(record):
+    refs = {r.get('ReferenceNumber'): r.get('SourceName') or '' for r in record.get('Reference', [])}
+    out = {'ghs': None, 'sections': {}, 'cameo_groups': []}
+    ghs = _cs_find(record, 'GHS Classification')
+    if ghs:
+        sets = {}
+        for inf in ghs.get('Information', []):
+            ref = inf.get('ReferenceNumber')
+            s = sets.setdefault(ref, {'source': refs.get(ref, ''), 'pictograms': [], 'signal': None, 'h': [], 'p': []})
+            name = inf.get('Name') or ''
+            if name == 'Pictogram(s)':
+                for m in inf.get('Value', {}).get('StringWithMarkup', []):
+                    for mk in m.get('Markup', []):
+                        code = re.search(r'(GHS0\d)', mk.get('URL') or '')
+                        if code and code.group(1) not in [p['code'] for p in s['pictograms']]:
+                            s['pictograms'].append({'code': code.group(1), 'name': mk.get('Extra') or ''})
+            elif name == 'Signal':
+                s['signal'] = (_cs_texts(inf) or [None])[0]
+            elif name == 'GHS Hazard Statements':
+                s['h'] += [t[:300] for t in _cs_texts(inf)]
+            elif name == 'Precautionary Statement Codes':
+                s['p'] += [c.strip() for t in _cs_texts(inf) for c in re.split(r',\s*', t) if re.match(r'^P\d', c.strip())]
+        ranked = sorted((s for s in sets.values() if s['h'] or s['pictograms']),
+                        key=lambda s: next((i for i, k in enumerate(CS_GHS_SOURCE_ORDER) if k in s['source']), 99))
+        if ranked:
+            out['ghs'] = ranked[0]
+            out['ghs']['h'] = out['ghs']['h'][:40]
+            out['ghs']['p'] = list(dict.fromkeys(out['ghs']['p']))[:60]
+            out['ghs']['other_sources'] = len(ranked) - 1
+    for key, (heads, prefer) in CS_SECTIONS.items():
+        found = []
+        for h in heads:
+            s = _cs_find(record, h)
+            for inf in (s or {}).get('Information', []):
+                src = refs.get(inf.get('ReferenceNumber'), '')
+                txt = ' '.join(_cs_texts(inf))
+                if txt:
+                    found.append({'heading': h, 'source': src, 'text': txt[:1800]})
+        found.sort(key=lambda f: (next((i for i, k in enumerate(prefer) if k == f['source']), 50), heads.index(f['heading'])))
+        out['sections'][key] = found[:3] if key != 'exposure' else found[:6]
+    rg = _cs_find(record, 'Reactive Group')
+    for inf in (rg or {}).get('Information', []):
+        for t in _cs_texts(inf):
+            for g in re.split(r'\s*(?:\n|;)\s*', t):
+                if g and g not in out['cameo_groups']:
+                    out['cameo_groups'].append(g[:120])
+    return out
+
+
+def _cs_suggest_groups(data):
+    groups = []
+    for g in data.get('cameo_groups', []):
+        for e in CS_CAMEO_TO_EPA.get(g, []):
+            if e not in groups:
+                groups.append(e)
+    hcodes = {m.group(0) for h in ((data.get('ghs') or {}).get('h') or []) for m in [re.match(r'H\d{3}', h)] if m}
+    for codes, e in CS_H_TO_EPA.items():
+        if hcodes & set(codes) and e not in groups:
+            groups.append(e)
+    return groups
+
+
+def _cs_substance_dict(s, full=True):
+    d = _tbt_json(s.data, {})
+    out = {'id': s.id, 'cid': s.cid, 'name': s.name, 'cas': s.cas, 'formula': s.formula, 'molecular_weight': d.get('mw'),
+           'iupac': d.get('iupac'), 'pubchem_url': f'https://pubchem.ncbi.nlm.nih.gov/compound/{s.cid}' if s.cid else None,
+           'suggested_groups': _cs_suggest_groups(d), 'cameo_groups': d.get('cameo_groups', []),
+           'peroxide_class': _cs_peroxide_guess(s.name, *(d.get('synonyms') or [])[:15]), 'fetched_at': _in_iso(s.fetched_at)}
+    if full:
+        out.update({'ghs': d.get('ghs'), 'sections': d.get('sections', {})})
+    return out
+
+
+def _cs_fetch_substance(cid, refresh=False):
+    s = ChemSubstance.query.filter_by(cid=cid).first()
+    if s and not refresh and s.fetched_at and s.fetched_at > datetime.utcnow() - timedelta(days=180):
+        return s
+    props = _cs_get(f'/pug/compound/cid/{int(cid)}/property/Title,MolecularFormula,MolecularWeight,IUPACName/JSON')
+    if not props:
+        return None
+    p = props['PropertyTable']['Properties'][0]
+    safety = _cs_get(f'/pug_view/data/compound/{int(cid)}/JSON?heading=Safety+and+Hazards', timeout=25)
+    parsed = _cs_parse_safety(safety['Record']) if safety else {'ghs': None, 'sections': {}, 'cameo_groups': []}
+    cas = None
+    try:
+        cj = _cs_get(f'/pug_view/data/compound/{int(cid)}/JSON?heading=CAS')
+        texts = [t for inf in (_cs_find(cj['Record'], 'CAS') or {}).get('Information', []) for t in _cs_texts(inf)] if cj else []
+        cas = next((t for t in texts if re.fullmatch(r'\d{2,7}-\d{2}-\d', t)), None)
+    except Exception:
+        cas = None
+    syn = []
+    try:
+        sj = _cs_get(f'/pug/compound/cid/{int(cid)}/synonyms/JSON')
+        syn = (sj or {}).get('InformationList', {}).get('Information', [{}])[0].get('Synonym', [])[:25]
+    except Exception:
+        syn = []
+    data = {'iupac': p.get('IUPACName'), 'mw': p.get('MolecularWeight'), 'synonyms': syn, **parsed}
+    if not s:
+        s = ChemSubstance(cid=int(cid))
+        db.session.add(s)
+    s.name = (p.get('Title') or f'CID {cid}')[:200]
+    s.formula = (p.get('MolecularFormula') or '')[:120] or None
+    s.cas = cas
+    s.data = json.dumps(data)
+    s.fetched_at = datetime.utcnow()
+    db.session.commit()
+    return s
+
+
+def _cs_staff_403(user):
+    if not _rc_staff(user):
+        return jsonify({'success': False, 'error': 'Only supervisors and admins can change the chemical register.'}), 403
+    return None
+
+
+def _cs_item(user, iid):
+    it = db.session.get(ChemItem, iid)
+    return it if it and it.company_id == user.company_id else None
+
+
+def _cs_months(d, n):
+    m = d.month - 1 + n
+    y = d.year + m // 12
+    m = m % 12 + 1
+    import calendar as _cal
+    return d.replace(year=y, month=m, day=min(d.day, _cal.monthrange(y, m)[1]))
+
+
+def _cs_item_state(it, last_test, today):
+    """What needs doing for this container (expiry and peroxide tests)."""
+    issues = []
+    if it.status != 'in_use':
+        return issues
+    if it.expires_on:
+        days = (it.expires_on - today).days
+        if days < 0:
+            issues.append({'kind': 'expired', 'level': 'high', 'text': f'Expired {-days} day(s) ago', 'date': it.expires_on.isoformat()})
+        elif days <= 30:
+            issues.append({'kind': 'expiring', 'level': 'medium', 'text': f'Expires in {days} day(s)', 'date': it.expires_on.isoformat()})
+    if it.peroxide_class in CS_PEROXIDE_MONTHS:
+        if last_test and last_test.result_ppm is not None and last_test.result_ppm >= CS_PEROXIDE_LIMIT_PPM:
+            issues.append({'kind': 'peroxide_high', 'level': 'critical',
+                           'text': f'Last peroxide test {last_test.result_ppm:g} ppm (limit {CS_PEROXIDE_LIMIT_PPM:g}): do not use, arrange disposal',
+                           'date': last_test.tested_on.isoformat()})
+        else:
+            if it.opened_on:
+                base = max(it.opened_on, last_test.tested_on) if last_test else it.opened_on
+                due = _cs_months(base, CS_PEROXIDE_MONTHS[it.peroxide_class])
+                why = f'Class {it.peroxide_class} peroxide former, opened: test every {CS_PEROXIDE_MONTHS[it.peroxide_class]} months'
+            else:
+                start = it.received_on or (it.created_at.date() if it.created_at else today)
+                due = _cs_months(last_test.tested_on, 12) if last_test else _cs_months(start, 12)
+                if it.expires_on and it.expires_on < due:
+                    due = it.expires_on
+                why = f'Class {it.peroxide_class} peroxide former, unopened: test 12 months after receipt or at expiry'
+            days = (due - today).days
+            if days < 0:
+                issues.append({'kind': 'peroxide_test_overdue', 'level': 'high', 'text': f'Peroxide test overdue by {-days} day(s). {why}', 'date': due.isoformat()})
+            elif days <= 14:
+                issues.append({'kind': 'peroxide_test_due', 'level': 'medium', 'text': f'Peroxide test due in {days} day(s). {why}', 'date': due.isoformat()})
+    return issues
+
+
+def _cs_item_dict(it, today, last_test=None, sub=None):
+    groups = _tbt_json(it.groups, [])
+    return {'id': it.id, 'name': it.name, 'cas': it.cas, 'substance_id': it.substance_id, 'cid': getattr(sub, 'cid', None),
+            'location': it.location, 'quantity': it.quantity, 'unit': it.unit, 'containers': it.containers, 'supplier': it.supplier,
+            'groups': groups, 'group_names': [CS_EPA_GROUPS.get(g, g) for g in groups], 'groups_confirmed': bool(it.groups_confirmed),
+            'peroxide_class': it.peroxide_class, 'received_on': it.received_on.isoformat() if it.received_on else None,
+            'opened_on': it.opened_on.isoformat() if it.opened_on else None, 'expires_on': it.expires_on.isoformat() if it.expires_on else None,
+            'status': it.status, 'notes': it.notes, 'has_sds': bool(it.sds_file), 'sds_uploaded_at': _in_iso(it.sds_uploaded_at),
+            'last_test': {'tested_on': last_test.tested_on.isoformat(), 'result_ppm': last_test.result_ppm, 'result': last_test.result} if last_test else None,
+            'issues': _cs_item_state(it, last_test, today), 'updated_at': _in_iso(it.updated_at)}
+
+
+def _cs_last_tests(ids):
+    out = {}
+    if not ids:
+        return out
+    for t in ChemTest.query.filter(ChemTest.item_id.in_(list(ids))).order_by(ChemTest.tested_on, ChemTest.id).all():
+        out[t.item_id] = t
+    return out
+
+
+def _cs_import_legacy(user):
+    """Copy the old chemical_inventory rows of this company into the register once (the old table stays as it was)."""
+    try:
+        legacy = Chemical.query.filter_by(company_id=user.company_id).all()
+    except Exception:
+        return 0
+    have = {r.legacy_id for r in ChemItem.query.filter(ChemItem.company_id == user.company_id, ChemItem.legacy_id.isnot(None)).all()}
+    n = 0
+    for c in legacy:
+        if c.id in have:
+            continue
+        db.session.add(ChemItem(company_id=user.company_id, name=_rc_text(c.name, 200) or 'Unnamed chemical', location=_rc_text(c.location, 160) or None,
+                                notes=' | '.join(x for x in (f'Quantity: {c.quantity}' if c.quantity else '', f'Hazard: {c.hazard_class}' if c.hazard_class else '',
+                                                              f'Risk: {c.risk_level}' if c.risk_level else '', f'SDS link: {c.sds_url}' if c.sds_url else '') if x) or None,
+                                legacy_id=c.id, created_by=c.user_id, groups='[]'))
+        n += 1
+    if n:
+        db.session.commit()
+    return n
+
+
+def _cs_storage_conflicts(items):
+    by_loc = {}
+    for it in items:
+        if it.status == 'in_use' and it.location:
+            by_loc.setdefault(re.sub(r'\s+', ' ', it.location.strip().lower()), []).append(it)
+    out = []
+    for loc, rows in by_loc.items():
+        for i in range(len(rows)):
+            for j in range(i + 1, len(rows)):
+                a, b = rows[i], rows[j]
+                worst, codes_all = 0, []
+                for ga in _tbt_json(a.groups, []):
+                    for gb in _tbt_json(b.groups, []):
+                        c = _cs_pair(ga, gb)
+                        if c:
+                            worst = max(worst, _cs_rank(c))
+                            codes_all.append({'a_group': ga, 'b_group': gb, 'codes': c, 'meaning': _cs_explain(c)})
+                if codes_all:
+                    out.append({'location': rows[i].location, 'a': {'id': a.id, 'name': a.name}, 'b': {'id': b.id, 'name': b.name},
+                                'severity': worst, 'reactions': codes_all[:6]})
+    out.sort(key=lambda r: -r['severity'])
+    return out
+
+
+def _cs_sds_dir(cid):
+    return os.path.join(BASE_UPLOAD_DIR, 'chemical_sds', str(int(cid)))
+
+
+# ---------------------------------------------------------------- routes
+@app.route('/api/chem/groups', methods=['GET'])
+@jwt_required
+def cs_groups_route():
+    return jsonify({'success': True, 'data': {'groups': [{'id': k, 'name': v} for k, v in CS_EPA_GROUPS.items()], 'codes': CS_CODES,
+                                              'source': 'EPA-600/2-80-076 (Hatayama et al., 1980), A Method for Determining the Compatibility of Hazardous Wastes',
+                                              'caution': 'The chart shows some hazards to expect on mixing. A blank does not prove a mixture is safe.'}}), 200
+
+
+@app.route('/api/chem/lookup', methods=['GET'])
+@jwt_required
+def cs_lookup_route():
+    """Find a chemical by name or CAS number (PubChem). Only the search text is sent."""
+    q = _rc_text(request.args.get('q'), 120)
+    if len(q) < 2:
+        return jsonify({'success': True, 'data': []}), 200
+    if not re.fullmatch(r"[A-Za-z0-9 ,.()'\-\[\]+/]+", q):
+        return jsonify({'success': False, 'error': 'Use letters, numbers and - , . ( ) only.'}), 400
+    cached = ChemSubstance.query.filter(or_(func.lower(ChemSubstance.name) == q.lower(), ChemSubstance.cas == q)).limit(5).all()
+    if cached:
+        return jsonify({'success': True, 'data': [_cs_substance_dict(s, full=False) for s in cached], 'cached': True}), 200
+    try:
+        from urllib.parse import quote as _q
+        ids = _cs_get(f'/pug/compound/name/{_q(q, safe="")}/cids/JSON')
+        cids = ((ids or {}).get('IdentifierList') or {}).get('CID', [])[:5]
+        if not cids:
+            return jsonify({'success': True, 'data': []}), 200
+        props = _cs_get(f'/pug/compound/cid/{",".join(str(int(c)) for c in cids)}/property/Title,MolecularFormula,MolecularWeight/JSON')
+    except Exception as e:
+        logger.error(f'pubchem lookup: {e}')
+        return jsonify({'success': False, 'error': 'The chemical database (PubChem) could not be reached. Try again, or add the chemical by hand.'}), 502
+    out = [{'cid': p['CID'], 'name': p.get('Title'), 'formula': p.get('MolecularFormula'), 'molecular_weight': p.get('MolecularWeight')}
+           for p in (props or {}).get('PropertyTable', {}).get('Properties', [])]
+    return jsonify({'success': True, 'data': out}), 200
+
+
+@app.route('/api/chem/substance/<int:cid>', methods=['GET'])
+@jwt_required
+def cs_substance_route(cid):
+    try:
+        s = _cs_fetch_substance(cid, refresh=request.args.get('refresh') == '1' and _rc_staff(request.user))
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f'pubchem substance {cid}: {e}')
+        return jsonify({'success': False, 'error': 'The chemical database (PubChem) could not be reached. Try again in a minute.'}), 502
+    if not s:
+        return jsonify({'success': False, 'error': 'Chemical not found in PubChem.'}), 404
+    return jsonify({'success': True, 'data': _cs_substance_dict(s)}), 200
+
+
+@app.route('/api/chem/items', methods=['GET'])
+@jwt_required
+def cs_items_route():
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    if _rc_staff(user):
+        _cs_import_legacy(user)
+    q = ChemItem.query.filter(ChemItem.company_id == user.company_id)
+    if request.args.get('status') in ('in_use', 'disposed'):
+        q = q.filter(ChemItem.status == request.args['status'])
+    rows = q.order_by(func.lower(ChemItem.name)).limit(2000).all()
+    today = datetime.utcnow().date()
+    last = _cs_last_tests({r.id for r in rows})
+    subs = {s.id: s for s in ChemSubstance.query.filter(ChemSubstance.id.in_({r.substance_id for r in rows if r.substance_id} or {0})).all()}
+    return jsonify({'success': True, 'data': [_cs_item_dict(r, today, last.get(r.id), subs.get(r.substance_id)) for r in rows],
+                    'can_manage': _rc_staff(user)}), 200
+
+
+def _cs_apply(it, data, user):
+    if 'name' in data or it.id is None:
+        name = _rc_text(data.get('name'), 200)
+        if len(name) < 2:
+            raise ValueError('Type the chemical name.')
+        it.name = name
+    if 'cas' in data:
+        cas = _rc_text(data.get('cas'), 40)
+        if cas and not re.fullmatch(r'\d{2,7}-\d{2}-\d', cas):
+            raise ValueError('A CAS number looks like 67-64-1.')
+        it.cas = cas or None
+    for k, n in (('location', 160), ('supplier', 160), ('unit', 12)):
+        if k in data:
+            setattr(it, k, _rc_text(data.get(k), n) or None)
+    if 'notes' in data:
+        it.notes = _rc_text(data.get('notes'), 4000) or None
+    if 'quantity' in data:
+        v = data.get('quantity')
+        if v in (None, ''):
+            it.quantity = None
+        else:
+            try:
+                it.quantity = float(v)
+            except (TypeError, ValueError):
+                raise ValueError('Quantity must be a number.')
+            if it.quantity < 0 or it.quantity > 1e9:
+                raise ValueError('Quantity is out of range.')
+    if 'containers' in data:
+        v = data.get('containers')
+        try:
+            it.containers = int(v) if v not in (None, '') else None
+        except (TypeError, ValueError):
+            raise ValueError('Number of containers must be a whole number.')
+    if 'groups' in data:
+        gs = data.get('groups') or []
+        if not isinstance(gs, list) or any(str(g) not in CS_EPA_GROUPS for g in gs) or len(gs) > 8:
+            raise ValueError('Unknown reactivity group.')
+        it.groups = json.dumps(list(dict.fromkeys(str(g) for g in gs)))
+        it.groups_confirmed = bool(data.get('groups_confirmed', True))
+    if 'peroxide_class' in data:
+        pc = data.get('peroxide_class') or None
+        if pc not in (None, 'A', 'B', 'C'):
+            raise ValueError('Peroxide class must be A, B, C or none.')
+        it.peroxide_class = pc
+    for k in ('received_on', 'opened_on', 'expires_on'):
+        if k in data:
+            setattr(it, k, _ct_date(data.get(k)))
+    today = datetime.utcnow().date()
+    if it.received_on and it.received_on > today:
+        raise ValueError('The received date cannot be in the future.')
+    if it.opened_on and it.opened_on > today:
+        raise ValueError('The opened date cannot be in the future.')
+    if it.opened_on and it.received_on and it.opened_on < it.received_on:
+        raise ValueError('A container cannot be opened before it was received.')
+    if 'status' in data:
+        if data.get('status') not in ('in_use', 'disposed'):
+            raise ValueError('Unknown status.')
+        it.status = data['status']
+    if 'substance_id' in data:
+        sid = data.get('substance_id')
+        if sid in (None, ''):
+            it.substance_id = None
+        else:
+            s = db.session.get(ChemSubstance, int(sid))
+            if not s:
+                raise ValueError('Unknown chemical record.')
+            it.substance_id = s.id
+            if not it.cas and s.cas:
+                it.cas = s.cas
+
+
+@app.route('/api/chem/items', methods=['POST'])
+@app.route('/api/chem/items/<int:iid>', methods=['PUT', 'DELETE'])
+@jwt_required
+def cs_item_save_route(iid=None):
+    user = request.user
+    deny = _in_company_403(user) or _cs_staff_403(user)
+    if deny:
+        return deny
+    if iid is None:
+        if ChemItem.query.filter(ChemItem.company_id == user.company_id).count() >= 5000:
+            return jsonify({'success': False, 'error': 'Register limit reached.'}), 400
+        it = ChemItem(company_id=user.company_id, created_by=user.id, groups='[]', status='in_use')
+    else:
+        it = _cs_item(user, iid)
+        if not it:
+            return jsonify({'success': False, 'error': 'Chemical not found.'}), 404
+        if request.method == 'DELETE':
+            path = os.path.join(_cs_sds_dir(it.company_id), it.sds_file) if it.sds_file and re.fullmatch(r'[0-9a-f]{32}\.pdf', it.sds_file) else None
+            db.session.delete(it)
+            db.session.commit()
+            if path and os.path.exists(path):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            return jsonify({'success': True}), 200
+    data = _in_body()
+    try:
+        _cs_apply(it, data, user)
+    except (ValueError, TypeError) as e:
+        db.session.rollback()
+        return jsonify({'success': False, 'error': str(e)}), 400
+    if iid is None:
+        db.session.add(it)
+    db.session.commit()
+    today = datetime.utcnow().date()
+    return jsonify({'success': True, 'data': _cs_item_dict(it, today, _cs_last_tests({it.id}).get(it.id),
+                                                           db.session.get(ChemSubstance, it.substance_id) if it.substance_id else None)}), 201 if iid is None else 200
+
+
+@app.route('/api/chem/items/<int:iid>/tests', methods=['GET', 'POST'])
+@jwt_required
+def cs_tests_route(iid):
+    user = request.user
+    it = _cs_item(user, iid)
+    if not it:
+        return jsonify({'success': False, 'error': 'Chemical not found.'}), 404
+    if request.method == 'POST':
+        deny = _cs_staff_403(user)
+        if deny:
+            return deny
+        data = _in_body()
+        try:
+            d = _ct_date(data.get('tested_on')) or datetime.utcnow().date()
+        except ValueError as e:
+            return jsonify({'success': False, 'error': str(e)}), 400
+        if d > datetime.utcnow().date():
+            return jsonify({'success': False, 'error': 'The test date cannot be in the future.'}), 400
+        ppm = data.get('result_ppm')
+        try:
+            ppm = float(ppm) if ppm not in (None, '') else None
+        except (TypeError, ValueError):
+            return jsonify({'success': False, 'error': 'The result must be a number (ppm).'}), 400
+        if ppm is not None and not (0 <= ppm <= 100000):
+            return jsonify({'success': False, 'error': 'The result is out of range.'}), 400
+        kind = data.get('kind') if data.get('kind') in ('peroxide', 'visual', 'other') else 'peroxide'
+        if kind == 'peroxide' and ppm is None:
+            return jsonify({'success': False, 'error': 'Enter the peroxide reading in ppm.'}), 400
+        t = ChemTest(company_id=it.company_id, item_id=it.id, kind=kind, tested_on=d, result_ppm=ppm,
+                     result=_rc_text(data.get('result'), 300) or None, tested_by=user.id)
+        db.session.add(t)
+        it.notified_on = None
+        db.session.commit()
+        if ppm is not None and ppm >= CS_PEROXIDE_LIMIT_PPM:
+            _in_notify([(u.id, getattr(u, 'email', None)) for u in _rc_staff_users(it.company_id, user.id)],
+                       f'Peroxide level high: {it.name}'[:200],
+                       f'{it.name} ({it.location or "no location"}) tested {ppm:g} ppm, at or above {CS_PEROXIDE_LIMIT_PPM:g} ppm. Do not use, move or open it further; arrange disposal.',
+                       '/chemicals?tab=alerts', 'critical', email=True)
+    rows = ChemTest.query.filter(ChemTest.item_id == it.id).order_by(ChemTest.tested_on.desc(), ChemTest.id.desc()).limit(100).all()
+    names = _in_names([r.tested_by for r in rows])
+    return jsonify({'success': True, 'data': [{'id': r.id, 'kind': r.kind, 'tested_on': r.tested_on.isoformat(), 'result_ppm': r.result_ppm,
+                                               'result': r.result, 'tested_by': names.get(r.tested_by)} for r in rows]}), 201 if request.method == 'POST' else 200
+
+
+@app.route('/api/chem/items/<int:iid>/sds', methods=['GET', 'POST', 'DELETE'])
+@jwt_required
+def cs_sds_route(iid):
+    """The supplier's safety data sheet for this chemical (PDF)."""
+    user = request.user
+    it = _cs_item(user, iid)
+    if not it:
+        return jsonify({'success': False, 'error': 'Chemical not found.'}), 404
+    folder = _cs_sds_dir(it.company_id)
+    path = os.path.join(folder, it.sds_file) if it.sds_file and re.fullmatch(r'[0-9a-f]{32}\.pdf', it.sds_file) else None
+    if request.method == 'GET':
+        if not path or not os.path.exists(path):
+            return jsonify({'success': False, 'error': 'No supplier SDS uploaded for this chemical yet.'}), 404
+        resp = send_file(path, mimetype='application/pdf', as_attachment=False,
+                         download_name=re.sub(r'[^A-Za-z0-9_-]+', '_', it.name)[:60] + '_SDS.pdf')
+        resp.headers['X-Content-Type-Options'] = 'nosniff'
+        resp.headers['Cache-Control'] = 'private, no-store'
+        return resp
+    deny = _cs_staff_403(user)
+    if deny:
+        return deny
+    if request.method == 'DELETE':
+        it.sds_file, it.sds_mime, it.sds_uploaded_at = None, None, None
+        db.session.commit()
+        if path and os.path.exists(path):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        return jsonify({'success': True}), 200
+    up = request.files.get('file')
+    if not up or not up.filename:
+        return jsonify({'success': False, 'error': 'Choose the SDS file (PDF).'}), 400
+    raw = up.read(20 * 1024 * 1024 + 1)
+    if len(raw) > 20 * 1024 * 1024:
+        return jsonify({'success': False, 'error': 'The file is larger than 20 MB.'}), 400
+    if not raw.startswith(b'%PDF'):
+        return jsonify({'success': False, 'error': 'The SDS must be a PDF file.'}), 400
+    try:
+        import fitz as _fz
+        with _fz.open(stream=raw, filetype='pdf') as _d:
+            if _d.page_count < 1:
+                raise ValueError('empty')
+    except Exception:
+        return jsonify({'success': False, 'error': 'The PDF could not be opened.'}), 400
+    os.makedirs(folder, exist_ok=True)
+    name = f'{uuid.uuid4().hex}.pdf'
+    with open(os.path.join(folder, name), 'wb') as fh:
+        fh.write(raw)
+    old = path
+    it.sds_file, it.sds_mime, it.sds_uploaded_at = name, 'application/pdf', datetime.utcnow()
+    db.session.commit()
+    if old and os.path.exists(old):
+        try:
+            os.remove(old)
+        except OSError:
+            pass
+    return jsonify({'success': True, 'data': {'has_sds': True, 'sds_uploaded_at': _in_iso(it.sds_uploaded_at)}}), 200
+
+
+@app.route('/api/chem/compatibility', methods=['POST'])
+@jwt_required
+def cs_compat_route():
+    """Pairs of chemicals (register items) and/or EPA groups -> expected reactions."""
+    user = request.user
+    data = _in_body()
+    entries = []
+    for iid in (data.get('items') or [])[:20]:
+        try:
+            it = _cs_item(user, int(iid))
+        except (TypeError, ValueError):
+            it = None
+        if not it:
+            return jsonify({'success': False, 'error': 'A chemical is not in your register.'}), 400
+        entries.append({'label': it.name, 'item_id': it.id, 'groups': _tbt_json(it.groups, []), 'confirmed': bool(it.groups_confirmed)})
+    for g in (data.get('groups') or [])[:20]:
+        if str(g) not in CS_EPA_GROUPS:
+            return jsonify({'success': False, 'error': 'Unknown reactivity group.'}), 400
+        entries.append({'label': CS_EPA_GROUPS[str(g)], 'groups': [str(g)], 'confirmed': True})
+    if len(entries) < 2:
+        return jsonify({'success': False, 'error': 'Choose at least two chemicals or groups.'}), 400
+    pairs, missing = [], [e['label'] for e in entries if not e['groups']]
+    for i in range(len(entries)):
+        for j in range(i + 1, len(entries)):
+            a, b = entries[i], entries[j]
+            reactions = []
+            for ga in a['groups']:
+                for gb in b['groups']:
+                    c = _cs_pair(ga, gb)
+                    if c:
+                        reactions.append({'a_group': ga, 'a_group_name': CS_EPA_GROUPS[ga], 'b_group': gb, 'b_group_name': CS_EPA_GROUPS[gb],
+                                          'codes': c, 'meaning': _cs_explain(c)})
+            sev = max([_cs_rank(r['codes']) for r in reactions] or [0])
+            pairs.append({'a': a['label'], 'b': b['label'], 'severity': sev, 'reactions': reactions,
+                          'verdict': ('Do not mix or store together' if sev >= 3 else 'Keep apart: hazardous reaction possible' if sev >= 1 else
+                                      ('Unknown: reactivity group missing' if not a['groups'] or not b['groups'] else 'No reaction listed in the EPA chart')),
+                          'unconfirmed': not (a['confirmed'] and b['confirmed'])})
+    pairs.sort(key=lambda p: -p['severity'])
+    return jsonify({'success': True, 'data': {'pairs': pairs, 'missing_groups': missing,
+                                              'caution': 'Based on the EPA compatibility chart (EPA-600/2-80-076). A blank does not prove a mixture is safe; '
+                                                         'also read the reactivity section of each supplier SDS.'}}), 200
+
+
+@app.route('/api/chem/alerts', methods=['GET'])
+@jwt_required
+def cs_alerts_route():
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    rows = ChemItem.query.filter(ChemItem.company_id == user.company_id, ChemItem.status == 'in_use').all()
+    today = datetime.utcnow().date()
+    last = _cs_last_tests({r.id for r in rows})
+    items = []
+    for r in rows:
+        for iss in _cs_item_state(r, last.get(r.id), today):
+            items.append({**iss, 'item_id': r.id, 'name': r.name, 'location': r.location})
+    order = {'critical': 0, 'high': 1, 'medium': 2}
+    items.sort(key=lambda x: (order.get(x['level'], 3), x['date'] or ''))
+    conflicts = _cs_storage_conflicts(rows)
+    return jsonify({'success': True, 'data': {
+        'items': items, 'storage_conflicts': conflicts,
+        'without_groups': [{'id': r.id, 'name': r.name} for r in rows if not _tbt_json(r.groups, [])][:200],
+        'unconfirmed_groups': sum(1 for r in rows if _tbt_json(r.groups, []) and not r.groups_confirmed),
+        'without_sds': sum(1 for r in rows if not r.sds_file)}}), 200
+
+
+@app.route('/api/chem/standards', methods=['GET'])
+@jwt_required
+def cs_standards_route():
+    user = request.user
+    country = _rc_text(request.args.get('country'), 60) or _cs_country(user)
+    return jsonify({'success': True, 'data': _cs_standards(country)}), 200
+
+
+# ---------------------------------------------------------------- safety summary (PDF)
+CS_PICTO = {'GHS01': 'Exploding bomb (explosives)', 'GHS02': 'Flame (flammable)', 'GHS03': 'Flame over circle (oxidiser)',
+            'GHS04': 'Gas cylinder (gas under pressure)', 'GHS05': 'Corrosion (corrosive)', 'GHS06': 'Skull and crossbones (acute toxicity)',
+            'GHS07': 'Exclamation mark (harmful/irritant)', 'GHS08': 'Health hazard (serious long-term)', 'GHS09': 'Environment (aquatic toxicity)'}
+CS_SECTION_TITLES = (('first_aid', 'First aid'), ('fire', 'Fire fighting'), ('spill', 'Spills and leaks'), ('storage', 'Storage'),
+                     ('ppe', 'Personal protective equipment'), ('exposure', 'Exposure limits'), ('reactivity', 'Reactivity and incompatibilities'))
+
+
+def _cs_summary_pdf(it, sub, user, country):
+    import fitz as _fz
+    from html import escape as _e
+    d = _cs_substance_dict(sub) if sub else {}
+    ghs = d.get('ghs') or {}
+    comp = db.session.get(_TbtCompany, it.company_id)
+    std = _cs_standards(country)
+    groups = _tbt_json(it.groups, [])
+    h = [f'<h1>Chemical safety summary: {_e(it.name)}</h1>',
+         '<p class="warn">This summary is built from public reference data. It does not replace the supplier\'s safety data sheet (SDS); '
+         + ('the supplier SDS is held with this record.' if it.sds_file else 'no supplier SDS has been uploaded for this chemical yet.') + '</p>',
+         '<table>'
+         f'<tr><th>Company</th><td>{_e(getattr(comp, "name", "") or "")}</td><th>Location</th><td>{_e(it.location or "")}</td></tr>'
+         f'<tr><th>CAS</th><td>{_e(it.cas or d.get("cas") or "")}</td><th>Formula</th><td>{_e(d.get("formula") or "")}</td></tr>'
+         f'<tr><th>Quantity</th><td>{_e((f"{it.quantity:g} " if it.quantity is not None else "") + (it.unit or ""))}</td><th>Supplier</th><td>{_e(it.supplier or "")}</td></tr>'
+         f'<tr><th>Expires</th><td>{it.expires_on.strftime("%d %b %Y") if it.expires_on else ""}</td><th>Peroxide former</th><td>{"Class " + it.peroxide_class if it.peroxide_class else "No"}</td></tr>'
+         '</table>']
+    if ghs:
+        h.append(f'<h2>GHS hazards</h2><p><b>Signal word: {_e(ghs.get("signal") or "-")}</b></p>')
+        if ghs.get('pictograms'):
+            h.append('<p>Pictograms: ' + '; '.join(f'{_e(p["code"])} {_e(CS_PICTO.get(p["code"], p.get("name") or ""))}' for p in ghs['pictograms']) + '</p>')
+        if ghs.get('h'):
+            h.append('<ul>' + ''.join(f'<li>{_e(x)}</li>' for x in ghs['h'][:20]) + '</ul>')
+        if ghs.get('p'):
+            h.append(f'<p class="small">Precautionary statements: {_e(", ".join(ghs["p"][:40]))}</p>')
+        h.append(f'<p class="src">Source: {_e(ghs.get("source") or "")} (via PubChem)</p>')
+    else:
+        h.append('<h2>GHS hazards</h2><p>No GHS classification found in PubChem for this record. Use the supplier SDS.</p>')
+    if groups:
+        h.append('<h2>Reactivity groups (EPA chart)</h2><p>' + _e('; '.join(CS_EPA_GROUPS.get(g, g) for g in groups))
+                 + ('' if it.groups_confirmed else ' (suggested, not yet confirmed)') + '</p>')
+    for key, title in CS_SECTION_TITLES:
+        rows = (d.get('sections') or {}).get(key) or []
+        if not rows:
+            continue
+        h.append(f'<h2>{title}</h2>')
+        for r in rows[:2 if key != 'exposure' else 6]:
+            h.append(f'<p>{_e(r["text"][:1400])}</p><p class="src">Source: {_e(r["source"])} ({_e(r["heading"])})</p>')
+    h.append(f'<h2>Rules that apply{" in " + _e(std["country"]) if std.get("country") else ""}</h2>')
+    if std['local']:
+        h.append('<p><b>Local</b></p><ul>' + ''.join(f'<li>{_e(x["title"])}: {_e(x["what"])}</li>' for x in std['local']) + '</ul>')
+    h.append('<p><b>International</b></p><ul>' + ''.join(f'<li>{_e(x["title"])}</li>' for x in std['international']) + '</ul>')
+    h.append(f'<p class="small">{_e(std["note"])}</p>')
+    h.append(f'<p class="small">Generated {datetime.utcnow().strftime("%d %b %Y %H:%M")} UTC by SafeTrack Pro for {_e(getattr(comp, "name", "") or "")}. '
+             + (f'PubChem CID {sub.cid}, data retrieved {sub.fetched_at.strftime("%d %b %Y")}.' if sub and sub.cid else 'Entered by hand; no PubChem record linked.') + '</p>')
+    css = ('* { font-family: sans-serif; } body { font-size: 9.5pt; } h1 { color: #0b3d91; font-size: 15pt; } h2 { color: #0b3d91; font-size: 11.5pt; margin-top: 8px; } '
+           'table { border-collapse: collapse; width: 100%; } td, th { border: 1px solid #d0d7e2; padding: 3px; text-align: left; } th { background: #eef3fb; width: 16%; } '
+           '.warn { background: #fff4e5; border: 1px solid #f0b46c; padding: 4px; } .src { color: #666; font-size: 8pt; } .small { color: #555; font-size: 8.5pt; }')
+    story = _fz.Story(html=''.join(h), user_css=css)
+    buf = io.BytesIO()
+    writer = _fz.DocumentWriter(buf)
+    box = _fz.paper_rect('a4')
+    more = True
+    while more:
+        dev = writer.begin_page(box)
+        more, _ = story.place(box + (40, 40, -40, -40))
+        story.draw(dev)
+        writer.end_page()
+    writer.close()
+    return buf.getvalue()
+
+
+@app.route('/api/chem/items/<int:iid>/summary.pdf', methods=['GET'])
+@jwt_required
+def cs_summary_route(iid):
+    user = request.user
+    it = _cs_item(user, iid)
+    if not it:
+        return jsonify({'success': False, 'error': 'Chemical not found.'}), 404
+    sub = db.session.get(ChemSubstance, it.substance_id) if it.substance_id else None
+    try:
+        pdf = _cs_summary_pdf(it, sub, user, _cs_country(user))
+    except Exception as e:
+        logger.error(f'chemical summary {iid}: {e}')
+        return jsonify({'success': False, 'error': 'The summary could not be made.'}), 500
+    resp = send_file(io.BytesIO(pdf), mimetype='application/pdf', as_attachment=True,
+                     download_name=re.sub(r'[^A-Za-z0-9_-]+', '_', it.name)[:60] + '_safety_summary.pdf')
+    resp.headers['Cache-Control'] = 'private, no-store'
+    return resp
+
+
+# ---------------------------------------------------------------- daily alerts
+def _cs_reminders(today=None):
+    """Once a day per container: expired / expiring in 7 days / peroxide test due or high. Goes to supervisors."""
+    today = today or datetime.utcnow().date()
+    rows = (ChemItem.query.filter(ChemItem.status == 'in_use', or_(ChemItem.notified_on.is_(None), ChemItem.notified_on < today))
+            .limit(3000).all())
+    last = _cs_last_tests({r.id for r in rows})
+    by_company = {}
+    for r in rows:
+        issues = [i for i in _cs_item_state(r, last.get(r.id), today)
+                  if i['kind'] != 'expiring' or (r.expires_on and (r.expires_on - today).days <= 7)]
+        if not issues:
+            continue
+        claimed = (ChemItem.query.filter(ChemItem.id == r.id, or_(ChemItem.notified_on.is_(None), ChemItem.notified_on < today))
+                   .update({'notified_on': today}, synchronize_session=False))
+        db.session.commit()
+        if claimed:
+            by_company.setdefault(r.company_id, []).append(f'{r.name}: {issues[0]["text"]}')
+    for cid, lines in by_company.items():
+        _in_notify([(u.id, getattr(u, 'email', None)) for u in _rc_staff_users(cid)], f'Chemicals: {len(lines)} need attention',
+                   '; '.join(lines[:10]) + (' ...' if len(lines) > 10 else ''), '/chemicals?tab=alerts', 'high',
+                   email=any('overdue' in x or 'Expired' in x or 'ppm' in x for x in lines))
+    return sum(len(v) for v in by_company.values())
+
+
+def _cs_watch_loop():
+    time.sleep(540)
+    while True:
+        try:
+            with app.app_context():
+                _cs_reminders()
+        except Exception as e:
+            logger.error(f'chemical reminder watcher: {e}')
+        finally:
+            try:
+                with app.app_context():
+                    db.session.remove()
+            except Exception:
+                pass
+        time.sleep(6 * 3600)
+
+
+if os.environ.get('READY_CHECK_WATCHER', '1') == '1':
+    threading.Thread(target=_cs_watch_loop, name='chemical-reminder-watcher', daemon=True).start()
+
+
 # =====================================================================================================
 # AUTO MIGRATIONS (2026-11-23)
 # Railway's Data tab appends LIMIT to every query, so CREATE/ALTER statements fail there. Instead the
@@ -171656,7 +172754,7 @@ if os.environ.get('READY_CHECK_WATCHER', '1') == '1':
 #   - a failing statement is logged and the file is retried on the next start
 # Set AUTO_MIGRATE=0 on Railway to switch this off.
 # =====================================================================================================
-AUTO_MIGRATIONS = ('DEPLOY_2026-11-23_FULL.sql', '2026-11-24_company_quotes.sql', '2026-11-25_ready_checks.sql', '2026-11-26_muster_contractors.sql', '2026-11-27_document_control_plus.sql', '2026-11-27_inspections.sql')
+AUTO_MIGRATIONS = ('DEPLOY_2026-11-23_FULL.sql', '2026-11-24_company_quotes.sql', '2026-11-25_ready_checks.sql', '2026-11-26_muster_contractors.sql', '2026-11-27_document_control_plus.sql', '2026-11-27_inspections.sql', '2026-11-27_chemical_safety.sql')
 _MIGRATION_LOCK_KEY = 74230115
 
 
