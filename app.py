@@ -160952,6 +160952,15 @@ def pt_status(permit_id):
         return jsonify({'success': False, 'error': 'Describe the close-out (work complete, area left safe, isolations removed)'}), 400
     if action == 'activate' and p.end_at and p.end_at < datetime.utcnow():
         return jsonify({'success': False, 'error': 'This permit has already expired. Create a new permit or extend the end time.'}), 409
+    if action in ('close', 'cancel') and p.company_id:
+        try:
+            iso_err = _og_close_check(p, body, user)                          # oil & gas isolation register
+        except Exception as e:
+            db.session.rollback()
+            logger.error(f'permit close isolation check {p.id}: {e}')
+            iso_err = None
+        if iso_err:
+            return jsonify({'success': False, 'code': 'ISOLATIONS_IN_PLACE', 'error': iso_err}), 409
     p.status = target
     if action == 'activate' and not p.activated_at:
         p.activated_at = datetime.utcnow()
@@ -173990,6 +173999,814 @@ def kpi_outcome_save(incident_id):
     return jsonify({'success': True, 'data': {'id': incident_id, 'outcome': o.outcome, 'days_lost': o.days_lost, 'days_restricted': o.days_restricted}}), 200
 
 
+# ============================================================================
+# OIL & GAS: ISOLATIONS, GAS TESTS, SIMOPS, MOC, BYPASSES, ZONES (2026-11-27)
+# ============================================================================
+# Builds on the existing permits to work (work_permits). Isolation points (LOTO) belong to a permit and need an independent
+# verifier; a permit cannot be closed while its isolations are still in place unless they are handed over. Gas tests are
+# logged against a permit and the gas detector from the equipment register. SIMOPS checks permits that overlap in time and
+# place. Process safety: management of change (OSHA 1910.119(l)) with a pre-startup safety review checklist (1910.119(i)),
+# a register of bypassed / inhibited safety devices, and H2S / flare / hazardous-area zones with their entry rules.
+# DB: og_isolations, og_gas_tests, og_mocs, og_bypasses, og_zones -> sql/2026-11-27_oil_gas.sql (auto migration)
+
+
+class OgIsolation(db.Model):
+    __tablename__ = 'og_isolations'
+    __table_args__ = {'extend_existing': True}
+    id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id', ondelete='CASCADE'), nullable=False, index=True)
+    permit_id = db.Column(db.Integer, db.ForeignKey('work_permits.id', ondelete='CASCADE'), nullable=False, index=True)
+    point_tag = db.Column(db.String(80), nullable=False)                     # valve / breaker / blind tag
+    equipment = db.Column(db.String(200))
+    energy_type = db.Column(db.String(20), nullable=False)
+    method = db.Column(db.String(30), nullable=False)
+    lock_no = db.Column(db.String(40))
+    status = db.Column(db.String(12), nullable=False, default='isolated')   # isolated | verified | removed | handed_over
+    isolated_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    isolated_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    verified_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    verified_at = db.Column(db.DateTime)
+    verify_note = db.Column(db.String(300))
+    removed_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    removed_at = db.Column(db.DateTime)
+    note = db.Column(db.String(500))
+
+
+class OgGasTest(db.Model):
+    __tablename__ = 'og_gas_tests'
+    __table_args__ = {'extend_existing': True}
+    id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id', ondelete='CASCADE'), nullable=False, index=True)
+    permit_id = db.Column(db.Integer, db.ForeignKey('work_permits.id', ondelete='SET NULL'), nullable=True, index=True)
+    location = db.Column(db.String(200))
+    tested_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    o2 = db.Column(db.Float)
+    lel = db.Column(db.Float)
+    h2s = db.Column(db.Float)
+    co = db.Column(db.Float)
+    other_name = db.Column(db.String(60))
+    other_value = db.Column(db.Float)
+    other_limit = db.Column(db.Float)
+    instrument_id = db.Column(db.Integer, db.ForeignKey('equipment_items.id', ondelete='SET NULL'), nullable=True)
+    instrument_text = db.Column(db.String(120))
+    result = db.Column(db.String(6), nullable=False)                         # pass | fail
+    reasons = db.Column(db.Text)                                             # JSON list
+    limits = db.Column(db.Text)                                              # JSON limits used
+    tested_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+
+class OgMoc(db.Model):
+    __tablename__ = 'og_mocs'
+    __table_args__ = (db.UniqueConstraint('company_id', 'number', name='uq_og_mocs_company_number'), {'extend_existing': True})
+    id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id', ondelete='CASCADE'), nullable=False, index=True)
+    number = db.Column(db.String(20), nullable=False)
+    title = db.Column(db.String(200), nullable=False)
+    change_type = db.Column(db.String(20), nullable=False)
+    temporary = db.Column(db.Boolean, nullable=False, default=False)
+    expires_on = db.Column(db.Date)
+    location = db.Column(db.String(200))
+    description = db.Column(db.Text)
+    technical_basis = db.Column(db.Text)
+    safety_impact = db.Column(db.Text)
+    procedures_affected = db.Column(db.Text)
+    risk_level = db.Column(db.String(10))
+    needs_pssr = db.Column(db.Boolean, nullable=False, default=True)
+    training_done = db.Column(db.Boolean, nullable=False, default=False)
+    psi_updated = db.Column(db.Boolean, nullable=False, default=False)
+    procedures_updated = db.Column(db.Boolean, nullable=False, default=False)
+    status = db.Column(db.String(12), nullable=False, default='draft')      # draft | review | approved | implemented | closed | rejected
+    owner_id = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    approved_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    approved_at = db.Column(db.DateTime)
+    decision_note = db.Column(db.String(1000))
+    implemented_at = db.Column(db.DateTime)
+    pssr_inspection_id = db.Column(db.Integer)
+    closed_at = db.Column(db.DateTime)
+    notified_on = db.Column(db.Date)
+    created_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class OgBypass(db.Model):
+    __tablename__ = 'og_bypasses'
+    __table_args__ = {'extend_existing': True}
+    id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id', ondelete='CASCADE'), nullable=False, index=True)
+    device_tag = db.Column(db.String(80), nullable=False)
+    device_type = db.Column(db.String(20), nullable=False)
+    location = db.Column(db.String(200))
+    reason = db.Column(db.String(1000), nullable=False)
+    mitigation = db.Column(db.String(1000), nullable=False)
+    authorised_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    start_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    planned_end = db.Column(db.DateTime, nullable=False)
+    status = db.Column(db.String(10), nullable=False, default='active')     # active | removed
+    removed_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    removed_at = db.Column(db.DateTime)
+    removal_note = db.Column(db.String(500))
+    notified_on = db.Column(db.Date)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+
+class OgZone(db.Model):
+    __tablename__ = 'og_zones'
+    __table_args__ = {'extend_existing': True}
+    id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id', ondelete='CASCADE'), nullable=False, index=True)
+    name = db.Column(db.String(160), nullable=False)
+    zone_type = db.Column(db.String(20), nullable=False)
+    description = db.Column(db.String(1000))
+    requirements = db.Column(db.Text)                                        # JSON list of entry rules
+    active = db.Column(db.Boolean, nullable=False, default=True)
+    created_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+
+OG_ENERGY = {'electrical': 'Electrical', 'process': 'Process fluid / pressure', 'mechanical': 'Mechanical (moving parts)', 'hydraulic': 'Hydraulic',
+             'pneumatic': 'Pneumatic', 'chemical': 'Chemical', 'thermal': 'Thermal (hot / cold)', 'gravity': 'Stored / gravity', 'radiation': 'Radiation'}
+OG_METHODS = {'lock_valve': 'Valve closed, locked and tagged', 'dbb': 'Double block and bleed', 'spade': 'Spade / blind / spectacle blind',
+              'spool': 'Spool removed and blanked', 'breaker': 'Breaker off, locked and tagged', 'racked_out': 'Breaker racked out', 'fuse': 'Fuses removed',
+              'disconnect': 'Disconnected / air gap', 'block': 'Mechanical block / pin', 'other': 'Other'}
+OG_GAS_DEFAULTS = {'o2_min': 19.5, 'o2_max': 23.5, 'lel_max': 10.0, 'h2s_max': 5.0, 'co_max': 25.0}
+# Pairs of permit types that should not run in the same area at the same time without a SIMOPS review.
+OG_SIMOPS = {
+    ('hot_work', 'line_breaking'): ('stop', 'Opening process equipment can release flammable gas onto the hot work.'),
+    ('hot_work', 'confined_space'): ('review', 'Hot work near a confined space entry: sparks, fumes and gas from the space; agree controls and gas monitoring.'),
+    ('hot_work', 'isolation'): ('review', 'Check the isolation removes all flammable sources before hot work starts.'),
+    ('hot_work', 'excavation'): ('review', 'Excavation may expose buried lines or gas pockets near hot work.'),
+    ('radiography', '*'): ('stop', 'Radiography needs a cleared exclusion zone: no other work inside the barrier.'),
+    ('lifting', '*'): ('review', 'Loads must not pass over people or live plant: agree the lift path and exclusion zone.'),
+    ('diving', 'lifting'): ('stop', 'Lifting over divers is not allowed without a specific SIMOPS plan.'),
+    ('diving', 'hot_work'): ('review', 'Hot work near diving operations: agree controls with the diving supervisor.'),
+    ('confined_space', 'line_breaking'): ('stop', 'Line breaking can release gas into the confined space.'),
+    ('electrical', 'confined_space'): ('review', 'Electrical work near or in a confined space: check isolation and portable equipment.'),
+    ('work_at_height', 'lifting'): ('review', 'Work at height under or near a lift path: dropped-object risk.'),
+}
+OG_BYPASS_TYPES = {'sis_trip': 'Trip / shutdown (SIS / ESD)', 'alarm': 'Alarm', 'psv': 'Pressure relief device', 'fire_gas': 'Fire and gas detector',
+                   'interlock': 'Interlock', 'other': 'Other safety device'}
+OG_ZONE_TYPES = {'h2s': 'H2S area', 'flare': 'Flare radiation zone', 'zone0': 'Hazardous area Zone 0', 'zone1': 'Hazardous area Zone 1',
+                 'zone2': 'Hazardous area Zone 2', 'exclusion': 'Exclusion zone', 'muster': 'Muster / safe area'}
+OG_CHANGE_TYPES = {'equipment': 'Equipment / facilities', 'process': 'Process conditions / chemicals', 'procedure': 'Operating procedure',
+                   'control': 'Control system / software', 'organisation': 'Organisation / staffing', 'other': 'Other'}
+
+
+def _og_names(ids):
+    return _in_names(list(ids))
+
+
+def _og_permit(user, pid):
+    try:
+        p = db.session.get(WorkPermit, int(pid))
+    except (TypeError, ValueError):
+        return None
+    return p if p and p.company_id and p.company_id == getattr(user, 'company_id', None) else None
+
+
+def _og_iso_dict(i, names):
+    return {'id': i.id, 'permit_id': i.permit_id, 'point_tag': i.point_tag, 'equipment': i.equipment, 'energy_type': i.energy_type,
+            'energy_name': OG_ENERGY.get(i.energy_type, i.energy_type), 'method': i.method, 'method_name': OG_METHODS.get(i.method, i.method),
+            'lock_no': i.lock_no, 'status': i.status, 'isolated_by': names.get(i.isolated_by), 'isolated_by_id': i.isolated_by,
+            'isolated_at': _in_iso(i.isolated_at), 'verified_by': names.get(i.verified_by), 'verified_at': _in_iso(i.verified_at),
+            'verify_note': i.verify_note, 'removed_by': names.get(i.removed_by), 'removed_at': _in_iso(i.removed_at), 'note': i.note}
+
+
+@app.route('/api/og/isolations', methods=['GET'])
+@jwt_required
+def og_isolation_register():
+    """All isolation points of the company; ?active=1 for those still in place; ?permit_id= for one permit."""
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    q = OgIsolation.query.filter(OgIsolation.company_id == user.company_id)
+    if request.args.get('permit_id'):
+        p = _og_permit(user, request.args.get('permit_id'))
+        if not p:
+            return jsonify({'success': False, 'error': 'Permit not found.'}), 404
+        q = q.filter(OgIsolation.permit_id == p.id)
+    if request.args.get('active') == '1':
+        q = q.filter(OgIsolation.status.in_(('isolated', 'verified')))
+    rows = q.order_by(OgIsolation.isolated_at.desc()).limit(2000).all()
+    names = _og_names([x for r in rows for x in (r.isolated_by, r.verified_by, r.removed_by)])
+    permits = {p.id: p for p in WorkPermit.query.filter(WorkPermit.id.in_({r.permit_id for r in rows} or {0})).all()}
+    out = []
+    for r in rows:
+        d = _og_iso_dict(r, names)
+        p = permits.get(r.permit_id)
+        d['permit'] = {'id': p.id, 'number': p.permit_number, 'title': p.title, 'status': p.status, 'type': p.permit_type} if p else None
+        out.append(d)
+    return jsonify({'success': True, 'data': out, 'energy_types': [{'id': k, 'name': v} for k, v in OG_ENERGY.items()],
+                    'methods': [{'id': k, 'name': v} for k, v in OG_METHODS.items()]}), 200
+
+
+@app.route('/api/og/isolations', methods=['POST'])
+@jwt_required
+def og_isolation_add():
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    data = _in_body()
+    p = _og_permit(user, data.get('permit_id'))
+    if not p:
+        return jsonify({'success': False, 'error': 'Choose the permit the isolation belongs to.'}), 400
+    if p.status in ('closed', 'cancelled', 'rejected'):
+        return jsonify({'success': False, 'error': f'The permit is {p.status}.'}), 409
+    tag = _rc_text(data.get('point_tag'), 80)
+    if len(tag) < 1:
+        return jsonify({'success': False, 'error': 'Give the isolation point tag (valve, breaker or blind number).'}), 400
+    if data.get('energy_type') not in OG_ENERGY or data.get('method') not in OG_METHODS:
+        return jsonify({'success': False, 'error': 'Choose the energy type and the isolation method.'}), 400
+    if OgIsolation.query.filter(OgIsolation.permit_id == p.id, func.lower(OgIsolation.point_tag) == tag.lower(),
+                                OgIsolation.status.in_(('isolated', 'verified'))).first():
+        return jsonify({'success': False, 'error': 'This point is already isolated on this permit.'}), 409
+    i = OgIsolation(company_id=user.company_id, permit_id=p.id, point_tag=tag, equipment=_rc_text(data.get('equipment'), 200) or None,
+                    energy_type=data['energy_type'], method=data['method'], lock_no=_rc_text(data.get('lock_no'), 40) or None,
+                    note=_rc_text(data.get('note'), 500) or None, isolated_by=user.id, status='isolated')
+    db.session.add(i)
+    db.session.commit()
+    return jsonify({'success': True, 'data': _og_iso_dict(i, _og_names([user.id]))}), 201
+
+
+@app.route('/api/og/isolations/<int:iid>', methods=['PUT'])
+@jwt_required
+def og_isolation_act(iid):
+    """action: verify (a different person proves zero energy) | remove (after the work) ."""
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    i = db.session.get(OgIsolation, iid)
+    if not i or i.company_id != user.company_id:
+        return jsonify({'success': False, 'error': 'Isolation not found.'}), 404
+    data = _in_body()
+    action = data.get('action')
+    p = db.session.get(WorkPermit, i.permit_id)
+    if action == 'verify':
+        if i.status != 'isolated':
+            return jsonify({'success': False, 'error': f'This isolation is {i.status.replace("_", " ")}.'}), 409
+        if i.isolated_by == user.id:
+            return jsonify({'success': False, 'error': 'The isolation must be verified by a different person from the one who isolated it.'}), 409
+        i.status, i.verified_by, i.verified_at = 'verified', user.id, datetime.utcnow()
+        i.verify_note = _rc_text(data.get('note'), 300) or 'Zero energy proved (try-out / test)'
+    elif action == 'remove':
+        if i.status not in ('isolated', 'verified'):
+            return jsonify({'success': False, 'error': f'This isolation is {i.status.replace("_", " ")}.'}), 409
+        if p and p.status == 'active' and not data.get('work_stopped'):
+            return jsonify({'success': False, 'code': 'WORK_ACTIVE',
+                            'error': 'The permit is still active. Confirm the work has stopped and people are clear before removing the isolation.'}), 409
+        i.status, i.removed_by, i.removed_at = 'removed', user.id, datetime.utcnow()
+    else:
+        return jsonify({'success': False, 'error': 'Unknown action.'}), 400
+    db.session.commit()
+    return jsonify({'success': True, 'data': _og_iso_dict(i, _og_names([i.isolated_by, i.verified_by, i.removed_by]))}), 200
+
+
+def _og_close_check(p, body, user):
+    """Used by the permit status route: no close / cancel while isolations are still in place, unless handed over."""
+    open_iso = OgIsolation.query.filter(OgIsolation.permit_id == p.id, OgIsolation.status.in_(('isolated', 'verified'))).all()
+    if not open_iso:
+        return None
+    handover = _rc_text(body.get('isolations_handover'), 500)
+    if len(handover) < 3:
+        return (f'{len(open_iso)} isolation point(s) are still in place ({", ".join(i.point_tag for i in open_iso[:5])}). '
+                'Remove them first, or hand them over (say to which permit or isolation certificate).')
+    for i in open_iso:
+        i.status = 'handed_over'
+        i.note = (f'Handed over: {handover}')[:500]
+        i.removed_by, i.removed_at = user.id, datetime.utcnow()
+    return None
+
+
+# ---------------------------------------------------------------- gas tests
+def _og_eval_gas(t, lim):
+    reasons = []
+    if t.o2 is not None and not (lim['o2_min'] <= t.o2 <= lim['o2_max']):
+        reasons.append(f'Oxygen {t.o2}% outside {lim["o2_min"]}-{lim["o2_max"]}%')
+    if t.lel is not None and t.lel >= lim['lel_max']:
+        reasons.append(f'Flammable gas {t.lel}% LEL at or above {lim["lel_max"]}%')
+    if t.h2s is not None and t.h2s >= lim['h2s_max']:
+        reasons.append(f'H2S {t.h2s} ppm at or above {lim["h2s_max"]} ppm')
+    if t.co is not None and t.co >= lim['co_max']:
+        reasons.append(f'CO {t.co} ppm at or above {lim["co_max"]} ppm')
+    if t.other_value is not None and t.other_limit is not None and t.other_value >= t.other_limit:
+        reasons.append(f'{t.other_name or "Other gas"} {t.other_value} at or above {t.other_limit}')
+    return ('fail' if reasons else 'pass'), reasons
+
+
+def _og_gas_dict(t, names, instruments=None):
+    inst = (instruments or {}).get(t.instrument_id)
+    return {'id': t.id, 'permit_id': t.permit_id, 'location': t.location, 'tested_at': _in_iso(t.tested_at), 'o2': t.o2, 'lel': t.lel,
+            'h2s': t.h2s, 'co': t.co, 'other_name': t.other_name, 'other_value': t.other_value, 'other_limit': t.other_limit,
+            'instrument': (f'{inst.tag_no} {inst.name}' if inst else t.instrument_text), 'instrument_id': t.instrument_id,
+            'result': t.result, 'reasons': _tbt_json(t.reasons, []), 'limits': _tbt_json(t.limits, {}), 'tested_by': names.get(t.tested_by)}
+
+
+@app.route('/api/og/gas-tests', methods=['GET', 'POST'])
+@jwt_required
+def og_gas_tests():
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    if request.method == 'GET':
+        q = OgGasTest.query.filter(OgGasTest.company_id == user.company_id)
+        if request.args.get('permit_id'):
+            p = _og_permit(user, request.args.get('permit_id'))
+            if not p:
+                return jsonify({'success': False, 'error': 'Permit not found.'}), 404
+            q = q.filter(OgGasTest.permit_id == p.id)
+        rows = q.order_by(OgGasTest.tested_at.desc()).limit(1000).all()
+        names = _og_names([r.tested_by for r in rows])
+        inst = {e.id: e for e in EquipmentItem.query.filter(EquipmentItem.id.in_({r.instrument_id for r in rows if r.instrument_id} or {0})).all()}
+        detectors = EquipmentItem.query.filter(EquipmentItem.company_id == user.company_id, EquipmentItem.category == 'gas_detector',
+                                               EquipmentItem.status != 'retired').order_by(EquipmentItem.tag_no).all()
+        return jsonify({'success': True, 'data': [_og_gas_dict(r, names, inst) for r in rows], 'defaults': OG_GAS_DEFAULTS,
+                        'detectors': [{'id': e.id, 'label': f'{e.tag_no} {e.name}', 'state': _eq_state(e)[0], 'state_label': _eq_state(e)[1]} for e in detectors]}), 200
+    data = _in_body()
+    p = None
+    if data.get('permit_id'):
+        p = _og_permit(user, data.get('permit_id'))
+        if not p:
+            return jsonify({'success': False, 'error': 'Permit not found.'}), 404
+
+    def num(k, lo, hi):
+        v = data.get(k)
+        if v in (None, ''):
+            return None
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            raise ValueError(f'{k.upper()} must be a number.')
+        if not (lo <= v <= hi):
+            raise ValueError(f'{k.upper()} reading {v} is out of range.')
+        return v
+    try:
+        vals = {'o2': num('o2', 0, 100), 'lel': num('lel', 0, 100), 'h2s': num('h2s', 0, 10000), 'co': num('co', 0, 10000),
+                'other_value': num('other_value', 0, 1000000), 'other_limit': num('other_limit', 0, 1000000)}
+        lim = dict(OG_GAS_DEFAULTS)
+        for k in lim:
+            if (data.get('limits') or {}).get(k) not in (None, ''):
+                lim[k] = float(data['limits'][k])
+        tested_at = _pt_parse_dt(data.get('tested_at')) if data.get('tested_at') else datetime.utcnow()
+    except (TypeError, ValueError) as e:
+        return jsonify({'success': False, 'error': str(e) if str(e) else 'Check the readings.'}), 400
+    if all(vals[k] is None for k in ('o2', 'lel', 'h2s', 'co', 'other_value')):
+        return jsonify({'success': False, 'error': 'Enter at least one reading.'}), 400
+    if tested_at > datetime.utcnow() + timedelta(minutes=10):
+        return jsonify({'success': False, 'error': 'The test time cannot be in the future.'}), 400
+    inst = None
+    if data.get('instrument_id'):
+        inst = _eq_get(user, int(data['instrument_id'])) if str(data['instrument_id']).isdigit() else None
+        if not inst:
+            return jsonify({'success': False, 'error': 'Gas detector not found in your equipment register.'}), 400
+    t = OgGasTest(company_id=user.company_id, permit_id=p.id if p else None, location=_rc_text(data.get('location'), 200) or (p.location if p else None),
+                  tested_at=tested_at, other_name=_rc_text(data.get('other_name'), 60) or None, instrument_id=inst.id if inst else None,
+                  instrument_text=None if inst else (_rc_text(data.get('instrument_text'), 120) or None), tested_by=user.id, **vals)
+    t.result, reasons = _og_eval_gas(t, lim)
+    warn = []
+    if inst and _eq_state(inst)[0] != 'ok':
+        warn.append(f'The detector {inst.tag_no} is not in a safe state: {_eq_state(inst)[1]}. Readings may not be reliable.')
+    t.reasons, t.limits = json.dumps(reasons), json.dumps(lim)
+    db.session.add(t)
+    db.session.commit()
+    if t.result == 'fail' and p:
+        _in_notify([(u.id, getattr(u, 'email', None)) for u in _rc_staff_users(user.company_id, user.id)], f'Gas test failed: {p.permit_number}'[:200],
+                   '; '.join(reasons), '/hse-management/industry/oil_gas?tab=gas', 'critical', email=True)
+    return jsonify({'success': True, 'data': _og_gas_dict(t, _og_names([user.id]), {inst.id: inst} if inst else None), 'warnings': warn}), 201
+
+
+# ---------------------------------------------------------------- SIMOPS
+def _og_norm_loc(s):
+    return re.sub(r'[^a-z0-9]+', ' ', (s or '').lower()).strip()
+
+
+def _og_simops_rule(a, b):
+    for x, y in ((a, b), (b, a)):
+        if (x, y) in OG_SIMOPS:
+            return OG_SIMOPS[(x, y)]
+        if (x, '*') in OG_SIMOPS:
+            return OG_SIMOPS[(x, '*')]
+    return None
+
+
+@app.route('/api/og/simops', methods=['GET'])
+@jwt_required
+def og_simops():
+    """Permits that overlap in time at the same location (live or approved), with the SIMOPS rule for their types."""
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    hours = max(1, min(24 * 14, int(request.args.get('hours') or 48)))
+    now = datetime.utcnow()
+    horizon = now + timedelta(hours=hours)
+    rows = (WorkPermit.query.filter(WorkPermit.company_id == user.company_id, WorkPermit.status.in_(('active', 'approved', 'suspended', 'in_approval')))
+            .limit(2000).all())
+    live = []
+    for p in rows:
+        s = p.start_at or now
+        e = p.end_at or (s + timedelta(hours=12))
+        if e >= now and s <= horizon:
+            live.append((p, s, e))
+    out = []
+    for i in range(len(live)):
+        for j in range(i + 1, len(live)):
+            (a, sa, ea), (b, sb, eb) = live[i], live[j]
+            if not (sa < eb and sb < ea):
+                continue
+            la, lb = _og_norm_loc(a.location), _og_norm_loc(b.location)
+            if not la or la != lb:
+                continue
+            rule = _og_simops_rule(a.permit_type, b.permit_type)
+            level, why = rule if rule else ('info', 'Two permits at the same place and time: the area authority should know about both.')
+            out.append({'level': level, 'reason': why, 'location': a.location,
+                        'from': _in_iso(max(sa, sb)), 'to': _in_iso(min(ea, eb)),
+                        'a': {'id': a.id, 'number': a.permit_number, 'type': a.permit_type, 'title': a.title, 'status': a.status},
+                        'b': {'id': b.id, 'number': b.permit_number, 'type': b.permit_type, 'title': b.title, 'status': b.status}})
+    order = {'stop': 0, 'review': 1, 'info': 2}
+    out.sort(key=lambda x: (order[x['level']], x['from'] or ''))
+    return jsonify({'success': True, 'data': out, 'permits_checked': len(live), 'hours': hours,
+                    'note': 'Permits are matched by location name (ignoring capitals and punctuation): use the same area names on permits.'}), 200
+
+
+# ---------------------------------------------------------------- management of change
+OG_MOC_FLOW = {'submit': (('draft', 'rejected'), 'review'), 'approve': (('review',), 'approved'), 'reject': (('review',), 'rejected'),
+               'implement': (('approved',), 'implemented'), 'close': (('implemented',), 'closed')}
+
+
+def _og_moc_dict(m, names):
+    today = datetime.utcnow().date()
+    return {'id': m.id, 'number': m.number, 'title': m.title, 'change_type': m.change_type, 'change_type_name': OG_CHANGE_TYPES.get(m.change_type, m.change_type),
+            'temporary': m.temporary, 'expires_on': m.expires_on.isoformat() if m.expires_on else None,
+            'expired': bool(m.temporary and m.expires_on and m.expires_on < today and m.status not in ('closed', 'rejected')),
+            'location': m.location, 'description': m.description, 'technical_basis': m.technical_basis, 'safety_impact': m.safety_impact,
+            'procedures_affected': m.procedures_affected, 'risk_level': m.risk_level, 'needs_pssr': m.needs_pssr, 'training_done': m.training_done,
+            'psi_updated': m.psi_updated, 'procedures_updated': m.procedures_updated, 'status': m.status, 'owner': names.get(m.owner_id),
+            'owner_id': m.owner_id, 'approved_by': names.get(m.approved_by), 'approved_at': _in_iso(m.approved_at), 'decision_note': m.decision_note,
+            'implemented_at': _in_iso(m.implemented_at), 'pssr_inspection_id': m.pssr_inspection_id, 'closed_at': _in_iso(m.closed_at),
+            'created_at': _in_iso(m.created_at)}
+
+
+def _og_moc_apply(m, data, user):
+    if 'title' in data or m.id is None:
+        t = _rc_text(data.get('title'), 200)
+        if len(t) < 3:
+            raise ValueError('Give the change a title.')
+        m.title = t
+    if 'change_type' in data or m.id is None:
+        if data.get('change_type') not in OG_CHANGE_TYPES:
+            raise ValueError('Choose the type of change.')
+        m.change_type = data['change_type']
+    for f, n in (('location', 200), ('description', 8000), ('technical_basis', 8000), ('safety_impact', 8000), ('procedures_affected', 4000)):
+        if f in data:
+            setattr(m, f, _rc_text(data.get(f), n) or None)
+    if 'risk_level' in data:
+        if data.get('risk_level') not in (None, '', 'low', 'medium', 'high'):
+            raise ValueError('Risk level must be low, medium or high.')
+        m.risk_level = data.get('risk_level') or None
+    for f in ('temporary', 'needs_pssr', 'training_done', 'psi_updated', 'procedures_updated'):
+        if f in data:
+            setattr(m, f, bool(data.get(f)))
+    if 'expires_on' in data:
+        m.expires_on = _ct_date(data.get('expires_on'))
+    if m.temporary and not m.expires_on:
+        raise ValueError('A temporary change needs an end date.')
+    if 'owner_id' in data:
+        m.owner_id = _in_user_in_company(user.company_id, data.get('owner_id')) if data.get('owner_id') else None
+
+
+@app.route('/api/og/mocs', methods=['GET', 'POST'])
+@jwt_required
+def og_mocs():
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    if request.method == 'GET':
+        rows = OgMoc.query.filter(OgMoc.company_id == user.company_id).order_by(OgMoc.created_at.desc()).limit(1000).all()
+        names = _og_names([x for r in rows for x in (r.owner_id, r.approved_by)])
+        return jsonify({'success': True, 'data': [_og_moc_dict(r, names) for r in rows], 'can_manage': bool(_rc_staff(user)),
+                        'change_types': [{'id': k, 'name': v} for k, v in OG_CHANGE_TYPES.items()]}), 200
+    m = OgMoc(company_id=user.company_id, created_by=user.id, owner_id=user.id, status='draft')
+    try:
+        _og_moc_apply(m, _in_body(), user)
+    except ValueError as e:
+        db.session.rollback()
+        return jsonify({'success': False, 'error': str(e)}), 400
+    nums = [int(x.group(1)) for (n,) in db.session.query(OgMoc.number).filter(OgMoc.company_id == user.company_id).all()
+            for x in [re.fullmatch(r'MOC-(\d+)', n or '')] if x]
+    m.number = f'MOC-{(max(nums) if nums else 0) + 1:04d}'
+    db.session.add(m)
+    try:
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+        return jsonify({'success': False, 'error': 'Someone created a change at the same moment. Save again.'}), 409
+    return jsonify({'success': True, 'data': _og_moc_dict(m, _og_names([m.owner_id]))}), 201
+
+
+@app.route('/api/og/mocs/<int:mid>', methods=['PUT'])
+@jwt_required
+def og_moc_one(mid):
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    m = db.session.get(OgMoc, mid)
+    if not m or m.company_id != user.company_id:
+        return jsonify({'success': False, 'error': 'Change not found.'}), 404
+    data = _in_body()
+    action = data.get('action')
+    staff = bool(_rc_staff(user))
+    if not action:
+        if m.status not in ('draft', 'rejected', 'review', 'approved', 'implemented'):
+            return jsonify({'success': False, 'error': 'A closed change cannot be edited.'}), 409
+        if not (staff or m.owner_id == user.id or m.created_by == user.id):
+            return jsonify({'success': False, 'error': 'Only the owner or a supervisor can edit this change.'}), 403
+        try:
+            _og_moc_apply(m, data, user)
+        except ValueError as e:
+            db.session.rollback()
+            return jsonify({'success': False, 'error': str(e)}), 400
+        db.session.commit()
+        return jsonify({'success': True, 'data': _og_moc_dict(m, _og_names([m.owner_id, m.approved_by]))}), 200
+    if action not in OG_MOC_FLOW:
+        return jsonify({'success': False, 'error': 'Unknown action.'}), 400
+    allowed, target = OG_MOC_FLOW[action]
+    if m.status not in allowed:
+        return jsonify({'success': False, 'error': f'Cannot {action} a change that is {m.status}.'}), 409
+    if action in ('approve', 'reject', 'close') and not staff:
+        return jsonify({'success': False, 'error': 'Only supervisors and admins can approve, reject or close a change.'}), 403
+    if action == 'submit':
+        missing = [n for f, n in (('description', 'what changes'), ('technical_basis', 'technical basis'), ('safety_impact', 'impact on safety and health'))
+                   if not getattr(m, f)]
+        if missing:
+            return jsonify({'success': False, 'error': f'Before review, describe: {", ".join(missing)} (OSHA 1910.119(l)(2)).'}), 400
+    if action == 'approve' and m.created_by == user.id and m.owner_id == user.id:
+        return jsonify({'success': False, 'error': 'A change must be approved by someone other than the person who raised it.'}), 409
+    if action == 'reject' and len(_rc_text(data.get('note'), 1000)) < 3:
+        return jsonify({'success': False, 'error': 'Say why the change is rejected.'}), 400
+    if action == 'implement' and not m.training_done:
+        return jsonify({'success': False, 'error': 'Affected employees must be informed and trained before start-up (OSHA 1910.119(l)(3)).'}), 400
+    if action == 'close':
+        gaps = [n for ok, n in ((m.psi_updated, 'process safety information updated'), (m.procedures_updated, 'procedures updated'))
+                if not ok]
+        if m.needs_pssr:
+            ins = db.session.get(Inspection, m.pssr_inspection_id) if m.pssr_inspection_id else None
+            if not ins or ins.company_id != m.company_id or ins.status != 'completed':
+                gaps.append('pre-startup safety review completed')
+            elif ins.critical_failed:
+                gaps.append('pre-startup safety review without critical failures')
+        if gaps:
+            return jsonify({'success': False, 'error': 'Before closing: ' + '; '.join(gaps) + '.'}), 400
+    m.status = target
+    now = datetime.utcnow()
+    if action in ('approve', 'reject'):
+        m.approved_by, m.approved_at, m.decision_note = user.id, now, _rc_text(data.get('note'), 1000) or None
+    if action == 'implement':
+        m.implemented_at = now
+    if action == 'close':
+        m.closed_at = now
+    db.session.commit()
+    if action == 'submit':
+        _in_notify([(u.id, getattr(u, 'email', None)) for u in _rc_staff_users(m.company_id, user.id)], f'Change for review: {m.number} {m.title}'[:200],
+                   OG_CHANGE_TYPES.get(m.change_type, ''), '/hse-management/industry/oil_gas?tab=moc', 'high')
+    return jsonify({'success': True, 'data': _og_moc_dict(m, _og_names([m.owner_id, m.approved_by]))}), 200
+
+
+@app.route('/api/og/mocs/<int:mid>/pssr', methods=['POST'])
+@jwt_required
+def og_moc_pssr(mid):
+    """Start the pre-startup safety review for an approved change (an Inspections checklist linked to the change)."""
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    m = db.session.get(OgMoc, mid)
+    if not m or m.company_id != user.company_id:
+        return jsonify({'success': False, 'error': 'Change not found.'}), 404
+    if m.status not in ('approved', 'implemented'):
+        return jsonify({'success': False, 'error': 'The change must be approved first.'}), 409
+    if m.pssr_inspection_id:
+        ins = db.session.get(Inspection, m.pssr_inspection_id)
+        if ins and ins.status == 'in_progress':
+            return jsonify({'success': True, 'data': {'id': ins.id, 'resumed': True}}), 200
+    t, key, chk = _in_resolve_ref(user, 'lib:pssr')
+    ins = Inspection(company_id=user.company_id, library_key=key, title=f'PSSR: {m.number} {m.title}'[:200], site=m.location,
+                     inspector_id=user.id, status='in_progress', items=json.dumps(chk['items']), answers='{}')
+    db.session.add(ins)
+    db.session.flush()
+    m.pssr_inspection_id = ins.id
+    db.session.commit()
+    return jsonify({'success': True, 'data': {'id': ins.id, 'resumed': False}}), 201
+
+
+# ---------------------------------------------------------------- bypassed / inhibited safety devices
+def _og_bypass_dict(b, names):
+    now = datetime.utcnow()
+    return {'id': b.id, 'device_tag': b.device_tag, 'device_type': b.device_type, 'device_type_name': OG_BYPASS_TYPES.get(b.device_type, b.device_type),
+            'location': b.location, 'reason': b.reason, 'mitigation': b.mitigation, 'authorised_by': names.get(b.authorised_by),
+            'start_at': _in_iso(b.start_at), 'planned_end': _in_iso(b.planned_end), 'status': b.status,
+            'overdue': b.status == 'active' and b.planned_end < now, 'hours_active': round(((b.removed_at or now) - b.start_at).total_seconds() / 3600, 1),
+            'removed_by': names.get(b.removed_by), 'removed_at': _in_iso(b.removed_at), 'removal_note': b.removal_note}
+
+
+@app.route('/api/og/bypasses', methods=['GET', 'POST'])
+@jwt_required
+def og_bypasses():
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    if request.method == 'GET':
+        q = OgBypass.query.filter(OgBypass.company_id == user.company_id)
+        if request.args.get('active') == '1':
+            q = q.filter(OgBypass.status == 'active')
+        rows = q.order_by(OgBypass.status.asc(), OgBypass.planned_end.asc()).limit(2000).all()
+        names = _og_names([x for r in rows for x in (r.authorised_by, r.removed_by)])
+        return jsonify({'success': True, 'data': [_og_bypass_dict(r, names) for r in rows], 'can_manage': bool(_rc_staff(user)),
+                        'types': [{'id': k, 'name': v} for k, v in OG_BYPASS_TYPES.items()]}), 200
+    if not _rc_staff(user):
+        return jsonify({'success': False, 'error': 'A bypass must be authorised by a supervisor or admin.'}), 403
+    data = _in_body()
+    tag = _rc_text(data.get('device_tag'), 80)
+    reason, mitigation = _rc_text(data.get('reason'), 1000), _rc_text(data.get('mitigation'), 1000)
+    if not tag or data.get('device_type') not in OG_BYPASS_TYPES:
+        return jsonify({'success': False, 'error': 'Give the device tag and type.'}), 400
+    if len(reason) < 5 or len(mitigation) < 5:
+        return jsonify({'success': False, 'error': 'Say why the device is bypassed and what protects people meanwhile (compensating measures).'}), 400
+    try:
+        end = _pt_parse_dt(data.get('planned_end'))
+    except ValueError:
+        end = None
+    now = datetime.utcnow()
+    if not end or end <= now:
+        return jsonify({'success': False, 'error': 'Set when the bypass will be removed (in the future).'}), 400
+    if OgBypass.query.filter(OgBypass.company_id == user.company_id, OgBypass.status == 'active', func.lower(OgBypass.device_tag) == tag.lower()).first():
+        return jsonify({'success': False, 'error': 'This device is already bypassed.'}), 409
+    b = OgBypass(company_id=user.company_id, device_tag=tag, device_type=data['device_type'], location=_rc_text(data.get('location'), 200) or None,
+                 reason=reason, mitigation=mitigation, authorised_by=user.id, start_at=now, planned_end=end, status='active')
+    db.session.add(b)
+    db.session.commit()
+    _in_notify([(u.id, getattr(u, 'email', None)) for u in _rc_staff_users(user.company_id, user.id)], f'Safety device bypassed: {tag}'[:200],
+               f'{OG_BYPASS_TYPES[b.device_type]}. Until {end.strftime("%Y-%m-%d %H:%M")} UTC. {mitigation}'[:500], '/hse-management/industry/oil_gas?tab=bypass', 'high')
+    return jsonify({'success': True, 'data': _og_bypass_dict(b, _og_names([user.id]))}), 201
+
+
+@app.route('/api/og/bypasses/<int:bid>', methods=['PUT'])
+@jwt_required
+def og_bypass_one(bid):
+    """action: remove (device back in service) | extend (new planned_end, supervisor)."""
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    b = db.session.get(OgBypass, bid)
+    if not b or b.company_id != user.company_id:
+        return jsonify({'success': False, 'error': 'Bypass not found.'}), 404
+    data = _in_body()
+    if b.status != 'active':
+        return jsonify({'success': False, 'error': 'This bypass was already removed.'}), 409
+    if data.get('action') == 'remove':
+        b.status, b.removed_by, b.removed_at = 'removed', user.id, datetime.utcnow()
+        b.removal_note = _rc_text(data.get('note'), 500) or 'Device back in service and tested'
+    elif data.get('action') == 'extend':
+        if not _rc_staff(user):
+            return jsonify({'success': False, 'error': 'Only a supervisor or admin can extend a bypass.'}), 403
+        try:
+            end = _pt_parse_dt(data.get('planned_end'))
+        except ValueError:
+            end = None
+        if not end or end <= datetime.utcnow():
+            return jsonify({'success': False, 'error': 'The new end must be in the future.'}), 400
+        why = _rc_text(data.get('note'), 300)
+        if len(why) < 3:
+            return jsonify({'success': False, 'error': 'Say why the bypass is extended.'}), 400
+        b.planned_end, b.notified_on = end, None
+        b.mitigation = (b.mitigation + f' | Extended to {end.strftime("%Y-%m-%d %H:%M")}: {why}')[:1000]
+    else:
+        return jsonify({'success': False, 'error': 'Unknown action.'}), 400
+    db.session.commit()
+    return jsonify({'success': True, 'data': _og_bypass_dict(b, _og_names([b.authorised_by, b.removed_by]))}), 200
+
+
+# ---------------------------------------------------------------- zones
+def _og_zone_dict(z):
+    return {'id': z.id, 'name': z.name, 'zone_type': z.zone_type, 'zone_type_name': OG_ZONE_TYPES.get(z.zone_type, z.zone_type),
+            'description': z.description, 'requirements': _tbt_json(z.requirements, []), 'active': z.active}
+
+
+@app.route('/api/og/zones', methods=['GET', 'POST'])
+@app.route('/api/og/zones/<int:zid>', methods=['PUT', 'DELETE'])
+@jwt_required
+def og_zones(zid=None):
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    if request.method == 'GET':
+        rows = OgZone.query.filter(OgZone.company_id == user.company_id).order_by(OgZone.active.desc(), OgZone.name).all()
+        return jsonify({'success': True, 'data': [_og_zone_dict(z) for z in rows], 'can_manage': bool(_rc_staff(user)),
+                        'types': [{'id': k, 'name': v} for k, v in OG_ZONE_TYPES.items()]}), 200
+    if not _rc_staff(user):
+        return jsonify({'success': False, 'error': 'Only supervisors and admins can change zones.'}), 403
+    z = None
+    if zid is not None:
+        z = db.session.get(OgZone, zid)
+        if not z or z.company_id != user.company_id:
+            return jsonify({'success': False, 'error': 'Zone not found.'}), 404
+        if request.method == 'DELETE':
+            db.session.delete(z)
+            db.session.commit()
+            return jsonify({'success': True}), 200
+    data = _in_body()
+    if z is None:
+        z = OgZone(company_id=user.company_id, created_by=user.id)
+    if 'name' in data or z.id is None:
+        name = _rc_text(data.get('name'), 160)
+        if len(name) < 2:
+            return jsonify({'success': False, 'error': 'Give the zone a name.'}), 400
+        z.name = name
+    if 'zone_type' in data or z.id is None:
+        if data.get('zone_type') not in OG_ZONE_TYPES:
+            return jsonify({'success': False, 'error': 'Choose the zone type.'}), 400
+        z.zone_type = data['zone_type']
+    if 'description' in data:
+        z.description = _rc_text(data.get('description'), 1000) or None
+    if 'requirements' in data:
+        z.requirements = json.dumps([_rc_text(x, 200) for x in (data.get('requirements') or []) if _rc_text(x, 200)][:30])
+    if 'active' in data:
+        z.active = bool(data.get('active'))
+    if z.id is None:
+        db.session.add(z)
+    db.session.commit()
+    return jsonify({'success': True, 'data': _og_zone_dict(z)}), 200 if zid else 201
+
+
+# ---------------------------------------------------------------- reminders
+def _og_reminders(today=None):
+    """Once a day: bypasses past their planned end, temporary changes past their end date."""
+    today = today or datetime.utcnow().date()
+    now = datetime.utcnow()
+    by_company = {}
+    for b in OgBypass.query.filter(OgBypass.status == 'active', OgBypass.planned_end < now,
+                                   or_(OgBypass.notified_on.is_(None), OgBypass.notified_on < today)).limit(2000).all():
+        if OgBypass.query.filter(OgBypass.id == b.id, or_(OgBypass.notified_on.is_(None), OgBypass.notified_on < today)).update(
+                {'notified_on': today}, synchronize_session=False):
+            db.session.commit()
+            by_company.setdefault(b.company_id, []).append(f'bypass {b.device_tag} past its planned end')
+    for m in OgMoc.query.filter(OgMoc.temporary.is_(True), OgMoc.expires_on < today, OgMoc.status.in_(('approved', 'implemented')),
+                                or_(OgMoc.notified_on.is_(None), OgMoc.notified_on < today)).limit(2000).all():
+        if OgMoc.query.filter(OgMoc.id == m.id, or_(OgMoc.notified_on.is_(None), OgMoc.notified_on < today)).update(
+                {'notified_on': today}, synchronize_session=False):
+            db.session.commit()
+            by_company.setdefault(m.company_id, []).append(f'temporary change {m.number} past its end date')
+    for cid, lines in by_company.items():
+        _in_notify([(u.id, getattr(u, 'email', None)) for u in _rc_staff_users(cid)], f'Process safety: {len(lines)} item(s) overdue',
+                   '; '.join(lines[:10]), '/hse-management/industry/oil_gas', 'critical', email=True)
+    return sum(len(v) for v in by_company.values())
+
+
+def _og_watch_loop():
+    time.sleep(660)
+    while True:
+        try:
+            with app.app_context():
+                _og_reminders()
+        except Exception as e:
+            logger.error(f'oil & gas reminder watcher: {e}')
+        finally:
+            try:
+                with app.app_context():
+                    db.session.remove()
+            except Exception:
+                pass
+        time.sleep(3 * 3600)
+
+
+if os.environ.get('READY_CHECK_WATCHER', '1') == '1':
+    threading.Thread(target=_og_watch_loop, name='oil-gas-reminder-watcher', daemon=True).start()
+
+
+IN_LIBRARY.update({
+    'pssr': _in_lib('Pre-startup safety review (PSSR)', 'Process safety', 'Before hazardous chemicals are introduced to a new or modified process '
+                    '(OSHA 1910.119(i)).', [
+        ('Construction and equipment', [('Construction and equipment are in line with the design specifications', 'c'),
+                                        'Relief devices, trips and alarms are installed, set and tested', 'Temporary blinds and test equipment are removed']),
+        ('Procedures', [('Operating procedures are in place and adequate', 'c'), ('Safety and emergency procedures are in place and adequate', 'c'),
+                        'Maintenance procedures and inspection plans are in place']),
+        ('Hazard review', [('New facility: a process hazard analysis was done and its recommendations resolved before start-up', 'c'),
+                           ('Modified facility: management-of-change requirements are met', 'c'), 'Process safety information is updated (P&IDs, data sheets)']),
+        ('People', [('Training of every employee operating the process is completed', 'c'), 'Contractors involved have been informed of the hazards']),
+        ('Notes', [('Open items and who owns them', 't')]),
+    ]),
+})
+
+
 # =====================================================================================================
 # AUTO MIGRATIONS (2026-11-23)
 # Railway's Data tab appends LIMIT to every query, so CREATE/ALTER statements fail there. Instead the
@@ -174000,7 +174817,7 @@ def kpi_outcome_save(incident_id):
 #   - a failing statement is logged and the file is retried on the next start
 # Set AUTO_MIGRATE=0 on Railway to switch this off.
 # =====================================================================================================
-AUTO_MIGRATIONS = ('DEPLOY_2026-11-23_FULL.sql', '2026-11-24_company_quotes.sql', '2026-11-25_ready_checks.sql', '2026-11-26_muster_contractors.sql', '2026-11-27_document_control_plus.sql', '2026-11-27_inspections.sql', '2026-11-27_chemical_safety.sql', '2026-11-27_chemical_waste.sql', '2026-11-27_equipment.sql', '2026-11-27_incident_outcomes.sql')
+AUTO_MIGRATIONS = ('DEPLOY_2026-11-23_FULL.sql', '2026-11-24_company_quotes.sql', '2026-11-25_ready_checks.sql', '2026-11-26_muster_contractors.sql', '2026-11-27_document_control_plus.sql', '2026-11-27_inspections.sql', '2026-11-27_chemical_safety.sql', '2026-11-27_chemical_waste.sql', '2026-11-27_equipment.sql', '2026-11-27_incident_outcomes.sql', '2026-11-27_oil_gas.sql')
 _MIGRATION_LOCK_KEY = 74230115
 
 
