@@ -162113,6 +162113,12 @@ def _pbi_summary(user, project_id, dept_id, start, end):
     kpis.update({'totalManpower': headcount, 'totalManHours': total_hours, 'accidentRate': accident_rate,
                  'trainingRate': training_rate, 'overdueRate': kpis['overdue_rate'], 'positiveObs': pos,
                  'negativeObs': neg, 'totalInjuries': kpis['total_injuries'], 'avgSeverity': avg_sev})
+    leading = {}
+    try:
+        leading = _kpi_enrich(user, company_id, incidents, total_hours, start, end, kpis, notes)
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error('analytics kpi enrich: %s', e)
 
     # ---- linked module status
     modules = {
@@ -162166,6 +162172,7 @@ def _pbi_summary(user, project_id, dept_id, start, end):
         'incidentStats': {'total': len(incidents), 'byStatus': by_status, 'bySeverity': by_sev,
                           'byDepartment': by_dept, 'byType': by_type, 'trend': incident_trend},
         'modules': modules,
+        'leading': leading,
         'project': project,
         'notes': notes,
         'generated_at': now.isoformat(),
@@ -173769,6 +173776,220 @@ IN_LIBRARY.update({
 })
 
 
+# ============================================================================
+# SAFETY KPIs: INJURY OUTCOMES + LEADING INDICATORS (2026-11-27)
+# ============================================================================
+# The Analytics page used every incident (near misses, property damage ...) for TRIR. Recordable rates need the injury
+# outcome of each incident, so supervisors classify it once (none / first aid / medical treatment / restricted work /
+# lost time / fatality, with days lost). Kept in its own table, so the incidents table is not changed.
+# Rates (OSHA recordkeeping style): TRIR and DART per 200,000 hours, LTIFR per 1,000,000 hours, severity rate = days lost
+# per 200,000 hours. Leading indicators come from the modules that hold the real records (inspections, actions, Ready
+# Check, toolbox talks, equipment, chemicals, Workplace Voice).
+# DB: incident_outcomes -> sql/2026-11-27_incident_outcomes.sql (auto migration)
+
+
+class IncidentOutcome(db.Model):
+    __tablename__ = 'incident_outcomes'
+    __table_args__ = {'extend_existing': True}
+    incident_id = db.Column(db.Integer, db.ForeignKey('incidents.id', ondelete='CASCADE'), primary_key=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id', ondelete='CASCADE'), nullable=False, index=True)
+    outcome = db.Column(db.String(16), nullable=False)               # see KPI_OUTCOMES
+    days_lost = db.Column(db.Integer, nullable=False, default=0)
+    days_restricted = db.Column(db.Integer, nullable=False, default=0)
+    updated_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    updated_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+KPI_OUTCOMES = {
+    'none': 'No injury (near miss, damage only)', 'first_aid': 'First aid only', 'medical': 'Medical treatment beyond first aid',
+    'restricted': 'Restricted work or job transfer', 'lost_time': 'Lost time (days away from work)', 'fatality': 'Fatality',
+}
+KPI_RECORDABLE = ('medical', 'restricted', 'lost_time', 'fatality')
+
+
+def _kpi_is_near_miss(i):
+    t = f'{getattr(i, "incident_type", "") or ""} {getattr(i, "title", "") or ""}'.lower().replace('_', ' ').replace('-', ' ')
+    return 'near miss' in t
+
+
+def _kpi_enrich(user, company_id, incidents, total_hours, start, end, kpis, notes):
+    """Adds outcome-based rates to kpis (in place) and returns the leading indicators."""
+    leading = {}
+    ids = [i.id for i in incidents]
+    outs = {}
+    if ids:
+        try:
+            for o in IncidentOutcome.query.filter(IncidentOutcome.incident_id.in_(ids[:20000])).all():
+                outs[o.incident_id] = o
+        except Exception as e:
+            db.session.rollback()
+            logger.warning(f'kpi outcomes: {e}')
+    counts = {k: 0 for k in KPI_OUTCOMES}
+    days_lost = days_restricted = 0
+    for o in outs.values():
+        counts[o.outcome] = counts.get(o.outcome, 0) + 1
+        days_lost += int(o.days_lost or 0)
+        days_restricted += int(o.days_restricted or 0)
+    recordables = sum(counts[k] for k in KPI_RECORDABLE)
+    dart = counts['restricted'] + counts['lost_time']
+    lti_outcomes = counts['lost_time'] + counts['fatality']
+    near = sum(1 for i in incidents if _kpi_is_near_miss(i) or (outs.get(i.id) and outs[i.id].outcome == 'none'))
+    classified, unclassified = len(outs), len(incidents) - len(outs)
+    h = total_hours or 0
+    kpis.update({
+        'outcomes': counts, 'classified_incidents': classified, 'unclassified_incidents': unclassified,
+        'recordables': recordables, 'dart_cases': dart, 'days_lost': days_lost, 'days_restricted': days_restricted,
+        'fatalities': counts['fatality'], 'near_misses': near,
+        'trir': round(recordables * 200_000 / h, 2) if h and classified else None,
+        'dart': round(dart * 200_000 / h, 2) if h and classified else None,
+        'severity_rate': round(days_lost * 200_000 / h, 2) if h and classified else None,
+        'near_miss_ratio': round(near / recordables, 1) if recordables else None,
+        'trir_source': 'classified injury outcomes' if classified else None,
+    })
+    if kpis.get('lti_source') != 'LTI records' and classified:
+        kpis['lti_cases'], kpis['lti_source'] = lti_outcomes, 'classified injury outcomes'
+        kpis['ltifr'] = round(lti_outcomes * 1_000_000 / h, 2) if h else None
+    if incidents and not classified:
+        notes.append('TRIR, DART and severity rate need the injury outcome of each incident. Use "Classify injuries" to record them.')
+    elif unclassified:
+        notes.append(f'{unclassified} incident(s) in this period have no injury outcome yet, so the rates may be low. Use "Classify injuries".')
+    if not company_id:
+        return leading
+    today = datetime.utcnow().date()
+    s_d, e_d = start.date() if hasattr(start, 'date') else start, end.date() if hasattr(end, 'date') else end
+    try:
+        done = Inspection.query.filter(Inspection.company_id == company_id, Inspection.status == 'completed',
+                                       Inspection.completed_at >= start, Inspection.completed_at <= end)
+        acts = InspectionAction.query.filter(InspectionAction.company_id == company_id, InspectionAction.created_at >= start,
+                                             InspectionAction.created_at <= end).limit(20000).all()
+        closed = [a for a in acts if a.status in ('done', 'verified')]
+        on_time = [a for a in closed if a.done_at and a.due_date and a.done_at.date() <= a.due_date]
+        leading['inspections'] = {
+            'completed': done.count(), 'critical_findings': int(done.with_entities(func.coalesce(func.sum(Inspection.critical_failed), 0)).scalar() or 0),
+            'actions': len(acts), 'actions_closed': len(closed),
+            'actions_on_time_pct': round(100 * len(on_time) / len(closed), 1) if closed else None,
+            'actions_overdue_now': InspectionAction.query.filter(InspectionAction.company_id == company_id, InspectionAction.status == 'open',
+                                                                 InspectionAction.due_date < today).count()}
+    except Exception as e:
+        db.session.rollback()
+        logger.warning(f'kpi inspections: {e}')
+    try:
+        rc = ReadyCheck.query.filter(ReadyCheck.company_id == company_id, ReadyCheck.kind == 'check', ReadyCheck.done_at >= start,
+                                     ReadyCheck.done_at <= end)
+        leading['ready_check'] = {'checks': rc.count(), 'stops': rc.filter(ReadyCheck.result == 'stop').count()}
+    except Exception as e:
+        db.session.rollback()
+        logger.warning(f'kpi ready check: {e}')
+    try:
+        tq = ToolboxTalk.query.filter(ToolboxTalk.company_id == company_id, ToolboxTalk.status == 'delivered',
+                                      ToolboxTalk.talk_date >= s_d, ToolboxTalk.talk_date <= e_d)
+        leading['toolbox'] = {'talks': tq.count(), 'attendance': int(tq.with_entities(func.coalesce(func.sum(ToolboxTalk.attendee_count), 0)).scalar() or 0)}
+    except Exception as e:
+        db.session.rollback()
+        logger.warning(f'kpi toolbox: {e}')
+    try:
+        eq = EquipmentItem.query.filter(EquipmentItem.company_id == company_id, EquipmentItem.status != 'retired').limit(10000).all()
+        states = [_eq_state(x, today)[0] for x in eq]
+        leading['equipment'] = {'items': len(eq), 'safe': states.count('ok'), 'do_not_use': states.count('do_not_use') + states.count('cert_expired'),
+                                'overdue': states.count('overdue') + states.count('not_inspected'),
+                                'safe_pct': round(100 * states.count('ok') / len(eq), 1) if eq else None}
+    except Exception as e:
+        db.session.rollback()
+        logger.warning(f'kpi equipment: {e}')
+    try:
+        rows = ChemItem.query.filter(ChemItem.company_id == company_id, ChemItem.status == 'in_use').limit(5000).all()
+        last = _cs_last_tests({r.id for r in rows})
+        issues = [i for r in rows for i in _cs_item_state(r, last.get(r.id), today)]
+        wastes = ChemWaste.query.filter(ChemWaste.company_id == company_id, ChemWaste.status == 'open').limit(2000).all()
+        leading['chemicals'] = {'items': len(rows), 'alerts': len(issues), 'critical': sum(1 for i in issues if i['level'] == 'critical'),
+                                'without_sds': sum(1 for r in rows if not r.sds_file),
+                                'waste_over_limit': sum(1 for w in wastes if (_cs_waste_dict(w, today).get('issue') or {}).get('level') == 'critical')}
+    except Exception as e:
+        db.session.rollback()
+        logger.warning(f'kpi chemicals: {e}')
+    try:
+        vq = WorkplaceVoiceReport.query.filter(WorkplaceVoiceReport.company_id == company_id, WorkplaceVoiceReport.created_at >= start,
+                                               WorkplaceVoiceReport.created_at <= end)
+        leading['voice'] = {'reports': vq.count(), 'closed': vq.filter(WorkplaceVoiceReport.closed_at.isnot(None)).count()}
+    except Exception as e:
+        db.session.rollback()
+        logger.warning(f'kpi voice: {e}')
+    return leading
+
+
+def _kpi_period():
+    end = _pbi_date(request.args.get('end_date'), end=True) or datetime.utcnow()
+    start = _pbi_date(request.args.get('start_date')) or (end - timedelta(days=365))
+    return start, end
+
+
+@app.route('/api/analytics/injury-outcomes', methods=['GET'])
+@jwt_required
+def kpi_outcomes_list():
+    """Incidents of the period with their injury outcome (or none yet), newest first."""
+    user = request.user
+    cid = getattr(user, 'company_id', None)
+    if not cid:
+        return jsonify({'success': False, 'error': 'Available to company accounts.'}), 403
+    start, end = _kpi_period()
+    q = Incident.query.filter(Incident.company_id == cid, Incident.date_occurred >= start, Incident.date_occurred <= end)
+    if request.args.get('project_id') not in (None, '', 'all'):
+        pid = _pbi_valid_project(request.args.get('project_id'), user)
+        if not pid:
+            return jsonify({'success': False, 'error': 'Project not found'}), 404
+        q = q.filter(Incident.project_id == pid)
+    rows = q.order_by(Incident.date_occurred.desc()).limit(1000).all()
+    outs = {o.incident_id: o for o in IncidentOutcome.query.filter(IncidentOutcome.incident_id.in_([r.id for r in rows] or [0])).all()}
+    data = [{'id': r.id, 'number': r.incident_number, 'title': r.title, 'type': r.incident_type, 'severity': r.severity,
+             'date': r.date_occurred.date().isoformat() if r.date_occurred else None, 'near_miss': _kpi_is_near_miss(r),
+             'outcome': outs[r.id].outcome if r.id in outs else None, 'days_lost': outs[r.id].days_lost if r.id in outs else 0,
+             'days_restricted': outs[r.id].days_restricted if r.id in outs else 0} for r in rows]
+    return jsonify({'success': True, 'data': data, 'outcomes': [{'id': k, 'name': v} for k, v in KPI_OUTCOMES.items()],
+                    'can_manage': bool(_rc_staff(user))}), 200
+
+
+@app.route('/api/analytics/injury-outcomes/<int:incident_id>', methods=['PUT', 'DELETE'])
+@jwt_required
+def kpi_outcome_save(incident_id):
+    user = request.user
+    if not getattr(user, 'company_id', None):
+        return jsonify({'success': False, 'error': 'Available to company accounts.'}), 403
+    if not _rc_staff(user):
+        return jsonify({'success': False, 'error': 'Only supervisors and admins can classify injuries.'}), 403
+    inc = db.session.get(Incident, incident_id)
+    if not inc or inc.company_id != user.company_id:
+        return jsonify({'success': False, 'error': 'Incident not found.'}), 404
+    o = db.session.get(IncidentOutcome, incident_id)
+    if request.method == 'DELETE':
+        if o:
+            db.session.delete(o)
+            db.session.commit()
+        return jsonify({'success': True}), 200
+    data = request.get_json(silent=True) or {}
+    outcome = str(data.get('outcome') or '')
+    if outcome not in KPI_OUTCOMES:
+        return jsonify({'success': False, 'error': 'Choose the injury outcome.'}), 400
+    try:
+        lost = int(data.get('days_lost') or 0)
+        restricted = int(data.get('days_restricted') or 0)
+    except (TypeError, ValueError):
+        return jsonify({'success': False, 'error': 'Days must be whole numbers.'}), 400
+    if not (0 <= lost <= 180) or not (0 <= restricted <= 180):
+        return jsonify({'success': False, 'error': 'Days must be between 0 and 180 (OSHA caps a case at 180 days).'}), 400
+    if outcome != 'lost_time':
+        lost = 0
+    if outcome not in ('restricted', 'lost_time'):
+        restricted = 0
+    if outcome == 'lost_time' and lost < 1:
+        return jsonify({'success': False, 'error': 'A lost-time case needs at least 1 day lost.'}), 400
+    if not o:
+        o = IncidentOutcome(incident_id=incident_id, company_id=user.company_id)
+        db.session.add(o)
+    o.outcome, o.days_lost, o.days_restricted, o.updated_by = outcome, lost, restricted, user.id
+    db.session.commit()
+    return jsonify({'success': True, 'data': {'id': incident_id, 'outcome': o.outcome, 'days_lost': o.days_lost, 'days_restricted': o.days_restricted}}), 200
+
+
 # =====================================================================================================
 # AUTO MIGRATIONS (2026-11-23)
 # Railway's Data tab appends LIMIT to every query, so CREATE/ALTER statements fail there. Instead the
@@ -173779,7 +174000,7 @@ IN_LIBRARY.update({
 #   - a failing statement is logged and the file is retried on the next start
 # Set AUTO_MIGRATE=0 on Railway to switch this off.
 # =====================================================================================================
-AUTO_MIGRATIONS = ('DEPLOY_2026-11-23_FULL.sql', '2026-11-24_company_quotes.sql', '2026-11-25_ready_checks.sql', '2026-11-26_muster_contractors.sql', '2026-11-27_document_control_plus.sql', '2026-11-27_inspections.sql', '2026-11-27_chemical_safety.sql', '2026-11-27_chemical_waste.sql', '2026-11-27_equipment.sql')
+AUTO_MIGRATIONS = ('DEPLOY_2026-11-23_FULL.sql', '2026-11-24_company_quotes.sql', '2026-11-25_ready_checks.sql', '2026-11-26_muster_contractors.sql', '2026-11-27_document_control_plus.sql', '2026-11-27_inspections.sql', '2026-11-27_chemical_safety.sql', '2026-11-27_chemical_waste.sql', '2026-11-27_equipment.sql', '2026-11-27_incident_outcomes.sql')
 _MIGRATION_LOCK_KEY = 74230115
 
 
