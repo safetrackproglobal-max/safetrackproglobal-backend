@@ -172467,7 +172467,7 @@ def cs_tests_route(iid):
             _in_notify([(u.id, getattr(u, 'email', None)) for u in _rc_staff_users(it.company_id, user.id)],
                        f'Peroxide level high: {it.name}'[:200],
                        f'{it.name} ({it.location or "no location"}) tested {ppm:g} ppm, at or above {CS_PEROXIDE_LIMIT_PPM:g} ppm. Do not use, move or open it further; arrange disposal.',
-                       '/chemicals?tab=alerts', 'critical', email=True)
+                       '/hse-management/industry/chemical?tab=alerts', 'critical', email=True)
     rows = ChemTest.query.filter(ChemTest.item_id == it.id).order_by(ChemTest.tested_on.desc(), ChemTest.id.desc()).limit(100).all()
     names = _in_names([r.tested_by for r in rows])
     return jsonify({'success': True, 'data': [{'id': r.id, 'kind': r.kind, 'tested_on': r.tested_on.isoformat(), 'result_ppm': r.result_ppm,
@@ -172718,7 +172718,7 @@ def _cs_reminders(today=None):
             by_company.setdefault(r.company_id, []).append(f'{r.name}: {issues[0]["text"]}')
     for cid, lines in by_company.items():
         _in_notify([(u.id, getattr(u, 'email', None)) for u in _rc_staff_users(cid)], f'Chemicals: {len(lines)} need attention',
-                   '; '.join(lines[:10]) + (' ...' if len(lines) > 10 else ''), '/chemicals?tab=alerts', 'high',
+                   '; '.join(lines[:10]) + (' ...' if len(lines) > 10 else ''), '/hse-management/industry/chemical?tab=alerts', 'high',
                    email=any('overdue' in x or 'Expired' in x or 'ppm' in x for x in lines))
     return sum(len(v) for v in by_company.values())
 
@@ -172729,6 +172729,7 @@ def _cs_watch_loop():
         try:
             with app.app_context():
                 _cs_reminders()
+                _cs_waste_reminders()
         except Exception as e:
             logger.error(f'chemical reminder watcher: {e}')
         finally:
@@ -172744,6 +172745,448 @@ if os.environ.get('READY_CHECK_WATCHER', '1') == '1':
     threading.Thread(target=_cs_watch_loop, name='chemical-reminder-watcher', daemon=True).start()
 
 
+# ============================================================================
+# CHEMICAL SAFETY PART 2 (2026-11-27)
+# ============================================================================
+# Lives inside HSE > Chemical workspace. Chemical waste log (accumulation limit, container contents, compatibility
+# through the EPA chart), document folders (PTW, risk assessment, COSHH, SDS ...) that are ordinary Document Management
+# documents of module 'chemical', SDS auto-fill (text, OCR for scans, optional DeepSeek when the user asks) and lab
+# checklists for the Inspections library. DB: chem_waste -> sql/2026-11-27_chemical_waste.sql (auto migration)
+
+
+class ChemWaste(db.Model):
+    __tablename__ = 'chem_waste'
+    __table_args__ = {'extend_existing': True}
+    id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id', ondelete='CASCADE'), nullable=False, index=True)
+    name = db.Column(db.String(200), nullable=False)                         # container label, e.g. "Halogenated solvents 20 L"
+    category = db.Column(db.String(40))                                      # see CS_WASTE_CATEGORIES
+    contents = db.Column(db.Text)                                            # JSON [{item_id, name}] from the register or free text
+    groups = db.Column(db.Text)                                              # JSON EPA group ids of everything in the container
+    quantity = db.Column(db.Float)
+    unit = db.Column(db.String(12))
+    location = db.Column(db.String(160))
+    started_on = db.Column(db.Date, nullable=False)                          # first waste went in
+    limit_days = db.Column(db.Integer, nullable=False, default=90)
+    status = db.Column(db.String(12), nullable=False, default='open')       # open | collected
+    collected_on = db.Column(db.Date)
+    contractor = db.Column(db.String(160))
+    manifest_no = db.Column(db.String(80))
+    disposal_method = db.Column(db.String(120))
+    notes = db.Column(db.Text)
+    notified_on = db.Column(db.Date)
+    created_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+CS_WASTE_CATEGORIES = {
+    'halogenated': 'Halogenated solvents', 'non_halogenated': 'Non-halogenated solvents', 'acid': 'Acids', 'base': 'Bases (alkalis)',
+    'oxidiser': 'Oxidisers', 'heavy_metal': 'Heavy metals', 'toxic': 'Toxic', 'reactive': 'Reactive (water / air)',
+    'oil': 'Oils and fuels', 'contaminated_solids': 'Contaminated solids (rags, absorbent, PPE)', 'empty_containers': 'Empty containers',
+    'aerosol': 'Aerosols and gas cylinders', 'other': 'Other',
+}
+
+
+def _cs_waste_dict(w, today):
+    contents = _tbt_json(w.contents, [])
+    days = (today - w.started_on).days if w.started_on else 0
+    left = (w.limit_days or 0) - days
+    issue = None
+    if w.status == 'open':
+        if left < 0:
+            issue = {'level': 'critical', 'text': f'Over the {w.limit_days}-day storage limit by {-left} day(s). Arrange collection.'}
+        elif left <= 7:
+            issue = {'level': 'high', 'text': f'{left} day(s) left of the {w.limit_days}-day storage limit.'}
+    return {'id': w.id, 'name': w.name, 'category': w.category, 'category_name': CS_WASTE_CATEGORIES.get(w.category or '', w.category),
+            'contents': contents, 'groups': _tbt_json(w.groups, []), 'quantity': w.quantity, 'unit': w.unit, 'location': w.location,
+            'started_on': w.started_on.isoformat() if w.started_on else None, 'limit_days': w.limit_days, 'days': days,
+            'days_left': left if w.status == 'open' else None, 'status': w.status,
+            'collected_on': w.collected_on.isoformat() if w.collected_on else None, 'contractor': w.contractor,
+            'manifest_no': w.manifest_no, 'disposal_method': w.disposal_method, 'notes': w.notes, 'issue': issue,
+            'updated_at': _in_iso(w.updated_at)}
+
+
+def _cs_waste_apply(w, data, user):
+    if 'name' in data or w.id is None:
+        name = _rc_text(data.get('name'), 200)
+        if len(name) < 2:
+            raise ValueError('Give the container a name, e.g. "Halogenated solvents, 20 L drum".')
+        w.name = name
+    if 'category' in data:
+        c = str(data.get('category') or '')
+        if c and c not in CS_WASTE_CATEGORIES:
+            raise ValueError('Unknown waste category.')
+        w.category = c or None
+    if 'contents' in data:
+        out = []
+        for c in (data.get('contents') or [])[:100]:
+            if isinstance(c, dict) and str(c.get('item_id') or '').isdigit():
+                it = _cs_item(user, int(c['item_id']))
+                if not it:
+                    raise ValueError('A chemical in the contents is not in your register.')
+                out.append({'item_id': it.id, 'name': it.name})
+            else:
+                n = _rc_text(c.get('name') if isinstance(c, dict) else c, 160)
+                if n:
+                    out.append({'item_id': None, 'name': n})
+        w.contents = json.dumps(out)
+    if 'groups' in data:
+        g = [str(x) for x in (data.get('groups') or [])][:20]
+        if any(x not in CS_EPA_GROUPS for x in g):
+            raise ValueError('Unknown reactivity group.')
+        w.groups = json.dumps(sorted(set(g), key=lambda x: int(x)))
+    for f, n in (('location', 160), ('unit', 12), ('contractor', 160), ('manifest_no', 80), ('disposal_method', 120), ('notes', 4000)):
+        if f in data:
+            setattr(w, f, _rc_text(data.get(f), n) or None)
+    if 'quantity' in data:
+        q = data.get('quantity')
+        if q in (None, ''):
+            w.quantity = None
+        else:
+            try:
+                w.quantity = float(q)
+            except (TypeError, ValueError):
+                raise ValueError('Quantity must be a number.')
+            if w.quantity < 0 or w.quantity > 1e9:
+                raise ValueError('Quantity is out of range.')
+    if 'started_on' in data or w.id is None:
+        d = _ct_date(data.get('started_on')) or datetime.utcnow().date()
+        if d > datetime.utcnow().date() + timedelta(days=1):
+            raise ValueError('The start date cannot be in the future.')
+        w.started_on = d
+    if 'limit_days' in data:
+        try:
+            ld = int(data.get('limit_days'))
+        except (TypeError, ValueError):
+            raise ValueError('The storage limit must be a whole number of days.')
+        if ld < 1 or ld > 3650:
+            raise ValueError('The storage limit must be between 1 and 3650 days.')
+        w.limit_days = ld
+    if 'status' in data:
+        s = str(data.get('status') or '')
+        if s not in ('open', 'collected'):
+            raise ValueError('Status must be open or collected.')
+        w.status = s
+        if s == 'collected':
+            w.collected_on = _ct_date(data.get('collected_on')) or w.collected_on or datetime.utcnow().date()
+        else:
+            w.collected_on = None
+
+
+@app.route('/api/chem/waste', methods=['GET', 'POST'])
+@jwt_required
+def cs_waste_route():
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    today = datetime.utcnow().date()
+    if request.method == 'GET':
+        q = ChemWaste.query.filter(ChemWaste.company_id == user.company_id)
+        if request.args.get('status') in ('open', 'collected'):
+            q = q.filter(ChemWaste.status == request.args.get('status'))
+        rows = q.order_by(ChemWaste.status.desc(), ChemWaste.started_on.asc()).limit(1000).all()
+        return jsonify({'success': True, 'data': [_cs_waste_dict(w, today) for w in rows], 'can_manage': bool(_rc_staff(user)),
+                        'categories': [{'id': k, 'name': v} for k, v in CS_WASTE_CATEGORIES.items()]}), 200
+    deny = _cs_staff_403(user)
+    if deny:
+        return deny
+    w = ChemWaste(company_id=user.company_id, created_by=user.id, limit_days=90, status='open')
+    try:
+        _cs_waste_apply(w, _in_body(), user)
+    except ValueError as e:
+        db.session.rollback()
+        return jsonify({'success': False, 'error': str(e)}), 400
+    db.session.add(w)
+    db.session.commit()
+    return jsonify({'success': True, 'data': _cs_waste_dict(w, today)}), 201
+
+
+@app.route('/api/chem/waste/<int:wid>', methods=['PUT', 'DELETE'])
+@jwt_required
+def cs_waste_one_route(wid):
+    user = request.user
+    deny = _in_company_403(user) or _cs_staff_403(user)
+    if deny:
+        return deny
+    w = db.session.get(ChemWaste, wid)
+    if not w or w.company_id != user.company_id:
+        return jsonify({'success': False, 'error': 'Waste container not found.'}), 404
+    if request.method == 'DELETE':
+        db.session.delete(w)
+        db.session.commit()
+        return jsonify({'success': True}), 200
+    try:
+        _cs_waste_apply(w, _in_body(), user)
+    except ValueError as e:
+        db.session.rollback()
+        return jsonify({'success': False, 'error': str(e)}), 400
+    db.session.commit()
+    return jsonify({'success': True, 'data': _cs_waste_dict(w, datetime.utcnow().date())}), 200
+
+
+def _cs_waste_reminders(today=None):
+    """Once a day per open container that is over, or within 7 days of, its storage limit."""
+    today = today or datetime.utcnow().date()
+    rows = (ChemWaste.query.filter(ChemWaste.status == 'open', or_(ChemWaste.notified_on.is_(None), ChemWaste.notified_on < today))
+            .limit(3000).all())
+    by_company = {}
+    for w in rows:
+        d = _cs_waste_dict(w, today)
+        if not d['issue']:
+            continue
+        claimed = (ChemWaste.query.filter(ChemWaste.id == w.id, or_(ChemWaste.notified_on.is_(None), ChemWaste.notified_on < today))
+                   .update({'notified_on': today}, synchronize_session=False))
+        db.session.commit()
+        if claimed:
+            by_company.setdefault(w.company_id, []).append((d['issue']['level'], f'{w.name}: {d["issue"]["text"]}'))
+    for cid, lines in by_company.items():
+        _in_notify([(u.id, getattr(u, 'email', None)) for u in _rc_staff_users(cid)], f'Chemical waste: {len(lines)} container(s) need collection',
+                   '; '.join(x for _, x in lines[:10]) + (' ...' if len(lines) > 10 else ''),
+                   '/hse-management/industry/chemical?tab=waste', 'high', email=any(lv == 'critical' for lv, _ in lines))
+    return sum(len(v) for v in by_company.values())
+
+
+# ---------------------------------------------------------------- document folders (Document Management, module 'chemical')
+CS_FOLDERS = [
+    ('ptw', 'Permits to work', ('ptw', 'permit')),
+    ('risk', 'Risk assessments', ('risk',)),
+    ('coshh', 'COSHH / chemical exposure assessments', ('coshh', 'exposure', 'chemical assessment', 'hazardous substance')),
+    ('sds', 'Safety data sheets', ('sds', 'msds', 'safety data')),
+    ('sop', 'Procedures and method statements', ('sop', 'procedure', 'method', 'instruction', 'work instruction')),
+    ('emergency', 'Emergency and spill plans', ('emergency', 'spill', 'evacuation', 'response plan')),
+    ('waste', 'Waste transfer notes and manifests', ('waste', 'manifest', 'transfer note', 'consignment')),
+    ('training', 'Training records', ('training', 'induction', 'certificate', 'competence')),
+    ('other', 'Other', ()),
+]
+
+
+def _cs_folder_of(d):
+    keys = {k for k, _, _ in CS_FOLDERS}
+    for v in (d.category, d.document_type):
+        if (v or '').lower() in keys:
+            return v.lower()
+    hay = f'{d.category or ""} {d.document_type or ""} {d.title or ""}'.lower().replace('_', ' ')
+    for k, _, words in CS_FOLDERS:
+        if any(re.search(r'\b' + re.escape(w) + r'\b', hay) for w in words):
+            return k
+    return 'other'
+
+
+@app.route('/api/chem/folders', methods=['GET'])
+@jwt_required
+def cs_folders_route():
+    """Company documents of the chemical module, sorted into folders. Confidential documents are shown only to
+    supervisors / admins and to the person who added them; opening a document goes through Document Management."""
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    staff = bool(_rc_staff(user))
+    q = Document.query.filter(Document.company_id == user.company_id, Document.module == 'chemical', Document.archived_at.is_(None))
+    if not staff:
+        q = q.filter(or_(Document.is_confidential.is_(False), Document.is_confidential.is_(None), Document.created_by == user.id))
+    try:
+        q = q.filter(or_(Document.is_latest.is_(True), Document.is_latest.is_(None)))
+        rows = q.order_by(Document.updated_at.desc().nullslast()).limit(2000).all()
+    except Exception as e:
+        db.session.rollback()
+        logger.warning(f'chemical folders: {e}')
+        rows = []
+    folders = {k: {'key': k, 'name': n, 'documents': []} for k, n, _ in CS_FOLDERS}
+    for d in rows:
+        folders[_cs_folder_of(d)]['documents'].append({
+            'id': d.id, 'title': d.title, 'type': d.document_type, 'status': d.status, 'confidential': bool(d.is_confidential),
+            'file_name': d.file_name, 'expires_at': _in_iso(d.expires_at), 'next_review_date': _in_iso(d.next_review_date),
+            'updated_at': _in_iso(d.updated_at or d.created_at)})
+    return jsonify({'success': True, 'data': {'folders': list(folders.values()), 'can_see_confidential': staff}}), 200
+
+
+# ---------------------------------------------------------------- SDS auto-fill
+def _cs_cas_ok(cas):
+    m = re.fullmatch(r'(\d{2,7})-(\d{2})-(\d)', cas or '')
+    if not m:
+        return False
+    digits = (m.group(1) + m.group(2))[::-1]
+    return sum((i + 1) * int(c) for i, c in enumerate(digits)) % 10 == int(m.group(3))
+
+
+def _cs_after_label(text, labels):
+    """Value after 'Label:' on the same line, or the next non-empty line when the label stands alone."""
+    lines = [ln.strip() for ln in text.splitlines()]
+    pat = re.compile(r'^(?:\d+(?:\.\d+)*\.?\s*)?(?:' + '|'.join(labels) + r')\b\s*[:\-–]?\s*(.*)$', re.I)
+    for i, ln in enumerate(lines[:400]):
+        m = pat.match(ln)
+        if not m:
+            continue
+        val = m.group(1).strip(' :.-–')
+        if not val or re.search(r'safety data sheet|of the substance|of the mixture|undertaking|identification', val, re.I):
+            nxt = next((x for x in lines[i + 1:i + 4] if x), '')
+            if pat.match(nxt) or re.match(r'^(?:section\s*)?\d+(\.\d+)*[\s:.]', nxt, re.I) or re.match(r'^[A-Za-z][\w ./()-]{1,40}?\s*:\s', nxt):
+                continue
+            val = nxt
+        val = re.sub(r'\s{2,}', ' ', val).strip(' :.-–')
+        if 2 <= len(val) <= 160 and not re.search(r'safety data sheet', val, re.I):
+            return val
+    return None
+
+
+def _cs_extract_sds(text):
+    t = unicodedata.normalize('NFKC', text or '')
+    out = {}
+    out['name'] = _cs_after_label(t, [r'product name', r'trade name', r'product identifier', r'name of (?:the )?(?:substance|product|mixture)',
+                                      r'substance name', r'commercial name'])
+    out['supplier'] = _cs_after_label(t, [r'supplier', r'manufacturer(?:/supplier)?', r'company name', r'company'])
+    cas = []
+    for m in re.finditer(r'(?<![\d-])(\d{2,7}-\d{2}-\d)(?![\d-])', t):
+        if _cs_cas_ok(m.group(1)) and m.group(1) not in cas:
+            cas.append(m.group(1))
+    out['cas_numbers'] = cas[:20]
+    hs = []
+    for m in re.finditer(r'\b((?:EU)?H\d{3}[A-Za-z]{0,2}(?:\s*\+\s*H\d{3}[A-Za-z]{0,2})*)\b', t):
+        code = re.sub(r'\s+', '', m.group(1))
+        if code not in hs:
+            hs.append(code)
+    out['hazard_codes'] = hs[:40]
+    m = re.search(r'signal\s*word\s*[:\-–]?\s*(danger|warning)', t, re.I)
+    out['signal'] = m.group(1).capitalize() if m else None
+    m = re.search(r'\bUN\s?-?(\d{4})\b', t)
+    out['un_number'] = f'UN{m.group(1)}' if m else None
+    m = re.search(r'(?:revision date|date of revision|revised on|revision|issue date|date of issue|print date)\s*[:\-–]?\s*'
+                  r'(\d{4}-\d{2}-\d{2}|\d{1,2}[./-]\d{1,2}[./-]\d{2,4}|\d{1,2}\s+[A-Za-z]{3,9}\.?\s+\d{4}|[A-Za-z]{3,9}\.?\s+\d{1,2},?\s+\d{4})', t, re.I)
+    out['revision_date'] = m.group(1) if m else None
+    return out
+
+
+@app.route('/api/chem/extract', methods=['POST'])
+@jwt_required
+def cs_extract_route():
+    """Read a supplier SDS (PDF, or a photo/scan) and suggest the register fields. Nothing is saved: a person checks the
+    suggestions. The file is read in memory and discarded. With ai=1 (the user's choice) the text is also sent to DeepSeek."""
+    user = request.user
+    deny = _in_company_403(user) or _cs_staff_403(user)
+    if deny:
+        return deny
+    up = request.files.get('file')
+    if not up or not up.filename:
+        return jsonify({'success': False, 'error': 'Choose the SDS file (PDF or a photo).'}), 400
+    raw = up.read(20 * 1024 * 1024 + 1)
+    if len(raw) > 20 * 1024 * 1024:
+        return jsonify({'success': False, 'error': 'The file is larger than 20 MB.'}), 400
+    method = 'text'
+    text = ''
+    try:
+        if raw.startswith(b'%PDF'):
+            import fitz as _fz
+            with _fz.open(stream=raw, filetype='pdf') as d:
+                text = '\n'.join(d[i].get_text() for i in range(min(d.page_count, 20)))
+                if len(text.strip()) < 80:
+                    from PIL import Image as _Im
+                    parts = []
+                    for i in range(min(d.page_count, 4)):
+                        pix = d[i].get_pixmap(matrix=_fz.Matrix(2, 2), alpha=False)
+                        parts.append(_dm_ocr_image(_Im.frombytes('RGB', (pix.width, pix.height), pix.samples)))
+                    text, method = '\n'.join(parts), 'ocr'
+        elif raw[:3] == b'\xff\xd8\xff' or raw[:8] == b'\x89PNG\r\n\x1a\n':
+            from PIL import Image as _Im
+            img = _Im.open(io.BytesIO(raw))
+            img.load()
+            if img.width * img.height > 40_000_000:
+                return jsonify({'success': False, 'error': 'The picture is too large.'}), 400
+            text, method = _dm_ocr_image(img), 'ocr'
+        else:
+            return jsonify({'success': False, 'error': 'Use a PDF, JPG or PNG file.'}), 400
+    except Exception as e:
+        logger.warning(f'sds extract read: {e}')
+        return jsonify({'success': False, 'error': 'The file could not be read. If it is a scan, the text recognition may not be installed.'}), 400
+    if len(text.strip()) < 40:
+        return jsonify({'success': False, 'error': 'No readable text found in this file.'}), 400
+    found = _cs_extract_sds(text)
+    sources = {k: method for k, v in found.items() if v}
+    ai_used, ai_error = False, None
+    if str(request.form.get('ai') or '') == '1':
+        try:
+            prompt = ('From this safety data sheet text, return JSON with keys: name (product name), supplier (company name only), '
+                      'cas_numbers (list), signal ("Danger" or "Warning" or null), hazard_codes (list of H codes like "H225"), '
+                      'un_number (like "UN1090" or null), revision_date (as written, or null). Use only what the text says; use null when absent.\n\n'
+                      + text[:14000])
+            res, _, _, _ = call_gemini(prompt, system_instruction='You extract fields from documents. Never guess.', json_mode=True,
+                                       temperature=0, max_tokens=800, feature='chem_sds_extract', use_cache=True,
+                                       current_user=user, company_id=user.company_id)
+            ai_used = True
+            if isinstance(res, dict):
+                if not found.get('name') and isinstance(res.get('name'), str) and 2 <= len(res['name'].strip()) <= 160:
+                    found['name'], sources['name'] = res['name'].strip(), 'ai'
+                if not found.get('supplier') and isinstance(res.get('supplier'), str) and 2 <= len(res['supplier'].strip()) <= 160:
+                    found['supplier'], sources['supplier'] = res['supplier'].strip(), 'ai'
+                extra = [c for c in (res.get('cas_numbers') or []) if isinstance(c, str) and _cs_cas_ok(c.strip()) and c.strip() in text]
+                for c in extra:
+                    if c.strip() not in found['cas_numbers']:
+                        found['cas_numbers'].append(c.strip())
+                        sources['cas_numbers'] = sources.get('cas_numbers', 'ai')
+                if not found.get('signal') and res.get('signal') in ('Danger', 'Warning'):
+                    found['signal'], sources['signal'] = res['signal'], 'ai'
+                for k in ('un_number', 'revision_date'):
+                    if not found.get(k) and isinstance(res.get(k), str) and res[k].strip() and len(res[k]) < 40:
+                        found[k], sources[k] = res[k].strip(), 'ai'
+        except Exception as e:
+            ai_error = 'The AI reader is not available right now; the fields below come from the text only.'
+            logger.warning(f'sds extract ai: {e}')
+    return jsonify({'success': True, 'data': {**found, 'sources': sources, 'method': method, 'ai_used': ai_used, 'ai_error': ai_error,
+                                              'is_pdf': raw.startswith(b'%PDF')}}), 200
+
+
+# ---------------------------------------------------------------- lab checklists (Inspections library)
+IN_LIBRARY.update({
+    'fume_hood': _in_lib('Laboratory fume hood check', 'Chemical / lab', 'Before use (user check) and monthly (supervisor). '
+                         'The certified test is done by a competent person, usually yearly.', [
+        ('Before use', [('Airflow monitor / alarm shows normal flow', 'c'), 'Sash moves freely and is at or below the marked working height',
+                        'Baffles and slots are not blocked by equipment or bottles', 'Hood is not used as a store for chemicals']),
+        ('Monthly', [('Measured face velocity (average of readings), m/s. Common design range 0.4-0.6 m/s (80-120 fpm); use your hood\'s certified value', 'n:0.4:0.6:m/s'),
+                     'Certification label is present and in date', 'Lights and electrical outlets work, no damaged cables inside',
+                     'Spills and residues have been cleaned']),
+        ('Notes', [('Defects found', 't')]),
+    ]),
+    'eyewash': _in_lib('Emergency eyewash and shower check', 'Chemical / lab', 'Activate weekly; full inspection yearly (ANSI/ISEA Z358.1).', [
+        ('Access', [('Reachable within 10 seconds, on the same level, with no obstructions', 'c'), 'A sign marks the station and is visible',
+                    'The area around it is well lit']),
+        ('Weekly activation', [('Water flows when the valve is opened and stays on without the hand (stay-open valve)', 'c'),
+                               'Water runs clear after flushing (no rust or sediment)', 'Nozzle dust covers are in place and come off with the flow',
+                               ('Water temperature, °C (tepid: 16-38 °C)', 'n:16:38:°C')]),
+        ('Shower', ['Shower valve opens and the pull rod / handle is within reach', 'Shower head is clear and the flow covers the body']),
+        ('Notes', [('Date of the last yearly inspection and defects found', 't')]),
+    ]),
+    'chem_store': _in_lib('Chemical store and cabinet inspection', 'Chemical / lab', 'Monthly, and after deliveries.', [
+        ('Containers', [('Every container is labelled with the name and hazard pictograms', 'c'), 'Containers are closed and not leaking or corroded',
+                        'Opened peroxide formers are dated and within their test interval', 'No expired chemicals on the shelves']),
+        ('Segregation', [('Incompatible chemicals are separated (acids from bases, oxidisers from flammables and organics)', 'c'),
+                         'Water-reactive chemicals are kept dry and away from sprinklers and sinks',
+                         'Liquids are in trays or bunds that hold the largest container', 'Heavy and corrosive containers are stored low']),
+        ('Flammables cabinet', [('Doors close and latch fully', 'c'), 'The cabinet is labelled "Flammable - keep fire away"',
+                                'Quantity is within the cabinet\'s rated limit', 'No ignition sources nearby']),
+        ('Information and response', ['A current SDS is available for every chemical', 'Spill kit is present and complete',
+                                      'Eyewash is within reach', 'Store is ventilated and the door can be locked']),
+        ('Notes', [('Findings', 't')]),
+    ]),
+    'gas_cylinders': _in_lib('Gas cylinder storage check', 'Chemical / lab', 'Weekly in use areas, monthly in stores.', [
+        ('Storage', [('Cylinders are upright and secured with a chain or strap', 'c'), 'Valve caps are fitted on cylinders not in use',
+                     ('Oxygen and oxidising gases are at least 6 m (20 ft) from fuel gases or behind a 1.5 m high fire-resistant barrier', 'c'),
+                     'Full and empty cylinders are separated and marked', 'Store is ventilated, dry and away from heat and exits']),
+        ('In use', ['The regulator matches the gas and is in good condition', 'Hoses are not damaged; flashback arrestors fitted on fuel gas and oxygen lines',
+                    'No leaks (leak test with a suitable solution)', 'Toxic or asphyxiant gases have a gas detector where required']),
+        ('Notes', [('Findings', 't')]),
+    ]),
+    'spill_kit': _in_lib('Chemical spill kit check', 'Chemical / lab', 'Monthly and after every use.', [
+        ('Kit', [('The kit suits the chemicals in the area (acid / base neutraliser, solvent absorbent, mercury kit if needed)', 'c'),
+                 'Absorbent pads, socks and granules are present', 'Gloves, goggles and aprons are present and in date',
+                 'Disposal bags, ties and labels are present', 'Scoop / brush and a sealable container are present']),
+        ('Readiness', ['The kit is in its marked place and not blocked', 'Staff in the area know where it is and have been shown how to use it']),
+        ('Notes', [('Items to reorder', 't')]),
+    ]),
+})
+
+
 # =====================================================================================================
 # AUTO MIGRATIONS (2026-11-23)
 # Railway's Data tab appends LIMIT to every query, so CREATE/ALTER statements fail there. Instead the
@@ -172754,7 +173197,7 @@ if os.environ.get('READY_CHECK_WATCHER', '1') == '1':
 #   - a failing statement is logged and the file is retried on the next start
 # Set AUTO_MIGRATE=0 on Railway to switch this off.
 # =====================================================================================================
-AUTO_MIGRATIONS = ('DEPLOY_2026-11-23_FULL.sql', '2026-11-24_company_quotes.sql', '2026-11-25_ready_checks.sql', '2026-11-26_muster_contractors.sql', '2026-11-27_document_control_plus.sql', '2026-11-27_inspections.sql', '2026-11-27_chemical_safety.sql')
+AUTO_MIGRATIONS = ('DEPLOY_2026-11-23_FULL.sql', '2026-11-24_company_quotes.sql', '2026-11-25_ready_checks.sql', '2026-11-26_muster_contractors.sql', '2026-11-27_document_control_plus.sql', '2026-11-27_inspections.sql', '2026-11-27_chemical_safety.sql', '2026-11-27_chemical_waste.sql')
 _MIGRATION_LOCK_KEY = 74230115
 
 
