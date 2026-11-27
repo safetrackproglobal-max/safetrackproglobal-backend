@@ -160952,6 +160952,15 @@ def pt_status(permit_id):
         return jsonify({'success': False, 'error': 'Describe the close-out (work complete, area left safe, isolations removed)'}), 400
     if action == 'activate' and p.end_at and p.end_at < datetime.utcnow():
         return jsonify({'success': False, 'error': 'This permit has already expired. Create a new permit or extend the end time.'}), 409
+    if action == 'activate' and p.company_id:
+        try:
+            gate_err = _og_activate_check(p, body, user)                      # start-of-work safety gate
+        except Exception as e:
+            db.session.rollback()
+            logger.error(f'permit activation gate {p.id}: {e}')
+            gate_err = None
+        if gate_err:
+            return jsonify(gate_err), 409
     if action in ('close', 'cancel') and p.company_id:
         try:
             iso_err = _og_close_check(p, body, user)                          # oil & gas isolation register
@@ -174745,6 +174754,128 @@ def og_zones(zid=None):
         db.session.add(z)
     db.session.commit()
     return jsonify({'success': True, 'data': _og_zone_dict(z)}), 200 if zid else 201
+
+
+
+# ---------------------------------------------------------------- start-of-work safety gate (permit activation)
+OG_GAS_MAX_AGE_MIN = 120                                                     # a passing test older than this needs a retest
+OG_ISO_TYPES = ('isolation', 'line_breaking', 'electrical', 'confined_space')
+
+
+def _og_gas_types():
+    try:
+        import permit_templates
+        return {t['key'] for t in permit_templates.PERMIT_TYPES if t.get('gas_test')}
+    except Exception:
+        return {'hot_work', 'confined_space', 'line_breaking'}
+
+
+def _og_form_gas_ok(row):
+    """A gas test row typed on the permit form (wizard): O2 / LEL / H2S / CO against the permit-form limits."""
+    lim = {'O2': (19.5, 23.5), 'LEL': (None, 10), 'H2S': (None, 10), 'CO': (None, 25)}
+    seen = False
+    for k, (lo, hi) in lim.items():
+        v = row.get(k)
+        if v in (None, ''):
+            continue
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            return False
+        seen = True
+        if (lo is not None and v < lo) or (hi is not None and v >= hi):
+            return False
+    return True if seen else None
+
+
+def _og_gate(p, user):
+    """What stands between this permit and safe work right now. Blockers stop activation; warnings are shown."""
+    now = datetime.utcnow()
+    blockers, warnings, passed = [], [], []
+    # 1. gas test
+    if p.permit_type in _og_gas_types():
+        last = OgGasTest.query.filter(OgGasTest.permit_id == p.id).order_by(OgGasTest.tested_at.desc()).first()
+        if last:
+            age = int((now - last.tested_at).total_seconds() // 60)
+            if last.result != 'pass':
+                blockers.append(f'The last gas test failed ({"; ".join(_tbt_json(last.reasons, []))}). Ventilate or purge, then retest.')
+            elif age > OG_GAS_MAX_AGE_MIN:
+                blockers.append(f'The last passing gas test is {age} minutes old (more than {OG_GAS_MAX_AGE_MIN}). Retest before work starts.')
+            else:
+                passed.append(f'Gas test passed {age} minutes ago.')
+                if last.instrument_id:
+                    inst = db.session.get(EquipmentItem, last.instrument_id)
+                    if inst and _eq_state(inst)[0] != 'ok':
+                        warnings.append(f'The gas detector {inst.tag_no} is not in a safe state ({_eq_state(inst)[1]}): the readings may be wrong.')
+                elif not last.instrument_text:
+                    warnings.append('The gas test does not say which detector was used.')
+        else:
+            rows = [r for r in (_pt_data(p).get('gas_tests') or []) if isinstance(r, dict)]
+            verdicts = [v for v in (_og_form_gas_ok(r) for r in rows) if v is not None]
+            if verdicts and verdicts[-1] is False:
+                blockers.append('The last gas test written on the permit form is outside the limits.')
+            elif verdicts:
+                warnings.append('Only the gas test written on the permit form was found; it has no date. Record a fresh test in the gas log.')
+            else:
+                blockers.append('This permit type needs a gas test before work starts, and none is recorded.')
+    # 2. isolations
+    iso = OgIsolation.query.filter(OgIsolation.permit_id == p.id, OgIsolation.status.in_(('isolated', 'verified'))).all()
+    unverified = [i.point_tag for i in iso if i.status == 'isolated']
+    if unverified:
+        blockers.append(f'Isolation not verified (prove zero energy): {", ".join(unverified[:8])}.')
+    elif iso:
+        passed.append(f'{len(iso)} isolation point(s) in place and verified.')
+    elif p.permit_type in OG_ISO_TYPES:
+        warnings.append('No isolation points are recorded for this permit. Record them so they cannot be removed while people work.')
+    # 3. SIMOPS with permits already running here
+    loc = _og_norm_loc(p.location)
+    if loc:
+        end = p.end_at or (now + timedelta(hours=12))
+        for o in WorkPermit.query.filter(WorkPermit.company_id == p.company_id, WorkPermit.id != p.id, WorkPermit.status == 'active').limit(500).all():
+            if _og_norm_loc(o.location) != loc:
+                continue
+            if o.end_at and o.end_at < now or (o.start_at and o.start_at > end):
+                continue
+            rule = _og_simops_rule(p.permit_type, o.permit_type)
+            if rule and rule[0] == 'stop':
+                blockers.append(f'{o.permit_number} ({o.permit_type.replace("_", " ")}) is running at the same place: {rule[1]}')
+            elif rule:
+                warnings.append(f'{o.permit_number} ({o.permit_type.replace("_", " ")}) is running at the same place: {rule[1]}')
+        # 4. bypassed safety devices in the same area
+        tags = [b.device_tag for b in OgBypass.query.filter(OgBypass.company_id == p.company_id, OgBypass.status == 'active').all()
+                if _og_norm_loc(b.location) == loc]
+        if tags:
+            warnings.append(f'Safety devices are bypassed in this area: {", ".join(tags[:8])}. Check the compensating measures cover this work.')
+    return {'blockers': blockers, 'warnings': warnings, 'passed': passed, 'ready': not blockers}
+
+
+@app.route('/api/og/permits/<int:pid>/gate', methods=['GET'])
+@jwt_required
+def og_gate_route(pid):
+    user = request.user
+    p = _og_permit(user, pid)
+    if not p:
+        return jsonify({'success': False, 'error': 'Permit not found.'}), 404
+    return jsonify({'success': True, 'data': _og_gate(p, user)}), 200
+
+
+def _og_activate_check(p, body, user):
+    """Used by the permit status route on 'activate'. Returns (error dict or None)."""
+    g = _og_gate(p, user)
+    if not g['blockers']:
+        return None
+    reason = _rc_text(body.get('override_reason'), 500)
+    if reason and _rc_staff(user):
+        if len(reason) < 10:
+            return {'success': False, 'code': 'GATE_BLOCKED', 'error': 'Give a full reason for starting despite the blockers (at least 10 characters).', 'gate': g}
+        data = _pt_data(p)
+        data.setdefault('activation_overrides', []).append({'by': user.id, 'at': datetime.utcnow().isoformat(), 'reason': reason, 'blockers': g['blockers']})
+        p.data = json.dumps(data)
+        _in_notify([(u.id, getattr(u, 'email', None)) for u in _rc_staff_users(p.company_id, user.id)], f'Permit started despite blockers: {p.permit_number}'[:200],
+                   f'{reason} | Blockers: {" ".join(g["blockers"])}'[:900], '/hse-management/industry/oil_gas?tab=permits', 'critical', email=True)
+        return None
+    return {'success': False, 'code': 'GATE_BLOCKED', 'gate': g,
+            'error': 'Work cannot start yet: ' + ' '.join(g['blockers']) + ('' if _rc_staff(user) else ' A supervisor can override with a reason.')}
 
 
 # ---------------------------------------------------------------- reminders
