@@ -177362,6 +177362,905 @@ if os.environ.get('READY_CHECK_WATCHER', '1') == '1':
     threading.Thread(target=_og2_watch_loop, name='oil-gas-handover-watcher', daemon=True).start()
 
 
+# ============================================================================
+# MINING PART 2: TAG BOARD + EMERGENCY ROLL CALL, REFUGES, DUST & SILICA EXPOSURE, FLEET PRE-START, SLOPE / TAILINGS MONITORING (2026-11-27)
+# ============================================================================
+# Tag board: who is underground and where. No tag-in without a self-rescuer, and not with one the equipment register says
+# is unsafe. Refuge chambers are checked and their capacity compared with the people in their area. An emergency freezes
+# the board into a roll call: everyone not yet accounted for is listed with their last area and the refuge there.
+# Exposure: personal samples turned into 8-hour TWAs against published limits (OSHA/MSHA silica, MSHA coal dust and diesel
+# particulate, ACGIH), statistics per similar exposure group (95th percentile, exceedance fraction), and the workers who
+# need a health check. Health data is visible to supervisors only. Fleet: which mobile plant has had its pre-start this
+# shift (pre-starts are Inspections on the equipment register, so a critical defect already takes the machine out of
+# service). Monitoring: prism / extensometer / radar / piezometer readings, velocity against the company's trigger levels,
+# and the inverse-velocity (Fukuzono 1985) estimate of time to failure when movement accelerates.
+# DB: mn_presence, mn_refuges, mn_refuge_checks, mn_emergencies, mn_samples, mn_health_checks, mn_monitor_points,
+#     mn_monitor_readings -> sql/2026-11-27_mining_part2.sql (auto migration)
+
+
+class MnPresence(db.Model):
+    __tablename__ = 'mn_presence'
+    __table_args__ = {'extend_existing': True}
+    id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id', ondelete='CASCADE'), nullable=False, index=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    person = db.Column(db.String(120), nullable=False)
+    employer = db.Column(db.String(120))
+    area = db.Column(db.String(160), nullable=False)
+    scsr_tag = db.Column(db.String(40), nullable=False)
+    scsr_equipment_id = db.Column(db.Integer, db.ForeignKey('equipment_items.id', ondelete='SET NULL'), nullable=True)
+    lamp_no = db.Column(db.String(40))
+    status = db.Column(db.String(4), nullable=False, default='in')          # in | out
+    entered_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    expected_out = db.Column(db.DateTime, nullable=False)
+    exited_at = db.Column(db.DateTime)
+    tagged_in_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    tagged_out_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    moves = db.Column(db.Text)                                               # JSON [{area, at}]
+
+
+class MnRefuge(db.Model):
+    __tablename__ = 'mn_refuges'
+    __table_args__ = {'extend_existing': True}
+    id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id', ondelete='CASCADE'), nullable=False, index=True)
+    name = db.Column(db.String(120), nullable=False)
+    area = db.Column(db.String(160), nullable=False)
+    capacity = db.Column(db.Integer, nullable=False)
+    air_hours = db.Column(db.Float)
+    check_every_days = db.Column(db.Integer, nullable=False)
+    last_checked_at = db.Column(db.DateTime)
+    last_ok = db.Column(db.Boolean)
+    last_issues = db.Column(db.Text)                                         # JSON list
+    active = db.Column(db.Boolean, nullable=False, default=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+
+class MnRefugeCheck(db.Model):
+    __tablename__ = 'mn_refuge_checks'
+    __table_args__ = {'extend_existing': True}
+    id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id', ondelete='CASCADE'), nullable=False, index=True)
+    refuge_id = db.Column(db.Integer, db.ForeignKey('mn_refuges.id', ondelete='CASCADE'), nullable=False, index=True)
+    answers = db.Column(db.Text, nullable=False)                             # JSON {key: ok|fail}
+    ok = db.Column(db.Boolean, nullable=False)
+    note = db.Column(db.String(1000))
+    checked_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    checked_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+
+class MnEmergency(db.Model):
+    __tablename__ = 'mn_emergencies'
+    __table_args__ = {'extend_existing': True}
+    id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id', ondelete='CASCADE'), nullable=False, index=True)
+    kind = db.Column(db.String(20), nullable=False)
+    area = db.Column(db.String(160))
+    status = db.Column(db.String(8), nullable=False, default='active')      # active | closed
+    people = db.Column(db.Text, nullable=False)                              # JSON [{presence_id, person, area, status, where, at, by}]
+    started_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    started_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    closed_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    closed_at = db.Column(db.DateTime)
+    note = db.Column(db.String(1000))
+
+
+class MnSample(db.Model):
+    __tablename__ = 'mn_samples'
+    __table_args__ = {'extend_existing': True}
+    id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id', ondelete='CASCADE'), nullable=False, index=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    person = db.Column(db.String(120), nullable=False)
+    seg = db.Column(db.String(120), nullable=False)                          # similar exposure group
+    area = db.Column(db.String(160))
+    task = db.Column(db.String(200))
+    agent = db.Column(db.String(20), nullable=False)
+    sampled_on = db.Column(db.Date, nullable=False)
+    duration_min = db.Column(db.Float, nullable=False)
+    shift_h = db.Column(db.Float, nullable=False, default=8)
+    conc = db.Column(db.Float, nullable=False)                               # mg/m3 over the sampled time
+    twa8 = db.Column(db.Float, nullable=False)
+    limit_used = db.Column(db.Float, nullable=False)
+    action_used = db.Column(db.Float)
+    result = db.Column(db.String(8), nullable=False)                         # below | action | over
+    respirator = db.Column(db.String(60))
+    lab_ref = db.Column(db.String(80))
+    note = db.Column(db.String(500))
+    created_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+
+class MnHealthCheck(db.Model):
+    __tablename__ = 'mn_health_checks'
+    __table_args__ = {'extend_existing': True}
+    id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id', ondelete='CASCADE'), nullable=False, index=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    person = db.Column(db.String(120), nullable=False)
+    done_on = db.Column(db.Date, nullable=False)
+    outcome = db.Column(db.String(10), nullable=False)                       # fit | restricted | refer
+    next_due = db.Column(db.Date, nullable=False)
+    note = db.Column(db.String(500))
+    created_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+
+class MnMonitorPoint(db.Model):
+    __tablename__ = 'mn_monitor_points'
+    __table_args__ = {'extend_existing': True}
+    id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id', ondelete='CASCADE'), nullable=False, index=True)
+    name = db.Column(db.String(120), nullable=False)
+    kind = db.Column(db.String(14), nullable=False)
+    structure = db.Column(db.String(160), nullable=False)
+    unit = db.Column(db.String(10), nullable=False)
+    amber_rate = db.Column(db.Float)                                         # per day (movement points)
+    red_rate = db.Column(db.Float)
+    amber_level = db.Column(db.Float)                                        # piezometers: water level / pressure
+    red_level = db.Column(db.Float)
+    level = db.Column(db.String(6), nullable=False, default='green')
+    active = db.Column(db.Boolean, nullable=False, default=True)
+    created_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+
+class MnMonitorReading(db.Model):
+    __tablename__ = 'mn_monitor_readings'
+    __table_args__ = {'extend_existing': True}
+    id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id', ondelete='CASCADE'), nullable=False, index=True)
+    point_id = db.Column(db.Integer, db.ForeignKey('mn_monitor_points.id', ondelete='CASCADE'), nullable=False, index=True)
+    at = db.Column(db.DateTime, nullable=False)
+    value = db.Column(db.Float, nullable=False)
+    note = db.Column(db.String(300))
+    recorded_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+
+MN_REFUGE_ITEMS = [('door', 'Door and seals close and are intact'), ('air', 'Breathable air / oxygen supply is charged'),
+                   ('scrub', 'CO2 scrubbing and cooling work'), ('gas', 'Gas monitor (O2, CO, CO2) works and is in calibration'),
+                   ('water', 'Drinking water and food are in date for the capacity'), ('firstaid', 'First aid kit is complete'),
+                   ('comms', 'Communication to the surface works (tested)'), ('power', 'Lighting and emergency power work'),
+                   ('signs', 'Signs to the chamber are visible on the way in'), ('access', 'Access route is clear')]
+MN_EMERGENCY_KINDS = {'fire': 'Fire / smoke', 'inrush': 'Inrush / flooding', 'fall_of_ground': 'Fall of ground', 'gas': 'Gas / bad air',
+                      'explosion': 'Explosion', 'other': 'Other'}
+# Published 8-hour limits (mg/m3). Companies may enter their country's limit on the sample.
+MN_AGENTS = {
+    'rcs': ('Respirable crystalline silica', 0.05, 0.025, 'OSHA 29 CFR 1910.1053 / MSHA 30 CFR part 60: 0.05 mg/m3, action level 0.025 (ACGIH TLV 0.025)'),
+    'coal_dust': ('Respirable coal mine dust', 1.5, None, 'MSHA 30 CFR 70.100: 1.5 mg/m3'),
+    'resp_dust': ('Respirable dust (not otherwise specified)', 3.0, None, 'ACGIH TLV respirable particles: 3 mg/m3'),
+    'inhal_dust': ('Inhalable dust (not otherwise specified)', 10.0, None, 'ACGIH TLV inhalable particles: 10 mg/m3'),
+    'dpm': ('Diesel particulate (total carbon)', 0.16, None, 'MSHA 30 CFR 57.5060: 160 ug/m3 total carbon'),
+}
+MN_HEALTH_EVERY_YEARS = 3                    # OSHA silica rule 1910.1053(i): medical examination at least every three years
+MN_SEG_MIN_SAMPLES = 6
+MN_FLEET_CATS = ('vehicle', 'forklift', 'crane', 'mewp')
+MN_SHIFT_HOURS = 12
+MN_MONITOR_KINDS = {'prism': ('Survey prism', 'move'), 'extensometer': ('Extensometer', 'move'), 'radar': ('Slope radar point', 'move'),
+                    'crackmeter': ('Crack meter', 'move'), 'inclinometer': ('Inclinometer', 'move'), 'piezometer': ('Piezometer', 'level')}
+
+
+def _mn_norm(s):
+    return re.sub(r'[^a-z0-9]+', ' ', (s or '').lower()).strip()
+
+
+# ---------------------------------------------------------------- refuges
+def _mn_refuge_dict(r, now=None):
+    now = now or datetime.utcnow()
+    due = r.last_checked_at + timedelta(days=r.check_every_days) if r.last_checked_at else None
+    overdue = due is None or due < now
+    usable = bool(r.active and r.last_ok and not overdue)
+    return {'id': r.id, 'name': r.name, 'area': r.area, 'capacity': r.capacity, 'air_hours': r.air_hours, 'check_every_days': r.check_every_days,
+            'last_checked_at': _in_iso(r.last_checked_at), 'last_ok': r.last_ok, 'issues': _tbt_json(r.last_issues, []), 'active': r.active,
+            'check_due': _in_iso(due), 'overdue': overdue, 'usable': usable}
+
+
+@app.route('/api/mining/refuges', methods=['GET', 'POST'])
+@app.route('/api/mining/refuges/<int:rid>', methods=['PUT'])
+@jwt_required
+def mn_refuges(rid=None):
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    if request.method == 'GET':
+        rows = MnRefuge.query.filter_by(company_id=user.company_id).order_by(MnRefuge.area, MnRefuge.name).all()
+        return jsonify({'success': True, 'data': [_mn_refuge_dict(r) for r in rows], 'items': [{'key': k, 'text': t} for k, t in MN_REFUGE_ITEMS],
+                        'can_manage': bool(_rc_staff(user))}), 200
+    if not _rc_staff(user):
+        return jsonify({'success': False, 'error': 'Only supervisors and admins can set up refuge chambers.'}), 403
+    data = _in_body()
+    r = MnRefuge(company_id=user.company_id) if rid is None else db.session.get(MnRefuge, rid)
+    if not r or r.company_id != user.company_id:
+        return jsonify({'success': False, 'error': 'Refuge not found.'}), 404
+    name, area = _rc_text(data.get('name', r.name), 120), _mn_area(data.get('area', r.area))
+    if len(name) < 2 or len(area) < 2:
+        return jsonify({'success': False, 'error': 'Give the refuge a name and the area or level it serves.'}), 400
+    try:
+        cap = int(data.get('capacity', r.capacity))
+        every = int(data.get('check_every_days', r.check_every_days))
+        air = data.get('air_hours', r.air_hours)
+        air = None if air in (None, '') else float(air)
+    except (TypeError, ValueError):
+        return jsonify({'success': False, 'error': 'Capacity, check interval and air hours must be numbers.'}), 400
+    if not (1 <= cap <= 500 and 1 <= every <= 365) or (air is not None and not (0 < air <= 500)):
+        return jsonify({'success': False, 'error': 'Capacity 1-500 people, check every 1-365 days.'}), 400
+    r.name, r.area, r.capacity, r.check_every_days, r.air_hours = name, area, cap, every, air
+    if 'active' in data:
+        r.active = bool(data['active'])
+    if rid is None:
+        db.session.add(r)
+    db.session.commit()
+    return jsonify({'success': True, 'data': _mn_refuge_dict(r)}), 201 if rid is None else 200
+
+
+@app.route('/api/mining/refuges/<int:rid>/checks', methods=['POST'])
+@jwt_required
+def mn_refuge_check(rid):
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    r = db.session.get(MnRefuge, rid)
+    if not r or r.company_id != user.company_id:
+        return jsonify({'success': False, 'error': 'Refuge not found.'}), 404
+    data = _in_body()
+    ans = data.get('answers') if isinstance(data.get('answers'), dict) else {}
+    missing = [t for k, t in MN_REFUGE_ITEMS if ans.get(k) not in ('ok', 'fail')]
+    if missing:
+        return jsonify({'success': False, 'error': f'Answer every item ({len(missing)} left: {missing[0]}).'}), 400
+    issues = [t for k, t in MN_REFUGE_ITEMS if ans[k] == 'fail']
+    c = MnRefugeCheck(company_id=r.company_id, refuge_id=r.id, answers=json.dumps({k: ans[k] for k, _ in MN_REFUGE_ITEMS}), ok=not issues,
+                      note=_rc_text(data.get('note'), 1000) or None, checked_by=user.id)
+    r.last_checked_at, r.last_ok, r.last_issues = c.checked_at or datetime.utcnow(), not issues, json.dumps(issues)
+    db.session.add(c)
+    db.session.commit()
+    if issues:
+        _in_notify([(u.id, getattr(u, 'email', None)) for u in _rc_staff_users(r.company_id, user.id)], f'Refuge chamber not ready: {r.name}'[:200],
+                   '; '.join(issues)[:900], '/hse-management/industry/mining?tab=tagboard', 'critical', email=True)
+    return jsonify({'success': True, 'data': _mn_refuge_dict(r)}), 201
+
+
+# ---------------------------------------------------------------- tag board
+def _mn_presence_dict(p, names, now=None):
+    now = now or datetime.utcnow()
+    return {'id': p.id, 'person': p.person, 'user_id': p.user_id, 'employer': p.employer, 'area': p.area, 'scsr_tag': p.scsr_tag, 'lamp_no': p.lamp_no,
+            'status': p.status, 'entered_at': _in_iso(p.entered_at), 'expected_out': _in_iso(p.expected_out), 'exited_at': _in_iso(p.exited_at),
+            'overdue': p.status == 'in' and p.expected_out < now, 'tagged_in_by': names.get(p.tagged_in_by), 'moves': _tbt_json(p.moves, [])}
+
+
+def _mn_active_emergency(cid):
+    return MnEmergency.query.filter_by(company_id=cid, status='active').order_by(MnEmergency.started_at.desc()).first()
+
+
+def _mn_board(cid, now=None):
+    now = now or datetime.utcnow()
+    inside = MnPresence.query.filter_by(company_id=cid, status='in').order_by(MnPresence.area, MnPresence.entered_at).all()
+    refuges = [_mn_refuge_dict(r, now) for r in MnRefuge.query.filter_by(company_id=cid, active=True).all()]
+    names = _in_names([p.tagged_in_by for p in inside])
+    areas = {}
+    for p in inside:
+        a = areas.setdefault(_mn_norm(p.area), {'area': p.area, 'people': [], 'refuges': []})
+        a['people'].append(_mn_presence_dict(p, names, now))
+    for rf in refuges:
+        k = _mn_norm(rf['area'])
+        if k in areas:
+            areas[k]['refuges'].append(rf)
+    out = []
+    for a in areas.values():
+        n = len(a['people'])
+        cap = sum(r['capacity'] for r in a['refuges'] if r['usable'])
+        warn = []
+        if not a['refuges']:
+            warn.append('No refuge chamber recorded for this area: check the escape route to the nearest one.')
+        elif cap < n:
+            warn.append(f'{n} people here but ready refuge space for only {cap}' + (' (a refuge is overdue for its check or not ready)' if any(not r['usable'] for r in a['refuges']) else '') + '.')
+        a.update({'count': n, 'refuge_capacity': cap, 'warnings': warn, 'overdue': sum(1 for p in a['people'] if p['overdue'])})
+        out.append(a)
+    out.sort(key=lambda a: (-len(a['warnings']), -a['count']))
+    return out, refuges
+
+
+@app.route('/api/mining/tagboard', methods=['GET', 'POST'])
+@jwt_required
+def mn_tagboard():
+    """GET: who is underground now by area, refuge capacity, active emergency. POST: tag in {person | user_id, area, scsr_tag, expected_out, lamp_no, employer}."""
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    now = datetime.utcnow()
+    if request.method == 'GET':
+        areas, refuges = _mn_board(user.company_id, now)
+        today = MnPresence.query.filter(MnPresence.company_id == user.company_id, MnPresence.status == 'out',
+                                        MnPresence.exited_at >= now - timedelta(hours=24)).order_by(MnPresence.exited_at.desc()).limit(200).all()
+        em = _mn_active_emergency(user.company_id)
+        return jsonify({'success': True, 'areas': areas, 'refuges': refuges, 'total': sum(a['count'] for a in areas),
+                        'overdue': sum(a['overdue'] for a in areas), 'recent_out': [_mn_presence_dict(p, {}, now) for p in today],
+                        'emergency': _mn_em_dict(em) if em else None, 'kinds': MN_EMERGENCY_KINDS, 'can_manage': bool(_rc_staff(user))}), 200
+    data = _in_body()
+    uid, person = None, _rc_text(data.get('person'), 120)
+    if data.get('user_id'):
+        u = db.session.get(User, int(data['user_id'])) if str(data['user_id']).isdigit() else None
+        if not u or u.company_id != user.company_id:
+            return jsonify({'success': False, 'error': 'Person not found in your company.'}), 400
+        uid, person = u.id, (_in_names([u.id]).get(u.id) or person)
+    if len(person or '') < 2:
+        return jsonify({'success': False, 'error': 'Who is going underground?'}), 400
+    area = _mn_area(data.get('area'))
+    if len(area) < 2:
+        return jsonify({'success': False, 'error': 'Give the area or level they are going to.'}), 400
+    scsr = _rc_text(data.get('scsr_tag'), 40)
+    if len(scsr) < 1:
+        return jsonify({'success': False, 'code': 'NO_SCSR', 'error': 'No self-rescuer, no entry: record the self-rescuer number carried.'}), 400
+    em = _mn_active_emergency(user.company_id)
+    if em:
+        return jsonify({'success': False, 'code': 'EMERGENCY', 'error': 'An emergency is active: no entry except the rescue team (record them in the emergency).'}), 409
+    q = MnPresence.query.filter(MnPresence.company_id == user.company_id, MnPresence.status == 'in')
+    dup = q.filter(MnPresence.user_id == uid).first() if uid else q.filter(func.lower(MnPresence.person) == person.lower()).first()
+    if dup:
+        return jsonify({'success': False, 'error': f'{person} is already tagged in at {dup.area}.'}), 409
+    warnings = []
+    eq = EquipmentItem.query.filter(EquipmentItem.company_id == user.company_id, func.lower(EquipmentItem.tag_no) == scsr.lower()).first()
+    if eq:
+        code, label, _ = _eq_state(eq)
+        if code != 'ok':
+            return jsonify({'success': False, 'code': 'SCSR_UNSAFE', 'error': f'Self-rescuer {eq.tag_no}: {label}. Take another one.'}), 409
+        other = MnPresence.query.filter(MnPresence.company_id == user.company_id, MnPresence.status == 'in', MnPresence.scsr_equipment_id == eq.id).first()
+        if other:
+            return jsonify({'success': False, 'error': f'Self-rescuer {eq.tag_no} is already carried by {other.person}.'}), 409
+    else:
+        warnings.append(f'Self-rescuer {scsr} is not in the equipment register, so its service date cannot be checked.')
+    try:
+        exp = _pt_parse_dt(data['expected_out']) if data.get('expected_out') else now + timedelta(hours=MN_SHIFT_HOURS)
+    except (TypeError, ValueError, KeyError):
+        return jsonify({'success': False, 'error': 'Expected time out is not a valid date and time.'}), 400
+    if exp <= now:
+        return jsonify({'success': False, 'error': 'Expected time out must be in the future.'}), 400
+    p = MnPresence(company_id=user.company_id, user_id=uid, person=person, employer=_rc_text(data.get('employer'), 120) or None, area=area,
+                   scsr_tag=eq.tag_no if eq else scsr, scsr_equipment_id=eq.id if eq else None, lamp_no=_rc_text(data.get('lamp_no'), 40) or None,
+                   expected_out=exp, tagged_in_by=user.id, moves='[]')
+    db.session.add(p)
+    db.session.commit()
+    return jsonify({'success': True, 'data': _mn_presence_dict(p, _in_names([user.id])), 'warnings': warnings}), 201
+
+
+@app.route('/api/mining/tagboard/<int:pid>', methods=['PUT'])
+@jwt_required
+def mn_tag_act(pid):
+    """action: out | move {area} ."""
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    p = db.session.get(MnPresence, pid)
+    if not p or p.company_id != user.company_id:
+        return jsonify({'success': False, 'error': 'Not found.'}), 404
+    if p.status != 'in':
+        return jsonify({'success': False, 'error': f'{p.person} is already out.'}), 409
+    data = _in_body()
+    now = datetime.utcnow()
+    if data.get('action') == 'out':
+        p.status, p.exited_at, p.tagged_out_by = 'out', now, user.id
+        em = _mn_active_emergency(p.company_id)
+        if em:
+            people = _tbt_json(em.people, [])
+            for x in people:
+                if x.get('presence_id') == p.id and x.get('status') == 'unknown':
+                    x.update({'status': 'safe', 'where': 'Surface (tagged out)', 'at': now.isoformat(), 'by': user.id})
+            em.people = json.dumps(people)
+    elif data.get('action') == 'move':
+        area = _mn_area(data.get('area'))
+        if len(area) < 2:
+            return jsonify({'success': False, 'error': 'Give the new area.'}), 400
+        moves = _tbt_json(p.moves, [])
+        moves.append({'from': p.area, 'to': area, 'at': now.isoformat()})
+        p.area, p.moves = area, json.dumps(moves[-50:])
+    else:
+        return jsonify({'success': False, 'error': 'Unknown action.'}), 400
+    db.session.commit()
+    return jsonify({'success': True, 'data': _mn_presence_dict(p, {})}), 200
+
+
+# ---------------------------------------------------------------- emergency roll call
+def _mn_em_dict(e):
+    people = _tbt_json(e.people, [])
+    refuges = [_mn_refuge_dict(r) for r in MnRefuge.query.filter_by(company_id=e.company_id, active=True).all()]
+    by_area = {}
+    for r in refuges:
+        by_area.setdefault(_mn_norm(r['area']), []).append(r)
+    for x in people:
+        rs = by_area.get(_mn_norm(x.get('area')), [])
+        x['refuges'] = [f'{r["name"]} ({r["capacity"]} places{"" if r["usable"] else ", NOT READY"})' for r in rs]
+    missing = [x for x in people if x.get('status') == 'unknown']
+    return {'id': e.id, 'kind': e.kind, 'kind_name': MN_EMERGENCY_KINDS.get(e.kind, e.kind), 'area': e.area, 'status': e.status,
+            'started_at': _in_iso(e.started_at), 'closed_at': _in_iso(e.closed_at), 'note': e.note, 'people': people,
+            'unaccounted': len(missing), 'accounted': len(people) - len(missing), 'total': len(people),
+            'minutes': int((((e.closed_at or datetime.utcnow()) - e.started_at).total_seconds()) // 60)}
+
+
+@app.route('/api/mining/emergencies', methods=['POST'])
+@jwt_required
+def mn_emergency_start():
+    """Anyone can start it: the board is frozen into a roll call of everyone underground."""
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    if _mn_active_emergency(user.company_id):
+        return jsonify({'success': False, 'error': 'An emergency is already active.'}), 409
+    data = _in_body()
+    kind = data.get('kind') if data.get('kind') in MN_EMERGENCY_KINDS else 'other'
+    inside = MnPresence.query.filter_by(company_id=user.company_id, status='in').all()
+    people = [{'presence_id': p.id, 'person': p.person, 'area': p.area, 'employer': p.employer, 'scsr_tag': p.scsr_tag, 'status': 'unknown'} for p in inside]
+    e = MnEmergency(company_id=user.company_id, kind=kind, area=_mn_area(data.get('area')) or None, people=json.dumps(people), started_by=user.id)
+    db.session.add(e)
+    db.session.commit()
+    _in_notify([(u.id, getattr(u, 'email', None)) for u in _rc_staff_users(user.company_id, user.id)],
+               f'MINE EMERGENCY: {MN_EMERGENCY_KINDS[kind]}{" at " + e.area if e.area else ""}'[:200],
+               f'{len(people)} people underground. Open the roll call.', '/hse-management/industry/mining?tab=tagboard', 'critical', email=True)
+    return jsonify({'success': True, 'data': _mn_em_dict(e)}), 201
+
+
+@app.route('/api/mining/emergencies/<int:eid>', methods=['PUT'])
+@jwt_required
+def mn_emergency_act(eid):
+    """action: account {presence_id, where} | missing {presence_id} | close {note} (supervisor)."""
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    e = db.session.get(MnEmergency, eid)
+    if not e or e.company_id != user.company_id:
+        return jsonify({'success': False, 'error': 'Emergency not found.'}), 404
+    if e.status != 'active':
+        return jsonify({'success': False, 'error': 'This emergency is closed.'}), 409
+    data = _in_body()
+    people = _tbt_json(e.people, [])
+    action = data.get('action')
+    if action in ('account', 'missing', 'reset'):
+        hit = [x for x in people if x.get('presence_id') == data.get('presence_id')]
+        if not hit:
+            return jsonify({'success': False, 'error': 'Person not on this roll call.'}), 404
+        if action == 'account':
+            where = _rc_text(data.get('where'), 120)
+            if len(where) < 2:
+                return jsonify({'success': False, 'error': 'Where is the person now (surface, refuge name, muster point)?'}), 400
+            hit[0].update({'status': 'safe', 'where': where})
+        elif action == 'missing':
+            hit[0].update({'status': 'missing', 'where': _rc_text(data.get('where'), 120) or 'Last seen at ' + (hit[0].get('area') or '?')})
+        else:
+            hit[0].update({'status': 'unknown', 'where': None})
+        hit[0].update({'at': datetime.utcnow().isoformat(), 'by': user.id})
+        e.people = json.dumps(people)
+    elif action == 'close':
+        if not _rc_staff(user):
+            return jsonify({'success': False, 'error': 'Only a supervisor can close the emergency.'}), 403
+        open_ = [x['person'] for x in people if x.get('status') != 'safe']
+        note = _rc_text(data.get('note'), 1000)
+        if open_ and len(note) < 10:
+            return jsonify({'success': False, 'code': 'NOT_ALL_SAFE', 'error': f'{len(open_)} not confirmed safe ({", ".join(open_[:5])}). Explain why you close (at least 10 characters).'}), 409
+        e.status, e.closed_by, e.closed_at, e.note = 'closed', user.id, datetime.utcnow(), note or None
+    else:
+        return jsonify({'success': False, 'error': 'Unknown action.'}), 400
+    db.session.commit()
+    return jsonify({'success': True, 'data': _mn_em_dict(e)}), 200
+
+
+# ---------------------------------------------------------------- dust & silica exposure
+def _mn_twa(conc, duration_min):
+    return conc * duration_min / 480.0
+
+
+def _mn_brief_scala(shift_h):
+    """Brief & Scala reduction factor for shifts longer than 8 h (used by several regulators for unusual shifts)."""
+    if shift_h <= 8:
+        return 1.0
+    return (8.0 / shift_h) * ((24.0 - shift_h) / 16.0)
+
+
+def _mn_seg_stats(values, oel):
+    """Lognormal statistics (AIHA approach): geometric mean, GSD, 95th percentile and exceedance fraction."""
+    import math
+    n = len(values)
+    out = {'n': n, 'max': max(values) if values else None}
+    if n < 2:
+        out['verdict'] = f'Only {n} sample: keep sampling (at least {MN_SEG_MIN_SAMPLES} for a decision).'
+        out['level'] = 'unknown'
+        return out
+    logs = [math.log(max(v, 1e-4)) for v in values]
+    mu = sum(logs) / n
+    sd = (sum((x - mu) ** 2 for x in logs) / (n - 1)) ** 0.5
+    p95 = math.exp(mu + 1.645 * sd)
+    ef = 0.0 if sd == 0 else (1 - 0.5 * (1 + math.erf(((math.log(oel) - mu) / sd) / math.sqrt(2)))) * 100
+    if sd == 0:
+        ef = 100.0 if math.exp(mu) > oel else 0.0
+    out.update({'gm': round(math.exp(mu), 4), 'gsd': round(math.exp(sd), 2), 'p95': round(p95, 4), 'exceedance_pct': round(ef, 1)})
+    if n < MN_SEG_MIN_SAMPLES:
+        out['verdict'] = f'{n} samples: too few for a firm decision (need {MN_SEG_MIN_SAMPLES}). Estimated 95th percentile {p95:.3g} mg/m3.'
+        out['level'] = 'amber' if p95 >= oel else 'unknown'
+    elif p95 < oel:
+        out['verdict'] = f'Acceptable: the 95th percentile ({p95:.3g}) is below the limit ({oel:g}).'
+        out['level'] = 'green'
+    else:
+        out['verdict'] = f'Not acceptable: about {ef:.0f}% of shifts are estimated above the limit. Improve the controls (water, ventilation, cab filtration), then resample.'
+        out['level'] = 'red'
+    return out
+
+
+def _mn_sample_dict(s, names):
+    a = MN_AGENTS.get(s.agent, (s.agent, None, None, ''))
+    return {'id': s.id, 'person': s.person, 'user_id': s.user_id, 'seg': s.seg, 'area': s.area, 'task': s.task, 'agent': s.agent, 'agent_name': a[0],
+            'sampled_on': s.sampled_on.isoformat(), 'duration_min': s.duration_min, 'shift_h': s.shift_h, 'conc': s.conc, 'twa8': round(s.twa8, 4),
+            'limit': s.limit_used, 'action_level': s.action_used, 'result': s.result, 'respirator': s.respirator, 'lab_ref': s.lab_ref, 'note': s.note,
+            'adjusted_limit': round(s.limit_used * _mn_brief_scala(s.shift_h), 4) if s.shift_h > 8 else None, 'by': names.get(s.created_by)}
+
+
+@app.route('/api/mining/exposure', methods=['GET', 'POST'])
+@jwt_required
+def mn_exposure():
+    """Supervisors see everyone; a worker sees only their own samples. POST (supervisor): one personal sample."""
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    staff = bool(_rc_staff(user))
+    if request.method == 'GET':
+        q = MnSample.query.filter(MnSample.company_id == user.company_id)
+        if not staff:
+            q = q.filter(MnSample.user_id == user.id)
+        rows = q.order_by(MnSample.sampled_on.desc(), MnSample.id.desc()).limit(3000).all()
+        names = _in_names([r.created_by for r in rows])
+        samples = [_mn_sample_dict(r, names) for r in rows]
+        groups = {}
+        for r in rows:
+            groups.setdefault((r.seg.strip().lower(), r.agent), []).append(r)
+        segs = []
+        for (seg, agent), rs in groups.items():
+            st = _mn_seg_stats([x.twa8 for x in rs], rs[0].limit_used)
+            segs.append({'seg': rs[0].seg, 'agent': agent, 'agent_name': MN_AGENTS.get(agent, (agent,))[0], 'limit': rs[0].limit_used, **st})
+        segs.sort(key=lambda s: ({'red': 0, 'amber': 1, 'unknown': 2, 'green': 3}[s['level']], s['seg']))
+        workers = _mn_workers(user.company_id, rows) if staff else []
+        return jsonify({'success': True, 'samples': samples, 'segs': segs, 'workers': workers, 'can_manage': staff,
+                        'agents': [{'id': k, 'name': v[0], 'limit': v[1], 'action_level': v[2], 'source': v[3]} for k, v in MN_AGENTS.items()],
+                        'health_every_years': MN_HEALTH_EVERY_YEARS}), 200
+    if not staff:
+        return jsonify({'success': False, 'error': 'Only supervisors and hygienists record exposure samples.'}), 403
+    data = _in_body()
+    agent = data.get('agent')
+    if agent not in MN_AGENTS:
+        return jsonify({'success': False, 'error': 'Choose what was sampled.'}), 400
+    uid, person = None, _rc_text(data.get('person'), 120)
+    if data.get('user_id'):
+        u = db.session.get(User, int(data['user_id'])) if str(data['user_id']).isdigit() else None
+        if not u or u.company_id != user.company_id:
+            return jsonify({'success': False, 'error': 'Worker not found in your company.'}), 400
+        uid, person = u.id, (_in_names([u.id]).get(u.id) or person)
+    seg = _rc_text(data.get('seg'), 120)
+    if len(person or '') < 2 or len(seg) < 2:
+        return jsonify({'success': False, 'error': 'Give the worker and their exposure group (for example "Jumbo operators").'}), 400
+    try:
+        conc, dur = float(data.get('conc')), float(data.get('duration_min'))
+        shift_h = float(data.get('shift_h') or 8)
+        sampled_on = _ct_date(data.get('sampled_on')) or datetime.utcnow().date()
+        limit = float(data['limit']) if data.get('limit') not in (None, '') else MN_AGENTS[agent][1]
+        action = float(data['action_level']) if data.get('action_level') not in (None, '') else (MN_AGENTS[agent][2] if data.get('limit') in (None, '') else None)
+    except (TypeError, ValueError, KeyError):
+        return jsonify({'success': False, 'error': 'Concentration, minutes sampled and shift length must be numbers.'}), 400
+    if not (0 <= conc <= 1000 and 1 <= dur <= 1440 and 1 <= shift_h <= 24 and 0 < limit <= 1000) or (action is not None and not (0 < action < limit)):
+        return jsonify({'success': False, 'error': 'A value is out of range (minutes 1-1440, shift 1-24 h, action level below the limit).'}), 400
+    if sampled_on > datetime.utcnow().date():
+        return jsonify({'success': False, 'error': 'The sample date cannot be in the future.'}), 400
+    twa = _mn_twa(conc, dur)
+    result = 'over' if twa > limit else 'action' if action is not None and twa >= action else 'below'
+    s = MnSample(company_id=user.company_id, user_id=uid, person=person, seg=seg, area=_mn_area(data.get('area')) or None, task=_rc_text(data.get('task'), 200) or None,
+                 agent=agent, sampled_on=sampled_on, duration_min=dur, shift_h=shift_h, conc=conc, twa8=twa, limit_used=limit, action_used=action, result=result,
+                 respirator=_rc_text(data.get('respirator'), 60) or None, lab_ref=_rc_text(data.get('lab_ref'), 80) or None, note=_rc_text(data.get('note'), 500) or None,
+                 created_by=user.id)
+    db.session.add(s)
+    db.session.commit()
+    warnings = []
+    if dur < shift_h * 60 * 0.7:
+        warnings.append(f'The sample covered {dur:g} of {shift_h * 60:g} minutes; the unsampled time is counted as no exposure. Sample the full shift where you can.')
+    if shift_h > 8 and twa > limit * _mn_brief_scala(shift_h) and result != 'over':
+        warnings.append(f'Below the 8-hour limit, but above the limit adjusted for a {shift_h:g} h shift ({limit * _mn_brief_scala(shift_h):.3g} mg/m3, Brief & Scala).')
+    if result == 'over':
+        _in_notify([(u.id, getattr(u, 'email', None)) for u in _rc_staff_users(user.company_id, user.id)],
+                   f'Exposure over the limit: {MN_AGENTS[agent][0]}'[:200], f'{s.seg}: {twa:.3g} mg/m3 against {limit:g}. Check the controls and respirators.',
+                   '/hse-management/industry/mining?tab=exposure', 'high')
+    return jsonify({'success': True, 'data': _mn_sample_dict(s, _in_names([user.id])), 'warnings': warnings}), 201
+
+
+def _mn_workers(cid, samples):
+    """Workers with a result at or above the action level (or the limit) in the last 12 months, and their health check status."""
+    today = datetime.utcnow().date()
+    since = today - timedelta(days=365)
+    people = {}
+    for s in samples:
+        if s.sampled_on < since:
+            continue
+        k = ('u', s.user_id) if s.user_id else ('n', s.person.strip().lower())
+        w = people.setdefault(k, {'person': s.person, 'user_id': s.user_id, 'max_ratio': 0, 'worst': None, 'samples': 0, 'flag': False})
+        w['samples'] += 1
+        ratio = s.twa8 / s.limit_used
+        if ratio > w['max_ratio']:
+            w['max_ratio'], w['worst'] = ratio, {'agent': MN_AGENTS.get(s.agent, (s.agent,))[0], 'twa8': round(s.twa8, 4), 'limit': s.limit_used, 'on': s.sampled_on.isoformat()}
+        if s.result in ('action', 'over'):
+            w['flag'] = True
+    checks = MnHealthCheck.query.filter_by(company_id=cid).order_by(MnHealthCheck.done_on.desc()).all()
+    last = {}
+    for c in checks:
+        k = ('u', c.user_id) if c.user_id else ('n', c.person.strip().lower())
+        last.setdefault(k, c)
+    out = []
+    for k, w in people.items():
+        c = last.get(k)
+        w['max_ratio'] = round(w['max_ratio'] * 100)
+        w['last_check'] = {'on': c.done_on.isoformat(), 'outcome': c.outcome, 'next_due': c.next_due.isoformat()} if c else None
+        w['needs_check'] = bool(w['flag'] and (not c or c.next_due < today))
+        w['restricted'] = bool(c and c.outcome in ('restricted', 'refer'))
+        if w['flag'] or c:
+            out.append(w)
+    out.sort(key=lambda w: (not w['needs_check'], -w['max_ratio']))
+    return out
+
+
+@app.route('/api/mining/health-checks', methods=['POST'])
+@jwt_required
+def mn_health_check():
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    if not _rc_staff(user):
+        return jsonify({'success': False, 'error': 'Only supervisors record health checks.'}), 403
+    data = _in_body()
+    uid, person = None, _rc_text(data.get('person'), 120)
+    if data.get('user_id'):
+        u = db.session.get(User, int(data['user_id'])) if str(data['user_id']).isdigit() else None
+        if not u or u.company_id != user.company_id:
+            return jsonify({'success': False, 'error': 'Worker not found in your company.'}), 400
+        uid, person = u.id, (_in_names([u.id]).get(u.id) or person)
+    if len(person or '') < 2:
+        return jsonify({'success': False, 'error': 'Which worker?'}), 400
+    if data.get('outcome') not in ('fit', 'restricted', 'refer'):
+        return jsonify({'success': False, 'error': 'Outcome must be fit, restricted or referred.'}), 400
+    done = _ct_date(data.get('done_on')) or datetime.utcnow().date()
+    if done > datetime.utcnow().date():
+        return jsonify({'success': False, 'error': 'The check date cannot be in the future.'}), 400
+    nxt = _ct_date(data.get('next_due')) or done.replace(year=done.year + MN_HEALTH_EVERY_YEARS, day=min(done.day, 28))
+    c = MnHealthCheck(company_id=user.company_id, user_id=uid, person=person, done_on=done, outcome=data['outcome'], next_due=nxt,
+                      note=_rc_text(data.get('note'), 500) or None, created_by=user.id)
+    db.session.add(c)
+    db.session.commit()
+    return jsonify({'success': True, 'data': {'id': c.id, 'person': c.person, 'next_due': c.next_due.isoformat()}}), 201
+
+
+# ---------------------------------------------------------------- fleet pre-start board
+@app.route('/api/mining/fleet', methods=['GET'])
+@jwt_required
+def mn_fleet():
+    """Mobile plant from the equipment register: pre-started this shift or not, out of service, repeat critical defects."""
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    now = datetime.utcnow()
+    rows = EquipmentItem.query.filter(EquipmentItem.company_id == user.company_id, EquipmentItem.category.in_(MN_FLEET_CATS),
+                                      EquipmentItem.status != 'retired').order_by(EquipmentItem.tag_no).all()
+    since = now - timedelta(days=30)
+    logs = {}
+    for l in EquipmentLog.query.filter(EquipmentLog.company_id == user.company_id, EquipmentLog.kind == 'status', EquipmentLog.created_at >= since,
+                                       EquipmentLog.text.like('Taken out of service automatically%')).all():
+        logs[l.equipment_id] = logs.get(l.equipment_id, 0) + 1
+    out = []
+    for e in rows:
+        code, label, level = _eq_state(e)
+        checked = bool(e.last_inspected_at and (now - e.last_inspected_at).total_seconds() < MN_SHIFT_HOURS * 3600)
+        if e.status == 'out_of_service':
+            board, text = 'down', e.status_reason or 'Out of service'
+        elif not checked:
+            board, text = 'not_checked', 'No pre-start this shift'
+        elif e.last_result in ('fail',):
+            board, text = 'defect', 'Pre-start found defects (not critical): book the repair'
+        else:
+            board, text = 'ready', 'Pre-start done'
+        out.append({'id': e.id, 'tag_no': e.tag_no, 'name': e.name, 'category': e.category, 'location': e.location, 'board': board, 'text': text,
+                    'state': code, 'state_label': label, 'last_prestart': _in_iso(e.last_inspected_at), 'last_result': e.last_result,
+                    'repeat_defects_30d': logs.get(e.id, 0), 'checklist_ref': e.checklist_ref or 'lib:mobile_plant'})
+    order = {'down': 0, 'not_checked': 1, 'defect': 2, 'ready': 3}
+    out.sort(key=lambda x: (order[x['board']], x['tag_no']))
+    counts = {k: sum(1 for x in out if x['board'] == k) for k in order}
+    return jsonify({'success': True, 'data': out, 'counts': counts, 'shift_hours': MN_SHIFT_HOURS,
+                    'repeat': [x for x in out if x['repeat_defects_30d'] >= 2]}), 200
+
+
+# ---------------------------------------------------------------- slope / tailings monitoring
+def _mn_analyse(point, readings):
+    """readings sorted by time. Movement: velocity per day between readings, acceleration, inverse-velocity time to failure.
+    Piezometer: latest level against the trigger levels and the rate of rise."""
+    out = {'velocity': None, 'velocities': [], 'accelerating': False, 'predicted_failure': None, 'level': 'green', 'reasons': []}
+    if not readings:
+        out['reasons'].append('No readings yet.')
+        return out
+    vel = []
+    for a, b in zip(readings, readings[1:]):
+        days = (b.at - a.at).total_seconds() / 86400
+        if days <= 0:
+            continue
+        vel.append((b.at, (b.value - a.value) / days))
+    out['velocities'] = [{'at': _in_iso(t), 'v': round(v, 3)} for t, v in vel[-30:]]
+    kind = MN_MONITOR_KINDS.get(point.kind, ('', 'move'))[1]
+    lvl = 'green'
+    if kind == 'level':
+        cur = readings[-1].value
+        if point.red_level is not None and cur >= point.red_level:
+            lvl = 'red'
+            out['reasons'].append(f'Level {cur:g} {point.unit} at or above the red trigger {point.red_level:g}.')
+        elif point.amber_level is not None and cur >= point.amber_level:
+            lvl = 'amber'
+            out['reasons'].append(f'Level {cur:g} {point.unit} at or above the amber trigger {point.amber_level:g}.')
+        if vel:
+            out['velocity'] = round(vel[-1][1], 3)
+            if vel[-1][1] > 0 and len(vel) >= 3 and vel[-1][1] > vel[-2][1] > vel[-3][1]:
+                out['accelerating'] = True
+                out['reasons'].append('The level is rising faster with each reading.')
+                lvl = 'amber' if lvl == 'green' else lvl
+    else:
+        if vel:
+            v = abs(vel[-1][1])
+            out['velocity'] = round(vel[-1][1], 3)
+            if point.red_rate is not None and v >= point.red_rate:
+                lvl = 'red'
+                out['reasons'].append(f'Moving {v:.2f} {point.unit}/day, at or above the red trigger {point.red_rate:g}.')
+            elif point.amber_rate is not None and v >= point.amber_rate:
+                lvl = 'amber'
+                out['reasons'].append(f'Moving {v:.2f} {point.unit}/day, at or above the amber trigger {point.amber_rate:g}.')
+        recent = [(t, abs(v)) for t, v in vel[-6:]]
+        if len(recent) >= 4 and all(b[1] > a[1] > 0 for a, b in zip(recent[-4:], recent[-3:])):
+            out['accelerating'] = True
+            xs = [(t - recent[0][0]).total_seconds() / 86400 for t, _ in recent]
+            ys = [1.0 / v for _, v in recent]
+            n = len(xs)
+            mx, my = sum(xs) / n, sum(ys) / n
+            sxx = sum((x - mx) ** 2 for x in xs)
+            slope = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / sxx if sxx else 0
+            if slope < 0:
+                t0 = mx - my / slope
+                pred = recent[0][0] + timedelta(days=t0)
+                if pred > recent[-1][0]:
+                    out['predicted_failure'] = _in_iso(pred)
+                    out['reasons'].append('Movement is accelerating. The inverse-velocity trend reaches zero around '
+                                          f'{pred.strftime("%d %b %H:%M")} UTC (Fukuzono method: an estimate for the geotechnical engineer, not a forecast).')
+            if lvl == 'green':
+                lvl = 'amber'
+            if not out['predicted_failure']:
+                out['reasons'].append('Movement is accelerating.')
+    out['level'] = lvl
+    return out
+
+
+def _mn_point_dict(p, readings=None):
+    readings = readings if readings is not None else MnMonitorReading.query.filter_by(point_id=p.id).order_by(MnMonitorReading.at).all()
+    a = _mn_analyse(p, readings)
+    return {'id': p.id, 'name': p.name, 'kind': p.kind, 'kind_name': MN_MONITOR_KINDS.get(p.kind, (p.kind,))[0], 'structure': p.structure, 'unit': p.unit,
+            'amber_rate': p.amber_rate, 'red_rate': p.red_rate, 'amber_level': p.amber_level, 'red_level': p.red_level, 'active': p.active,
+            'level': p.level, 'analysis': a, 'last': ({'at': _in_iso(readings[-1].at), 'value': readings[-1].value} if readings else None),
+            'series': [{'at': _in_iso(r.at), 'value': r.value} for r in readings[-60:]]}
+
+
+@app.route('/api/mining/monitoring', methods=['GET', 'POST'])
+@app.route('/api/mining/monitoring/<int:pid>', methods=['PUT'])
+@jwt_required
+def mn_monitoring(pid=None):
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    if request.method == 'GET':
+        rows = MnMonitorPoint.query.filter_by(company_id=user.company_id, active=True).order_by(MnMonitorPoint.structure, MnMonitorPoint.name).all()
+        data = [_mn_point_dict(p) for p in rows]
+        data.sort(key=lambda d: ({'red': 0, 'amber': 1, 'green': 2}[d['analysis']['level']], d['structure'], d['name']))
+        return jsonify({'success': True, 'data': data, 'kinds': [{'id': k, 'name': v[0], 'measure': v[1]} for k, v in MN_MONITOR_KINDS.items()],
+                        'can_manage': bool(_rc_staff(user))}), 200
+    if not _rc_staff(user):
+        return jsonify({'success': False, 'error': 'Only supervisors and engineers set up monitoring points.'}), 403
+    data = _in_body()
+    p = MnMonitorPoint(company_id=user.company_id, created_by=user.id) if pid is None else db.session.get(MnMonitorPoint, pid)
+    if not p or p.company_id != user.company_id:
+        return jsonify({'success': False, 'error': 'Point not found.'}), 404
+    kind = data.get('kind', p.kind)
+    if kind not in MN_MONITOR_KINDS:
+        return jsonify({'success': False, 'error': 'Choose the instrument type.'}), 400
+    name, structure, unit = _rc_text(data.get('name', p.name), 120), _rc_text(data.get('structure', p.structure), 160), _rc_text(data.get('unit', p.unit) or 'mm', 10)
+    if len(name) < 1 or len(structure) < 2:
+        return jsonify({'success': False, 'error': 'Give the point name and the wall, slope or dam it is on.'}), 400
+    vals = {}
+    for k in ('amber_rate', 'red_rate', 'amber_level', 'red_level'):
+        v = data.get(k, getattr(p, k))
+        try:
+            vals[k] = None if v in (None, '') else float(v)
+        except (TypeError, ValueError):
+            return jsonify({'success': False, 'error': 'Trigger levels must be numbers.'}), 400
+    if MN_MONITOR_KINDS[kind][1] == 'move':
+        if vals['amber_rate'] is None or vals['red_rate'] is None or not (0 < vals['amber_rate'] < vals['red_rate']):
+            return jsonify({'success': False, 'error': 'Give the amber and red movement rates per day from your ground control plan (amber below red).'}), 400
+    else:
+        if vals['amber_level'] is None or vals['red_level'] is None or not (vals['amber_level'] < vals['red_level']):
+            return jsonify({'success': False, 'error': 'Give the amber and red trigger levels from the dam design (amber below red).'}), 400
+    p.kind, p.name, p.structure, p.unit = kind, name, structure, unit
+    for k, v in vals.items():
+        setattr(p, k, v)
+    if 'active' in data:
+        p.active = bool(data['active'])
+    if pid is None:
+        db.session.add(p)
+    db.session.commit()
+    return jsonify({'success': True, 'data': _mn_point_dict(p)}), 201 if pid is None else 200
+
+
+@app.route('/api/mining/monitoring/<int:pid>/readings', methods=['POST'])
+@jwt_required
+def mn_monitor_reading(pid):
+    """{value, at} or {rows: "time,value" lines pasted from the survey / radar export}."""
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    p = db.session.get(MnMonitorPoint, pid)
+    if not p or p.company_id != user.company_id or not p.active:
+        return jsonify({'success': False, 'error': 'Point not found.'}), 404
+    data = _in_body()
+    now = datetime.utcnow()
+    pairs = []
+    if isinstance(data.get('rows'), str) and data['rows'].strip():
+        for n, line in enumerate(data['rows'].strip().splitlines()[:2000], 1):
+            parts = [x.strip() for x in re.split(r'[,;\t]', line) if x.strip()]
+            if not parts or (n == 1 and not re.search(r'\d', parts[-1])):
+                continue
+            try:
+                pairs.append((_pt_parse_dt(parts[0]), float(parts[1])))
+            except (TypeError, ValueError, IndexError):
+                return jsonify({'success': False, 'error': f'Line {n}: expected "date time, value".'}), 400
+    else:
+        try:
+            pairs.append((_pt_parse_dt(data['at']) if data.get('at') else now, float(data.get('value'))))
+        except (TypeError, ValueError):
+            return jsonify({'success': False, 'error': 'The reading must be a number.'}), 400
+    if not pairs:
+        return jsonify({'success': False, 'error': 'No readings found.'}), 400
+    if any(t > now + timedelta(minutes=10) for t, _ in pairs):
+        return jsonify({'success': False, 'error': 'A reading time is in the future.'}), 400
+    note = _rc_text(data.get('note'), 300) or None
+    for t, v in pairs:
+        db.session.add(MnMonitorReading(company_id=p.company_id, point_id=p.id, at=t, value=v, note=note, recorded_by=user.id))
+    db.session.flush()
+    readings = MnMonitorReading.query.filter_by(point_id=p.id).order_by(MnMonitorReading.at).all()
+    a = _mn_analyse(p, readings)
+    prev, p.level = p.level, a['level']
+    db.session.commit()
+    if a['level'] != 'green' and (a['level'] != prev or a['level'] == 'red'):
+        _in_notify([(u.id, getattr(u, 'email', None)) for u in _rc_staff_users(p.company_id, user.id)],
+                   f'Ground movement {a["level"].upper()}: {p.structure} {p.name}'[:200], ' '.join(a['reasons'])[:900],
+                   '/hse-management/industry/mining?tab=monitoring', 'critical' if a['level'] == 'red' else 'high', email=a['level'] == 'red')
+    return jsonify({'success': True, 'added': len(pairs), 'data': _mn_point_dict(p, readings)}), 201
+
+
+IN_LIBRARY.update({
+    'mobile_plant': _in_lib('Mobile plant pre-start (mining)', 'Mining', 'Haul trucks, loaders, dozers and light vehicles, before each shift.', [
+        ('Walk-around', [('Tyres and wheel nuts: no cuts, bulges or missing / loose nuts', 'c'), 'No oil, fuel, hydraulic or coolant leaks',
+                         'Lights, beacon and reflectors work and are clean', 'Mirrors and windows are clean and not cracked',
+                         ('ROPS / FOPS and steps / handrails are not damaged', 'c')]),
+        ('In the cab', [('Service brakes and park brake hold', 'c'), ('Steering works with no excess play', 'c'), ('Seat belt works', 'c'),
+                        ('Horn and reversing alarm work', 'c'), ('Collision avoidance / proximity detection tested and working', 'c'),
+                        'Two-way radio works on the mine channel', 'Wipers and demister work', 'Gauges and warning lights normal after start-up']),
+        ('Fire', [('Fire suppression system is charged and in date', 'c'), 'Fire extinguisher on board and in date']),
+        ('Readings', [('Hour meter', 'n:0::h'), ('Defects found', 't')]),
+    ]),
+})
+
+
 # =====================================================================================================
 # AUTO MIGRATIONS (2026-11-23)
 # Railway's Data tab appends LIMIT to every query, so CREATE/ALTER statements fail there. Instead the
@@ -177372,7 +178271,7 @@ if os.environ.get('READY_CHECK_WATCHER', '1') == '1':
 #   - a failing statement is logged and the file is retried on the next start
 # Set AUTO_MIGRATE=0 on Railway to switch this off.
 # =====================================================================================================
-AUTO_MIGRATIONS = ('DEPLOY_2026-11-23_FULL.sql', '2026-11-24_company_quotes.sql', '2026-11-25_ready_checks.sql', '2026-11-26_muster_contractors.sql', '2026-11-27_document_control_plus.sql', '2026-11-27_inspections.sql', '2026-11-27_chemical_safety.sql', '2026-11-27_chemical_waste.sql', '2026-11-27_equipment.sql', '2026-11-27_incident_outcomes.sql', '2026-11-27_oil_gas.sql', '2026-11-27_vision_reports.sql', '2026-11-27_mining.sql', '2026-11-27_mfg_wh.sql', '2026-11-27_og_part2.sql')
+AUTO_MIGRATIONS = ('DEPLOY_2026-11-23_FULL.sql', '2026-11-24_company_quotes.sql', '2026-11-25_ready_checks.sql', '2026-11-26_muster_contractors.sql', '2026-11-27_document_control_plus.sql', '2026-11-27_inspections.sql', '2026-11-27_chemical_safety.sql', '2026-11-27_chemical_waste.sql', '2026-11-27_equipment.sql', '2026-11-27_incident_outcomes.sql', '2026-11-27_oil_gas.sql', '2026-11-27_vision_reports.sql', '2026-11-27_mining.sql', '2026-11-27_mfg_wh.sql', '2026-11-27_og_part2.sql', '2026-11-27_mining_part2.sql')
 _MIGRATION_LOCK_KEY = 74230115
 
 
