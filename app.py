@@ -175476,6 +175476,586 @@ def vi_model_info():
                     'site_types': {k: [VI_PPE[x][2] for x in v] for k, v in VI_SITE_PPE.items()}}}), 200
 
 
+# ============================================================================
+# MINING: CRITICAL CONTROLS, FIT FOR SHIFT, GROUND TARP, BLAST CLEARANCE (2026-11-27)
+# ============================================================================
+# Built to act, not to file: a failed critical control stays open until fixed and shows the area at risk; areas nobody
+# verified are shown as blind spots; a fatigue check says fit / at risk / not fit before safety-critical work (prior
+# sleep-wake rule, Dawson & McCulloch 2005, plus roster rules); ground readings trigger the TARP level and its actions;
+# a blast cannot be fired until every guard post has confirmed its area clear, and re-entry waits for the set time.
+# DB: mn_risks, mn_verifications, mn_fatigue, mn_tarps, mn_tarp_readings, mn_blasts -> sql/2026-11-27_mining.sql
+
+
+class MnRisk(db.Model):
+    __tablename__ = 'mn_risks'
+    __table_args__ = {'extend_existing': True}
+    id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id', ondelete='CASCADE'), nullable=False, index=True)
+    name = db.Column(db.String(160), nullable=False)
+    description = db.Column(db.String(1000))
+    controls = db.Column(db.Text, nullable=False)                            # JSON [{id, text, check}]
+    active = db.Column(db.Boolean, nullable=False, default=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+
+class MnVerification(db.Model):
+    __tablename__ = 'mn_verifications'
+    __table_args__ = {'extend_existing': True}
+    id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id', ondelete='CASCADE'), nullable=False, index=True)
+    risk_id = db.Column(db.Integer, db.ForeignKey('mn_risks.id', ondelete='CASCADE'), nullable=False, index=True)
+    area = db.Column(db.String(160), nullable=False)
+    answers = db.Column(db.Text, nullable=False)                             # JSON {control_id: {value: yes|no|na, note}}
+    failed = db.Column(db.Integer, nullable=False, default=0)
+    result = db.Column(db.String(10), nullable=False)                        # effective | failed
+    immediate_action = db.Column(db.String(1000))
+    action_status = db.Column(db.String(8))                                  # open | closed (failed only)
+    closed_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    closed_at = db.Column(db.DateTime)
+    closed_note = db.Column(db.String(1000))
+    verified_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+
+class MnFatigue(db.Model):
+    __tablename__ = 'mn_fatigue'
+    __table_args__ = {'extend_existing': True}
+    id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id', ondelete='CASCADE'), nullable=False, index=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True, index=True)
+    shift_start = db.Column(db.DateTime, nullable=False)
+    shift_end = db.Column(db.DateTime, nullable=False)
+    sleep_24 = db.Column(db.Float, nullable=False)
+    sleep_48 = db.Column(db.Float, nullable=False)
+    woke_at = db.Column(db.DateTime, nullable=False)
+    safety_critical = db.Column(db.Boolean, nullable=False, default=True)
+    result = db.Column(db.String(8), nullable=False)                         # fit | at_risk | not_fit
+    reasons = db.Column(db.Text)
+    controls = db.Column(db.Text)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+
+class MnTarp(db.Model):
+    __tablename__ = 'mn_tarps'
+    __table_args__ = {'extend_existing': True}
+    id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id', ondelete='CASCADE'), nullable=False, index=True)
+    name = db.Column(db.String(160), nullable=False)
+    location = db.Column(db.String(160))
+    parameter = db.Column(db.String(120), nullable=False)
+    unit = db.Column(db.String(20))
+    amber_at = db.Column(db.Float, nullable=False)
+    red_at = db.Column(db.Float, nullable=False)
+    green_actions = db.Column(db.Text)
+    amber_actions = db.Column(db.Text)
+    red_actions = db.Column(db.Text)
+    level = db.Column(db.String(6), nullable=False, default='green')
+    active = db.Column(db.Boolean, nullable=False, default=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+
+class MnTarpReading(db.Model):
+    __tablename__ = 'mn_tarp_readings'
+    __table_args__ = {'extend_existing': True}
+    id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id', ondelete='CASCADE'), nullable=False, index=True)
+    tarp_id = db.Column(db.Integer, db.ForeignKey('mn_tarps.id', ondelete='CASCADE'), nullable=False, index=True)
+    value = db.Column(db.Float)
+    signs = db.Column(db.Text)                                               # JSON list of visual signs ticked
+    level = db.Column(db.String(6), nullable=False)
+    note = db.Column(db.String(1000))
+    recorded_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+
+class MnBlast(db.Model):
+    __tablename__ = 'mn_blasts'
+    __table_args__ = {'extend_existing': True}
+    id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id', ondelete='CASCADE'), nullable=False, index=True)
+    ref = db.Column(db.String(40), nullable=False)
+    location = db.Column(db.String(160), nullable=False)
+    planned_at = db.Column(db.DateTime, nullable=False)
+    exclusion_m = db.Column(db.Integer, nullable=False)
+    reentry_min = db.Column(db.Integer, nullable=False, default=30)
+    posts = db.Column(db.Text, nullable=False)                               # JSON [{name, guard, cleared_by, cleared_at}]
+    shotfirer = db.Column(db.String(120))
+    status = db.Column(db.String(12), nullable=False, default='planned')     # planned | fired | reentry | cancelled
+    fired_at = db.Column(db.DateTime)
+    fired_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    misfire = db.Column(db.Boolean, nullable=False, default=False)
+    reentry_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    reentry_at = db.Column(db.DateTime)
+    note = db.Column(db.String(1000))
+    created_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+
+# Starter fatal risks and their critical controls (common practice in mining; companies edit them for their mine).
+MN_LIBRARY = [
+    ('Fall of ground', 'Rock falling from the roof or walls of underground workings or highwalls.', [
+        ('Ground support is installed to the design before people work under it', 'Is the support pattern complete to the face as designed?'),
+        ('The workplace is examined and barred down (scaled) at the start of each shift', 'Was the examination done and recorded this shift?'),
+        ('Nobody goes under unsupported ground', 'Is the unsupported area barricaded and signed?'),
+        ('Changes in ground conditions are reported and the TARP followed', 'Are TARP readings current and the level acted on?')]),
+    ('Vehicle and mobile equipment interaction', 'Collisions between heavy equipment, light vehicles and people.', [
+        ('Light vehicles and people are kept apart from heavy equipment (separate roads or positive communication)', 'Did vehicles make positive contact before entering heavy equipment areas?'),
+        ('Collision avoidance / proximity detection works on every machine', 'Was the system tested at pre-start and working?'),
+        ('Pre-start checks are done before each shift', 'Are pre-start checks complete for every machine in the area?'),
+        ('Berms (windrows) are at least mid-axle height of the largest vehicle on the road', 'Are berms intact and high enough (MSHA 30 CFR 56.9300)?')]),
+    ('Fall from height', 'Falls from edges, platforms, equipment and into openings.', [
+        ('Edge protection or barriers at every open edge and opening', 'Are all edges and openings protected?'),
+        ('Fall arrest worn and anchored where edge protection is not possible', 'Is everyone at height clipped to a rated anchor?'),
+        ('Safe access to equipment (ladders, steps, platforms)', 'Is access in good condition?')]),
+    ('Hazardous energy (isolation)', 'Unexpected start-up or release of energy during maintenance.', [
+        ('Every person working places a personal lock on each isolation point', 'Does every worker have a lock on each point?'),
+        ('Zero energy is proved (test / try-out) before work starts', 'Was zero energy proved and recorded?'),
+        ('Stored energy (hydraulic, pressure, gravity) is released or blocked', 'Is stored energy released or blocked?')]),
+    ('Explosives and blasting', 'Unplanned initiation, fly rock, misfires and blast fumes.', [
+        ('The blast exclusion zone is cleared and guarded before firing', 'Did every guard confirm the area clear?'),
+        ('Only licensed shotfirers handle and fire explosives', 'Is the shotfirer licensed and named?'),
+        ('Misfire procedure is followed and re-entry waits for the set time and fume check', 'Was re-entry controlled?')]),
+    ('Underground fire', 'Fire on mobile equipment or in workings, with smoke spreading.', [
+        ('Fire suppression on mobile equipment is serviced and charged', 'Are suppression systems in date?'),
+        ('Every person carries a self-rescuer and knows the escape route', 'Did everyone have a self-rescuer?'),
+        ('Refuge chambers are accessible, stocked and tested', 'Was the nearest refuge chamber checked?')]),
+]
+
+
+def _mn_seed(cid):
+    if MnRisk.query.filter_by(company_id=cid).first():
+        return
+    for name, desc, ctrls in MN_LIBRARY:
+        db.session.add(MnRisk(company_id=cid, name=name, description=desc,
+                              controls=json.dumps([{'id': f'c{i + 1}', 'text': t, 'check': q} for i, (t, q) in enumerate(ctrls)])))
+    db.session.commit()
+
+
+def _mn_area(s):
+    return re.sub(r'\s+', ' ', (s or '').strip())[:160]
+
+
+@app.route('/api/mining/risks', methods=['GET', 'POST'])
+@app.route('/api/mining/risks/<int:rid>', methods=['PUT'])
+@jwt_required
+def mn_risks(rid=None):
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    cid = user.company_id
+    if request.method == 'GET':
+        _mn_seed(cid)
+        days = 30
+        since = datetime.utcnow() - timedelta(days=days)
+        risks = MnRisk.query.filter(MnRisk.company_id == cid).order_by(MnRisk.id).all()
+        vs = MnVerification.query.filter(MnVerification.company_id == cid, MnVerification.created_at >= since - timedelta(days=60)).all()
+        out = []
+        for r in risks:
+            mine = [v for v in vs if v.risk_id == r.id]
+            recent = [v for v in mine if v.created_at >= since]
+            last_by_area = {}
+            for v in sorted(mine, key=lambda x: x.created_at):
+                last_by_area[v.area.lower()] = v
+            open_fail = [v for v in mine if v.result == 'failed' and v.action_status == 'open']
+            stale = [{'area': v.area, 'last': _in_iso(v.created_at)} for v in last_by_area.values() if v.created_at < datetime.utcnow() - timedelta(days=7)]
+            ctrl_fail = {}
+            for v in recent:
+                for k, a in _tbt_json(v.answers, {}).items():
+                    if a.get('value') == 'no':
+                        ctrl_fail[k] = ctrl_fail.get(k, 0) + 1
+            status = 'failed' if open_fail else 'unverified' if not recent else 'effective'
+            out.append({'id': r.id, 'name': r.name, 'description': r.description, 'controls': _tbt_json(r.controls, []), 'active': r.active,
+                        'status': status, 'verifications_30d': len(recent),
+                        'effective_pct': round(100 * sum(1 for v in recent if v.result == 'effective') / len(recent), 1) if recent else None,
+                        'open_failures': [{'id': v.id, 'area': v.area, 'at': _in_iso(v.created_at), 'action': v.immediate_action,
+                                           'failed_controls': [k for k, a in _tbt_json(v.answers, {}).items() if a.get('value') == 'no']} for v in open_fail],
+                        'weakest_controls': sorted(ctrl_fail.items(), key=lambda kv: -kv[1])[:3],
+                        'areas': sorted(last_by_area.keys()), 'stale_areas': stale})
+        return jsonify({'success': True, 'data': out, 'can_manage': bool(_rc_staff(user))}), 200
+    if not _rc_staff(user):
+        return jsonify({'success': False, 'error': 'Only supervisors and admins can change critical controls.'}), 403
+    data = _in_body()
+    r = db.session.get(MnRisk, rid) if rid else MnRisk(company_id=cid)
+    if rid and (not r or r.company_id != cid):
+        return jsonify({'success': False, 'error': 'Risk not found.'}), 404
+    if 'name' in data or not rid:
+        name = _rc_text(data.get('name'), 160)
+        if len(name) < 3:
+            return jsonify({'success': False, 'error': 'Name the risk.'}), 400
+        r.name = name
+    if 'description' in data:
+        r.description = _rc_text(data.get('description'), 1000) or None
+    if 'controls' in data or not rid:
+        ctrls = [{'id': f'c{i + 1}', 'text': _rc_text(c.get('text'), 300), 'check': _rc_text(c.get('check'), 300)}
+                 for i, c in enumerate((data.get('controls') or [])[:12]) if isinstance(c, dict) and _rc_text(c.get('text'), 300)]
+        if not ctrls:
+            return jsonify({'success': False, 'error': 'A fatal risk needs at least one critical control.'}), 400
+        r.controls = json.dumps(ctrls)
+    if 'active' in data:
+        r.active = bool(data.get('active'))
+    if not rid:
+        db.session.add(r)
+    db.session.commit()
+    return jsonify({'success': True, 'data': {'id': r.id}}), 200 if rid else 201
+
+
+@app.route('/api/mining/verifications', methods=['GET', 'POST'])
+@jwt_required
+def mn_verify():
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    cid = user.company_id
+    if request.method == 'GET':
+        q = MnVerification.query.filter(MnVerification.company_id == cid)
+        if request.args.get('risk_id'):
+            q = q.filter(MnVerification.risk_id == int(request.args['risk_id']))
+        rows = q.order_by(MnVerification.created_at.desc()).limit(500).all()
+        names = _in_names([x for v in rows for x in (v.verified_by, v.closed_by)])
+        return jsonify({'success': True, 'data': [{'id': v.id, 'risk_id': v.risk_id, 'area': v.area, 'result': v.result, 'failed': v.failed,
+                                                   'answers': _tbt_json(v.answers, {}), 'immediate_action': v.immediate_action, 'action_status': v.action_status,
+                                                   'verified_by': names.get(v.verified_by), 'at': _in_iso(v.created_at), 'closed_by': names.get(v.closed_by),
+                                                   'closed_note': v.closed_note} for v in rows]}), 200
+    data = _in_body()
+    r = db.session.get(MnRisk, int(data.get('risk_id') or 0)) if str(data.get('risk_id') or '').isdigit() else None
+    if not r or r.company_id != cid:
+        return jsonify({'success': False, 'error': 'Choose the fatal risk.'}), 400
+    area = _mn_area(data.get('area'))
+    if len(area) < 2:
+        return jsonify({'success': False, 'error': 'Say which area or workplace you verified.'}), 400
+    ctrls = _tbt_json(r.controls, [])
+    ans_in = data.get('answers') or {}
+    answers = {}
+    for c in ctrls:
+        a = ans_in.get(c['id']) or {}
+        if a.get('value') not in ('yes', 'no', 'na'):
+            return jsonify({'success': False, 'error': f'Answer every control: "{c["text"][:60]}".'}), 400
+        if a['value'] == 'no' and len(_rc_text(a.get('note'), 300)) < 3:
+            return jsonify({'success': False, 'error': f'Say what is wrong with: "{c["text"][:60]}".'}), 400
+        answers[c['id']] = {'value': a['value'], 'note': _rc_text(a.get('note'), 300) or None}
+    failed = sum(1 for a in answers.values() if a['value'] == 'no')
+    action = _rc_text(data.get('immediate_action'), 1000)
+    if failed and len(action) < 5:
+        return jsonify({'success': False, 'error': 'A critical control failed: say what was done now (for example work stopped, area barricaded).'}), 400
+    v = MnVerification(company_id=cid, risk_id=r.id, area=area, answers=json.dumps(answers), failed=failed, result='failed' if failed else 'effective',
+                       immediate_action=action or None, action_status='open' if failed else None, verified_by=user.id)
+    db.session.add(v)
+    db.session.commit()
+    if failed:
+        txt = '; '.join(f'{c["text"][:80]}: {answers[c["id"]]["note"]}' for c in ctrls if answers[c['id']]['value'] == 'no')
+        _in_notify([(u.id, getattr(u, 'email', None)) for u in _rc_staff_users(cid, user.id)], f'Critical control failed: {r.name} at {area}'[:200],
+                   f'{txt}. Done now: {action}'[:900], '/hse-management/industry/mining?tab=controls', 'critical', email=True)
+    return jsonify({'success': True, 'data': {'id': v.id, 'result': v.result, 'failed': failed}}), 201
+
+
+@app.route('/api/mining/verifications/<int:vid>/close', methods=['POST'])
+@jwt_required
+def mn_verify_close(vid):
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    if not _rc_staff(user):
+        return jsonify({'success': False, 'error': 'Only a supervisor or admin can close a failed control.'}), 403
+    v = db.session.get(MnVerification, vid)
+    if not v or v.company_id != user.company_id or v.action_status != 'open':
+        return jsonify({'success': False, 'error': 'Open failure not found.'}), 404
+    note = _rc_text(_in_body().get('note'), 1000)
+    if len(note) < 5:
+        return jsonify({'success': False, 'error': 'Say how the control was restored.'}), 400
+    v.action_status, v.closed_by, v.closed_at, v.closed_note = 'closed', user.id, datetime.utcnow(), note
+    db.session.commit()
+    return jsonify({'success': True}), 200
+
+
+# ---------------------------------------------------------------- fit for shift (fatigue)
+MN_FATIGUE_RULES = {'min_sleep_24': 5.0, 'min_sleep_48': 12.0, 'max_shift_h': 12.0, 'min_rest_h': 10.0}
+
+
+def _mn_fatigue_eval(sleep24, sleep48, woke_at, start, end, prev_end, safety_critical):
+    """Prior sleep-wake model (Dawson & McCulloch 2005): sleep in the last 24 h >= 5 h, in the last 48 h >= 12 h, and hours
+    awake at the end of the shift no more than the sleep in the last 48 h. Plus roster rules: shift <= 12 h, rest >= 10 h."""
+    R = MN_FATIGUE_RULES
+    hard, soft = [], []
+    awake_end = (end - woke_at).total_seconds() / 3600
+    if sleep24 < R['min_sleep_24']:
+        hard.append(f'Only {sleep24:g} h sleep in the last 24 h (needs {R["min_sleep_24"]:g} h).')
+    if sleep48 < R['min_sleep_48']:
+        hard.append(f'Only {sleep48:g} h sleep in the last 48 h (needs {R["min_sleep_48"]:g} h).')
+    if awake_end > sleep48:
+        (hard if awake_end - sleep48 > 4 else soft).append(f'You will have been awake {awake_end:.0f} h at the end of the shift, more than your {sleep48:g} h of sleep in 48 h.')
+    shift_h = (end - start).total_seconds() / 3600
+    if shift_h > R['max_shift_h']:
+        soft.append(f'Shift of {shift_h:.1f} h is longer than {R["max_shift_h"]:g} h.')
+    if prev_end and (start - prev_end).total_seconds() / 3600 < R['min_rest_h']:
+        soft.append(f'Only {(start - prev_end).total_seconds() / 3600:.1f} h rest since the last shift (needs {R["min_rest_h"]:g} h).')
+    if start.hour < 6 or end.hour < 6 or end.date() > start.date():
+        soft.append('Night work: alertness is lowest between 02:00 and 06:00.')
+    if hard:
+        result = 'not_fit' if safety_critical else 'at_risk'
+    elif soft:
+        result = 'at_risk'
+    else:
+        result = 'fit'
+    controls = {'fit': [], 'at_risk': ['Tell your supervisor', 'Take regular breaks; avoid monotonous tasks at the low point of the night',
+                                       'Buddy check on safety-critical steps', 'Do not drive home tired: rest first or use transport'],
+                'not_fit': ['Do not start safety-critical work (driving, operating plant, isolation, blasting, work at height)',
+                            'Supervisor to reassign to low-risk work or rest before starting', 'Plan rest so the sleep rule is met before the next shift']}[result]
+    return result, hard + soft, controls
+
+
+@app.route('/api/mining/fatigue', methods=['GET', 'POST'])
+@jwt_required
+def mn_fatigue():
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    cid = user.company_id
+    if request.method == 'GET':
+        q = MnFatigue.query.filter(MnFatigue.company_id == cid, MnFatigue.shift_end >= datetime.utcnow() - timedelta(days=7))
+        if not _rc_staff(user):
+            q = q.filter(MnFatigue.user_id == user.id)                     # people see only their own checks
+        rows = q.order_by(MnFatigue.shift_start.desc()).limit(500).all()
+        names = _in_names([r.user_id for r in rows])
+        return jsonify({'success': True, 'rules': MN_FATIGUE_RULES, 'can_manage': bool(_rc_staff(user)),
+                        'data': [{'id': r.id, 'person': names.get(r.user_id), 'shift_start': _in_iso(r.shift_start), 'shift_end': _in_iso(r.shift_end),
+                                  'sleep_24': r.sleep_24, 'sleep_48': r.sleep_48, 'result': r.result, 'reasons': _tbt_json(r.reasons, []),
+                                  'controls': _tbt_json(r.controls, []), 'safety_critical': r.safety_critical} for r in rows]}), 200
+    data = _in_body()
+    try:
+        start, end, woke = _pt_parse_dt(data.get('shift_start')), _pt_parse_dt(data.get('shift_end')), _pt_parse_dt(data.get('woke_at'))
+        s24, s48 = float(data.get('sleep_24')), float(data.get('sleep_48'))
+    except (TypeError, ValueError):
+        return jsonify({'success': False, 'error': 'Give the shift start and end, when you woke up, and your sleep in the last 24 and 48 hours.'}), 400
+    if not (start and end and woke) or end <= start or woke > start + timedelta(hours=1):
+        return jsonify({'success': False, 'error': 'Check the times: the shift must end after it starts, and you woke before it starts.'}), 400
+    if not (0 <= s24 <= 24 and 0 <= s48 <= 48 and s24 <= s48):
+        return jsonify({'success': False, 'error': 'Sleep hours: 0-24 for the last day, 0-48 for two days, and two days at least as much as one.'}), 400
+    if (end - start) > timedelta(hours=24):
+        return jsonify({'success': False, 'error': 'A shift cannot be longer than 24 hours.'}), 400
+    prev = (MnFatigue.query.filter(MnFatigue.company_id == cid, MnFatigue.user_id == user.id, MnFatigue.shift_end <= start)
+            .order_by(MnFatigue.shift_end.desc()).first())
+    sc = data.get('safety_critical', True) is not False
+    result, reasons, controls = _mn_fatigue_eval(s24, s48, woke, start, end, prev.shift_end if prev else None, sc)
+    f = MnFatigue(company_id=cid, user_id=user.id, shift_start=start, shift_end=end, sleep_24=s24, sleep_48=s48, woke_at=woke, safety_critical=sc,
+                  result=result, reasons=json.dumps(reasons), controls=json.dumps(controls))
+    db.session.add(f)
+    db.session.commit()
+    if result == 'not_fit':
+        _in_notify([(u.id, getattr(u, 'email', None)) for u in _rc_staff_users(cid, user.id)], f'Not fit for safety-critical work: {getattr(user, "name", "") or "a worker"}'[:200],
+                   ' '.join(reasons)[:900], '/hse-management/industry/mining?tab=fatigue', 'high')
+    return jsonify({'success': True, 'data': {'id': f.id, 'result': result, 'reasons': reasons, 'controls': controls}}), 201
+
+
+# ---------------------------------------------------------------- ground control TARP
+def _mn_tarp_dict(t, last=None):
+    return {'id': t.id, 'name': t.name, 'location': t.location, 'parameter': t.parameter, 'unit': t.unit, 'amber_at': t.amber_at, 'red_at': t.red_at,
+            'actions': {'green': _tbt_json(t.green_actions, []), 'amber': _tbt_json(t.amber_actions, []), 'red': _tbt_json(t.red_actions, [])},
+            'level': t.level, 'active': t.active,
+            'last': {'value': last.value, 'level': last.level, 'at': _in_iso(last.created_at), 'signs': _tbt_json(last.signs, []), 'note': last.note} if last else None}
+
+
+MN_SIGNS_RED = ('Rock falling or popping', 'Major new cracks / slabs', 'Support failing (plates bent, mesh bulging, bolts broken)')
+MN_SIGNS_AMBER = ('New cracks', 'Water inflow increasing', 'Drummy / loose ground on sounding', 'Spalling')
+
+
+@app.route('/api/mining/tarps', methods=['GET', 'POST'])
+@app.route('/api/mining/tarps/<int:tid>', methods=['PUT'])
+@jwt_required
+def mn_tarps(tid=None):
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    cid = user.company_id
+    if request.method == 'GET':
+        ts = MnTarp.query.filter(MnTarp.company_id == cid).order_by(MnTarp.active.desc(), MnTarp.name).all()
+        out = []
+        for t in ts:
+            last = MnTarpReading.query.filter_by(tarp_id=t.id).order_by(MnTarpReading.created_at.desc()).first()
+            out.append(_mn_tarp_dict(t, last))
+        return jsonify({'success': True, 'data': out, 'can_manage': bool(_rc_staff(user)), 'signs': {'red': MN_SIGNS_RED, 'amber': MN_SIGNS_AMBER}}), 200
+    if not _rc_staff(user):
+        return jsonify({'success': False, 'error': 'Only supervisors and geotechnical staff can set up a TARP.'}), 403
+    data = _in_body()
+    t = db.session.get(MnTarp, tid) if tid else MnTarp(company_id=cid)
+    if tid and (not t or t.company_id != cid):
+        return jsonify({'success': False, 'error': 'TARP not found.'}), 404
+    try:
+        name, param = _rc_text(data.get('name', t.name), 160), _rc_text(data.get('parameter', t.parameter), 120)
+        amber, red = float(data.get('amber_at', t.amber_at)), float(data.get('red_at', t.red_at))
+    except (TypeError, ValueError):
+        return jsonify({'success': False, 'error': 'Give the amber and red trigger values.'}), 400
+    if len(name) < 2 or len(param) < 2:
+        return jsonify({'success': False, 'error': 'Name the TARP and what is measured (for example convergence, mm per day).'}), 400
+    if red <= amber:
+        return jsonify({'success': False, 'error': 'The red trigger must be higher than the amber trigger.'}), 400
+    t.name, t.parameter, t.amber_at, t.red_at = name, param, amber, red
+    t.location, t.unit = _rc_text(data.get('location', t.location), 160) or None, _rc_text(data.get('unit', t.unit), 20) or None
+    defaults = {'green': ['Normal monitoring and shift examination'], 'amber': ['Increase monitoring frequency', 'Geotechnical engineer to inspect this shift', 'Limit access to essential people'],
+                'red': ['Withdraw all people from the area now', 'Barricade and sign the area', 'Geotechnical engineer and manager decide re-entry']}
+    for lv in ('green', 'amber', 'red'):
+        acts = data.get(f'{lv}_actions')
+        if acts is not None or not tid:
+            setattr(t, f'{lv}_actions', json.dumps([_rc_text(a, 200) for a in (acts or defaults[lv]) if _rc_text(a, 200)][:10]))
+    if 'active' in data:
+        t.active = bool(data.get('active'))
+    if not tid:
+        db.session.add(t)
+    db.session.commit()
+    return jsonify({'success': True, 'data': _mn_tarp_dict(t)}), 200 if tid else 201
+
+
+@app.route('/api/mining/tarps/<int:tid>/readings', methods=['GET', 'POST'])
+@jwt_required
+def mn_tarp_reading(tid):
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    t = db.session.get(MnTarp, tid)
+    if not t or t.company_id != user.company_id:
+        return jsonify({'success': False, 'error': 'TARP not found.'}), 404
+    if request.method == 'GET':
+        rows = MnTarpReading.query.filter_by(tarp_id=t.id).order_by(MnTarpReading.created_at.desc()).limit(200).all()
+        names = _in_names([r.recorded_by for r in rows])
+        return jsonify({'success': True, 'data': [{'id': r.id, 'value': r.value, 'level': r.level, 'signs': _tbt_json(r.signs, []), 'note': r.note,
+                                                   'by': names.get(r.recorded_by), 'at': _in_iso(r.created_at)} for r in rows]}), 200
+    data = _in_body()
+    val = data.get('value')
+    try:
+        val = None if val in (None, '') else float(val)
+    except (TypeError, ValueError):
+        return jsonify({'success': False, 'error': 'The reading must be a number.'}), 400
+    signs = [s for s in (data.get('signs') or []) if s in MN_SIGNS_RED + MN_SIGNS_AMBER]
+    if val is None and not signs:
+        return jsonify({'success': False, 'error': 'Enter the reading or tick what you see.'}), 400
+    level = 'green'
+    if (val is not None and val >= t.amber_at) or any(s in MN_SIGNS_AMBER for s in signs):
+        level = 'amber'
+    if (val is not None and val >= t.red_at) or any(s in MN_SIGNS_RED for s in signs):
+        level = 'red'
+    r = MnTarpReading(company_id=t.company_id, tarp_id=t.id, value=val, signs=json.dumps(signs), level=level,
+                      note=_rc_text(data.get('note'), 1000) or None, recorded_by=user.id)
+    prev = t.level
+    t.level = level
+    db.session.add(r)
+    db.session.commit()
+    if level != 'green' and (level != prev or level == 'red'):
+        _in_notify([(u.id, getattr(u, 'email', None)) for u in _rc_staff_users(t.company_id, user.id)], f'Ground TARP {level.upper()}: {t.name}'[:200],
+                   f'{t.parameter}: {val if val is not None else "-"} {t.unit or ""}. {", ".join(signs)}. Actions: {"; ".join(_tbt_json(getattr(t, level + "_actions"), []))}'[:900],
+                   '/hse-management/industry/mining?tab=tarp', 'critical' if level == 'red' else 'high', email=level == 'red')
+    return jsonify({'success': True, 'data': {'level': level, 'actions': _tbt_json(getattr(t, level + '_actions'), []), 'changed': level != prev}}), 201
+
+
+# ---------------------------------------------------------------- blast clearance
+def _mn_blast_dict(b, names=None):
+    names = names or {}
+    posts = _tbt_json(b.posts, [])
+    now = datetime.utcnow()
+    reentry_ok_at = b.fired_at + timedelta(minutes=b.reentry_min) if b.fired_at else None
+    return {'id': b.id, 'ref': b.ref, 'location': b.location, 'planned_at': _in_iso(b.planned_at), 'exclusion_m': b.exclusion_m, 'reentry_min': b.reentry_min,
+            'posts': posts, 'all_clear': bool(posts) and all(p.get('cleared_at') for p in posts), 'shotfirer': b.shotfirer, 'status': b.status,
+            'fired_at': _in_iso(b.fired_at), 'misfire': b.misfire, 'reentry_ok_at': _in_iso(reentry_ok_at),
+            'reentry_wait_min': max(0, int((reentry_ok_at - now).total_seconds() // 60)) if reentry_ok_at and b.status == 'fired' else None,
+            'reentry_at': _in_iso(b.reentry_at), 'reentry_by': names.get(b.reentry_by), 'note': b.note}
+
+
+@app.route('/api/mining/blasts', methods=['GET', 'POST'])
+@jwt_required
+def mn_blasts():
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    cid = user.company_id
+    if request.method == 'GET':
+        rows = MnBlast.query.filter(MnBlast.company_id == cid).order_by(MnBlast.planned_at.desc()).limit(200).all()
+        return jsonify({'success': True, 'data': [_mn_blast_dict(b, _in_names([b.reentry_by])) for b in rows], 'can_manage': bool(_rc_staff(user))}), 200
+    if not _rc_staff(user):
+        return jsonify({'success': False, 'error': 'Only supervisors and admins can plan a blast.'}), 403
+    data = _in_body()
+    loc = _rc_text(data.get('location'), 160)
+    try:
+        when = _pt_parse_dt(data.get('planned_at'))
+        radius, wait = int(data.get('exclusion_m')), int(data.get('reentry_min') or 30)
+    except (TypeError, ValueError):
+        return jsonify({'success': False, 'error': 'Give the time, the exclusion radius in metres and the re-entry wait.'}), 400
+    posts = [{'name': _rc_text(p.get('name') if isinstance(p, dict) else p, 120), 'guard': _rc_text(p.get('guard'), 120) if isinstance(p, dict) else None,
+              'cleared_by': None, 'cleared_at': None} for p in (data.get('posts') or [])][:30]
+    posts = [p for p in posts if p['name']]
+    if len(loc) < 2 or not when or radius < 1 or not (5 <= wait <= 1440):
+        return jsonify({'success': False, 'error': 'Give the blast location, time, exclusion radius and a re-entry wait between 5 and 1440 minutes.'}), 400
+    if not posts:
+        return jsonify({'success': False, 'error': 'Add the guard posts that close the exclusion zone.'}), 400
+    nums = [int(x.group(1)) for (n,) in db.session.query(MnBlast.ref).filter(MnBlast.company_id == cid).all() for x in [re.fullmatch(r'BL-(\d+)', n or '')] if x]
+    b = MnBlast(company_id=cid, ref=f'BL-{(max(nums) if nums else 0) + 1:04d}', location=loc, planned_at=when, exclusion_m=radius, reentry_min=wait,
+                posts=json.dumps(posts), shotfirer=_rc_text(data.get('shotfirer'), 120) or None, created_by=user.id)
+    db.session.add(b)
+    db.session.commit()
+    return jsonify({'success': True, 'data': _mn_blast_dict(b)}), 201
+
+
+@app.route('/api/mining/blasts/<int:bid>', methods=['POST'])
+@jwt_required
+def mn_blast_act(bid):
+    """action: clear (a guard post confirms its area clear) | fire | misfire | reentry | cancel."""
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    b = db.session.get(MnBlast, bid)
+    if not b or b.company_id != user.company_id:
+        return jsonify({'success': False, 'error': 'Blast not found.'}), 404
+    data = _in_body()
+    action = data.get('action')
+    posts = _tbt_json(b.posts, [])
+    now = datetime.utcnow()
+    if action == 'clear':
+        if b.status != 'planned':
+            return jsonify({'success': False, 'error': f'The blast is {b.status}.'}), 409
+        i = data.get('post')
+        if not isinstance(i, int) or not (0 <= i < len(posts)):
+            return jsonify({'success': False, 'error': 'Choose the guard post.'}), 400
+        posts[i]['cleared_by'], posts[i]['cleared_at'] = getattr(user, 'name', None) or f'User {user.id}', now.isoformat()
+        b.posts = json.dumps(posts)
+    elif action in ('fire', 'misfire'):
+        if b.status != 'planned':
+            return jsonify({'success': False, 'error': f'The blast is {b.status}.'}), 409
+        open_posts = [p['name'] for p in posts if not p.get('cleared_at')]
+        if open_posts:
+            return jsonify({'success': False, 'code': 'NOT_CLEAR', 'error': f'Do not fire: not confirmed clear yet: {", ".join(open_posts)}.'}), 409
+        if not _rc_staff(user):
+            return jsonify({'success': False, 'error': 'Only the shotfirer / supervisor can record the firing.'}), 403
+        b.status, b.fired_at, b.fired_by, b.misfire = 'fired', now, user.id, action == 'misfire'
+        if action == 'misfire':
+            b.note = _rc_text(data.get('note'), 1000) or 'Misfire: follow the misfire procedure; no re-entry until the shotfirer declares it safe.'
+    elif action == 'reentry':
+        if b.status != 'fired':
+            return jsonify({'success': False, 'error': 'Re-entry is only after the blast is fired.'}), 409
+        if not _rc_staff(user):
+            return jsonify({'success': False, 'error': 'Only the shotfirer / supervisor can allow re-entry.'}), 403
+        if b.fired_at + timedelta(minutes=b.reentry_min) > now:
+            return jsonify({'success': False, 'code': 'WAIT', 'error': f'Re-entry wait not over: {int((b.fired_at + timedelta(minutes=b.reentry_min) - now).total_seconds() // 60) + 1} minute(s) left (fumes / dust).'}), 409
+        check = _rc_text(data.get('note'), 1000)
+        if len(check) < 5:
+            return jsonify({'success': False, 'error': 'Record the re-entry check (fumes cleared, no misfires seen, ground examined).'}), 400
+        if b.misfire and 'misfire' not in check.lower():
+            return jsonify({'success': False, 'error': 'This blast had a misfire: confirm in the note how the misfire was dealt with.'}), 400
+        b.status, b.reentry_by, b.reentry_at, b.note = 'reentry', user.id, now, check
+    elif action == 'cancel':
+        if not _rc_staff(user) or b.status != 'planned':
+            return jsonify({'success': False, 'error': 'Only a planned blast can be cancelled, by a supervisor.'}), 409
+        b.status = 'cancelled'
+    else:
+        return jsonify({'success': False, 'error': 'Unknown action.'}), 400
+    db.session.commit()
+    return jsonify({'success': True, 'data': _mn_blast_dict(b, _in_names([b.reentry_by]))}), 200
+
+
 # =====================================================================================================
 # AUTO MIGRATIONS (2026-11-23)
 # Railway's Data tab appends LIMIT to every query, so CREATE/ALTER statements fail there. Instead the
@@ -175486,7 +176066,7 @@ def vi_model_info():
 #   - a failing statement is logged and the file is retried on the next start
 # Set AUTO_MIGRATE=0 on Railway to switch this off.
 # =====================================================================================================
-AUTO_MIGRATIONS = ('DEPLOY_2026-11-23_FULL.sql', '2026-11-24_company_quotes.sql', '2026-11-25_ready_checks.sql', '2026-11-26_muster_contractors.sql', '2026-11-27_document_control_plus.sql', '2026-11-27_inspections.sql', '2026-11-27_chemical_safety.sql', '2026-11-27_chemical_waste.sql', '2026-11-27_equipment.sql', '2026-11-27_incident_outcomes.sql', '2026-11-27_oil_gas.sql', '2026-11-27_vision_reports.sql')
+AUTO_MIGRATIONS = ('DEPLOY_2026-11-23_FULL.sql', '2026-11-24_company_quotes.sql', '2026-11-25_ready_checks.sql', '2026-11-26_muster_contractors.sql', '2026-11-27_document_control_plus.sql', '2026-11-27_inspections.sql', '2026-11-27_chemical_safety.sql', '2026-11-27_chemical_waste.sql', '2026-11-27_equipment.sql', '2026-11-27_incident_outcomes.sql', '2026-11-27_oil_gas.sql', '2026-11-27_vision_reports.sql', '2026-11-27_mining.sql')
 _MIGRATION_LOCK_KEY = 74230115
 
 
