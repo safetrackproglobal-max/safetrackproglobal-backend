@@ -170511,6 +170511,1141 @@ def dcp_decide_cr(rid):
     return jsonify({'success': True, 'data': _dcp_cr_dict(r, d)})
 
 
+# ============================================================================
+# INSPECTIONS & CHECKLISTS (2026-11-27)
+# ============================================================================
+# Checklists from a built-in library or the company's own templates, filled in on a phone, with photos, a score,
+# a signed PDF report, schedules with reminders, and one action per failed item.
+# DB: inspection_templates, inspection_schedules, inspections, inspection_photos, inspection_actions
+#     -> sql/2026-11-27_inspections.sql (auto migration)
+# Every query is scoped to the user's company. Workers can run inspections and see their own; supervisors/admins
+# (_rc_staff) see everything, manage templates and schedules, and close out actions.
+
+
+class InspectionTemplate(db.Model):
+    __tablename__ = 'inspection_templates'
+    __table_args__ = {'extend_existing': True}
+    id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id', ondelete='CASCADE'), nullable=False, index=True)
+    name = db.Column(db.String(160), nullable=False)
+    category = db.Column(db.String(60))
+    description = db.Column(db.String(500))
+    items = db.Column(db.Text, nullable=False)                               # JSON list, see _in_clean_items
+    source = db.Column(db.String(40))                                        # library key it was copied from
+    archived = db.Column(db.Boolean, nullable=False, default=False)
+    created_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class InspectionSchedule(db.Model):
+    __tablename__ = 'inspection_schedules'
+    __table_args__ = {'extend_existing': True}
+    id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id', ondelete='CASCADE'), nullable=False, index=True)
+    template_id = db.Column(db.Integer, db.ForeignKey('inspection_templates.id', ondelete='CASCADE'), nullable=True)
+    library_key = db.Column(db.String(40))
+    title = db.Column(db.String(200), nullable=False)
+    site = db.Column(db.String(200))
+    assignee_id = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    frequency = db.Column(db.String(12), nullable=False, default='weekly')  # daily | weekly | monthly | quarterly | yearly
+    next_due = db.Column(db.Date, nullable=False)
+    active = db.Column(db.Boolean, nullable=False, default=True)
+    notified_on = db.Column(db.Date)                                         # last reminder (one a day at most)
+    created_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+
+class Inspection(db.Model):
+    __tablename__ = 'inspections'
+    __table_args__ = {'extend_existing': True}
+    id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id', ondelete='CASCADE'), nullable=False, index=True)
+    template_id = db.Column(db.Integer, db.ForeignKey('inspection_templates.id', ondelete='SET NULL'), nullable=True)
+    library_key = db.Column(db.String(40))
+    schedule_id = db.Column(db.Integer, db.ForeignKey('inspection_schedules.id', ondelete='SET NULL'), nullable=True)
+    title = db.Column(db.String(200), nullable=False)
+    site = db.Column(db.String(200))
+    inspector_id = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True, index=True)
+    status = db.Column(db.String(12), nullable=False, default='in_progress')  # in_progress | completed
+    items = db.Column(db.Text, nullable=False)                                # checklist as it was when started
+    answers = db.Column(db.Text)                                              # JSON {item id: {value, note, action}}
+    score = db.Column(db.Integer)
+    max_score = db.Column(db.Integer)
+    failed_count = db.Column(db.Integer, nullable=False, default=0)
+    critical_failed = db.Column(db.Integer, nullable=False, default=0)
+    note = db.Column(db.Text)
+    signed_name = db.Column(db.String(160))
+    started_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    completed_at = db.Column(db.DateTime)
+    updated_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class InspectionPhoto(db.Model):
+    __tablename__ = 'inspection_photos'
+    __table_args__ = {'extend_existing': True}
+    id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id', ondelete='CASCADE'), nullable=False, index=True)
+    inspection_id = db.Column(db.Integer, db.ForeignKey('inspections.id', ondelete='CASCADE'), nullable=False, index=True)
+    item_id = db.Column(db.String(20))
+    file_name = db.Column(db.String(60), nullable=False)
+    file_mime = db.Column(db.String(30), nullable=False)
+    uploaded_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+
+class InspectionAction(db.Model):
+    __tablename__ = 'inspection_actions'
+    __table_args__ = {'extend_existing': True}
+    id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id', ondelete='CASCADE'), nullable=False, index=True)
+    inspection_id = db.Column(db.Integer, db.ForeignKey('inspections.id', ondelete='CASCADE'), nullable=False, index=True)
+    item_id = db.Column(db.String(20))
+    title = db.Column(db.String(300), nullable=False)
+    detail = db.Column(db.Text)
+    priority = db.Column(db.String(10), nullable=False, default='medium')    # critical | high | medium
+    assignee_id = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True, index=True)
+    due_date = db.Column(db.Date)
+    status = db.Column(db.String(10), nullable=False, default='open')        # open | done | verified
+    done_note = db.Column(db.Text)
+    done_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    done_at = db.Column(db.DateTime)
+    verified_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    verified_at = db.Column(db.DateTime)
+    notified_on = db.Column(db.Date)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+
+IN_FREQ = {'daily': 1, 'weekly': 7, 'monthly': 30, 'quarterly': 91, 'yearly': 365}
+IN_TYPES = ('check', 'number', 'text')
+IN_MAX_ITEMS = 150
+IN_MAX_PHOTO = 8 * 1024 * 1024
+IN_MAX_PHOTOS = 60
+IN_MIME = {b'\x89PNG': ('image/png', 'png'), b'\xff\xd8\xff': ('image/jpeg', 'jpg')}
+
+
+def _in_lib(name, category, description, sections):
+    """sections: [(section, [text | (text, flags)])]; flags: 'c' critical, 'n:min:max:unit' number, 't' text"""
+    items, n = [], 0
+    for section, rows in sections:
+        for row in rows:
+            n += 1
+            text, flags = (row, '') if isinstance(row, str) else row
+            it = {'id': f'q{n}', 'section': section, 'text': text, 'type': 'check', 'required': True, 'critical': 'c' in flags.split(',')}
+            for f in flags.split(','):
+                if f.startswith('n:'):
+                    _, lo, hi, unit = (f.split(':') + ['', '', ''])[:4]
+                    it.update({'type': 'number', 'min': float(lo) if lo else None, 'max': float(hi) if hi else None, 'unit': unit or None})
+                elif f == 't':
+                    it.update({'type': 'text', 'required': False})
+            items.append(it)
+    return {'name': name, 'category': category, 'description': description, 'items': items}
+
+
+# Plain good-practice checklists. They are starting points, not a statement of any law: companies copy and adapt them.
+IN_LIBRARY = {
+    'site_walk': _in_lib('General site safety walk', 'General', 'Weekly walk-round of a work area.', [
+        ('Access and housekeeping', ['Walkways and stairs are clear of materials and trip hazards',
+                                     'Waste is stored in bins or skips, not piled at work fronts',
+                                     'Spills are cleaned up and the floor is not slippery',
+                                     ('Emergency exits and escape routes are unlocked and unobstructed', 'c')]),
+        ('People', ['Everyone wears the PPE the task needs (hard hat, boots, vest, eye protection)',
+                    'Workers know the assembly point and the emergency number',
+                    'Permits are displayed where permit-to-work tasks are under way']),
+        ('Equipment and hazards', ['Edges, openings and holes are guarded or covered', ('Work at height uses guardrails or fall arrest', 'c'),
+                                   'Electrical cables are protected and not damaged', 'Machines have their guards in place',
+                                   'Gas cylinders are upright, secured and capped when not in use',
+                                   'Fire extinguishers are in place and not blocked']),
+        ('Notes', [('Other findings', 't')]),
+    ]),
+    'scaffold': _in_lib('Scaffold inspection', 'Construction', 'Before first use, after changes or bad weather, and at least every 7 days.', [
+        ('Foundation', ['Base plates and sole boards are on firm, level ground', 'No missing or loose standards, ledgers or transoms']),
+        ('Platform', [('Platforms are fully boarded with no gaps', 'c'), ('Guardrails, mid-rails and toe boards are fitted on open sides', 'c'),
+                      'Boards are secured and not split or rotten', 'Safe access ladder is fixed and extends 1 m above the landing']),
+        ('Structure', ['Ties are present at the required spacing', 'Bracing is complete', 'Couplers are tight and undamaged',
+                       'Scaffold is not overloaded with materials']),
+        ('Status', ['A scaffold tag shows it is safe to use and the date of the last inspection', ('Comments', 't')]),
+    ]),
+    'extinguisher': _in_lib('Fire extinguisher monthly check', 'Fire', 'Monthly visual check of each extinguisher.', [
+        ('Extinguisher', ['In its marked location and easy to reach', ('Pressure gauge is in the green zone', 'c'),
+                          'Safety pin and tamper seal are in place', 'No visible damage, corrosion or leaks to body or hose',
+                          'Operating instructions are readable', 'Service label shows a service within the last 12 months']),
+        ('Details', [('Location / extinguisher number', 't')]),
+    ]),
+    'ladder': _in_lib('Ladder pre-use check', 'Work at height', 'Before each use.', [
+        ('Ladder', ['Stiles are straight and not cracked or bent', ('Rungs or steps are complete, firm and not damaged', 'c'),
+                    'Feet are present and not worn', 'Locking bars or spreaders work (step ladders)', 'Ladder is clean (no oil, mud or paint)']),
+        ('Use', ['Ladder is the right type and length for the job', 'It stands on firm, level ground at about 1 in 4 angle',
+                 'It is tied, footed or otherwise secured', 'Three points of contact can be kept']),
+    ]),
+    'forklift': _in_lib('Forklift daily pre-use check', 'Vehicles', 'Before the first use of each shift.', [
+        ('Walk-round', ['Tyres and wheels are in good condition', 'Forks, chains and mast have no cracks or damage',
+                        'No hydraulic, fuel or battery leaks', 'Overhead guard and load backrest are secure']),
+        ('Controls', [('Brakes and parking brake work', 'c'), ('Steering works correctly', 'c'), 'Horn, lights and reversing alarm work',
+                      'Seat belt is fitted and works', 'Lift, tilt and side-shift controls work smoothly']),
+        ('Readings', [('Hour meter reading', 'n:0::h'), ('Defects found', 't')]),
+    ]),
+    'vehicle': _in_lib('Vehicle pre-trip inspection', 'Vehicles', 'Light vehicles and trucks, before the trip.', [
+        ('Outside', ['Tyres have enough tread and correct pressure, no cuts or bulges', 'Lights, indicators and brake lights work',
+                     'Mirrors and windscreen are clean and not cracked', 'No fluid leaks under the vehicle']),
+        ('Inside', [('Brakes work', 'c'), 'Seat belts work for all seats', 'Fire extinguisher and first aid kit are on board',
+                    'Warning triangle and spare tyre are present']),
+        ('Readings', [('Odometer', 'n:0::km'), ('Defects found', 't')]),
+    ]),
+    'harness': _in_lib('Full body harness and lanyard check', 'Work at height', 'Before each use, and a detailed check every 6 months.', [
+        ('Webbing', [('No cuts, burns, frays or chemical damage', 'c'), 'Stitching is complete and not pulled', 'Label is readable and in date']),
+        ('Hardware', [('Buckles, D-rings and adjusters are not bent, cracked or corroded', 'c'), 'Connectors close and lock fully']),
+        ('Lanyard / shock absorber', [('Shock absorber pack has not deployed', 'c'), 'Lanyard is not damaged or knotted']),
+    ]),
+    'electrical': _in_lib('Portable electrical equipment check', 'Electrical', 'User check before use.', [
+        ('Equipment', [('Cable has no cuts, exposed wires or taped joints', 'c'), 'Plug is not cracked and the pins are not bent',
+                       'Casing is not damaged', 'No burn marks or smell of burning', 'Test label is in date']),
+        ('Use', ['Used with a residual current device (RCD) where required', 'Not used in wet conditions unless rated for it']),
+    ]),
+    'excavation': _in_lib('Excavation daily inspection', 'Construction', 'At the start of each shift and after rain.', [
+        ('Excavation', [('Sides are supported, battered or benched', 'c'), 'No water build-up or signs of collapse',
+                        'Spoil and materials are kept at least 1 m from the edge', ('Edge protection or barriers are in place', 'c')]),
+        ('Access and services', ['Safe ladder access within reach of workers', 'Buried services were located and marked',
+                                 'Vehicles are kept back from the edge with stop blocks']),
+        ('Atmosphere', [('Gas test in deep or confined excavations: oxygen %', 'n:19.5:23.5:%')]),
+    ]),
+    'first_aid': _in_lib('First aid kit check', 'Health', 'Monthly.', [
+        ('Kit', ['Kit is in its marked location', 'Contents match the kit list', 'Nothing is past its expiry date',
+                 'Sterile items are sealed', 'The name of the first aider is displayed']),
+        ('Details', [('Items to reorder', 't')]),
+    ]),
+}
+
+
+def _in_iso(d):
+    return d.isoformat() + 'Z' if isinstance(d, datetime) else (d.isoformat() if d else None)
+
+
+def _in_body():
+    data = request.get_json(silent=True)
+    return data if isinstance(data, dict) else {}
+
+
+def _in_staff_403(user):
+    if not _rc_staff(user):
+        return jsonify({'success': False, 'error': 'Only supervisors and admins can do this.'}), 403
+    return None
+
+
+def _in_company_403(user):
+    if not getattr(user, 'company_id', None):
+        return jsonify({'success': False, 'error': 'Inspections are available to company accounts.'}), 403
+    return None
+
+
+def _in_user_in_company(cid, uid):
+    if uid in (None, '', 0):
+        return None
+    try:
+        u = db.session.get(_TbtUser, int(uid))
+    except (TypeError, ValueError):
+        raise ValueError('Unknown person.')
+    if not u or u.company_id != cid:
+        raise ValueError('That person is not in your company.')
+    return u.id
+
+
+def _in_names(ids):
+    ids = [i for i in set(ids) if i]
+    if not ids:
+        return {}
+    return {u.id: _rc_text(getattr(u, 'name', None) or getattr(u, 'email', None) or f'User {u.id}', 160)
+            for u in _TbtUser.query.filter(_TbtUser.id.in_(ids)).all()}
+
+
+def _in_clean_items(raw):
+    """Validate a checklist sent by a company. Returns the cleaned list or raises ValueError."""
+    if not isinstance(raw, list) or not raw:
+        raise ValueError('Add at least one question.')
+    if len(raw) > IN_MAX_ITEMS:
+        raise ValueError(f'A checklist can have up to {IN_MAX_ITEMS} questions.')
+    out, seen = [], set()
+    for n, it in enumerate(raw, 1):
+        if not isinstance(it, dict):
+            raise ValueError('A question is not valid.')
+        text = _rc_text(it.get('text'), 300)
+        if len(text) < 3:
+            raise ValueError(f'Question {n} has no text.')
+        typ = it.get('type') if it.get('type') in IN_TYPES else 'check'
+        iid = str(it.get('id') or '')
+        if not re.fullmatch(r'[A-Za-z0-9_-]{1,20}', iid) or iid in seen:
+            iid = f'q{n}'
+            while iid in seen:
+                iid += 'x'
+        seen.add(iid)
+        row = {'id': iid, 'section': _rc_text(it.get('section'), 80) or 'General', 'text': text, 'type': typ,
+               'required': bool(it.get('required', typ != 'text')), 'critical': bool(it.get('critical')) and typ != 'text'}
+        if typ == 'number':
+            for k in ('min', 'max'):
+                v = it.get(k)
+                row[k] = float(v) if v not in (None, '') and re.fullmatch(r'-?\d+(\.\d+)?', str(v)) else None
+            if row['min'] is not None and row['max'] is not None and row['min'] > row['max']:
+                raise ValueError(f'Question {n}: the lowest value is above the highest value.')
+            row['unit'] = _rc_text(it.get('unit'), 12) or None
+        out.append(row)
+    return out
+
+
+def _in_template_dict(t):
+    items = _tbt_json(t.items, [])
+    return {'id': t.id, 'ref': f'tpl:{t.id}', 'name': t.name, 'category': t.category, 'description': t.description, 'items': items,
+            'count': len(items), 'source': t.source, 'archived': bool(t.archived), 'built_in': False, 'updated_at': _in_iso(t.updated_at)}
+
+
+def _in_library_dict(key):
+    v = IN_LIBRARY[key]
+    return {'id': None, 'ref': f'lib:{key}', 'key': key, 'name': v['name'], 'category': v['category'], 'description': v['description'],
+            'items': v['items'], 'count': len(v['items']), 'built_in': True}
+
+
+def _in_resolve_ref(user, ref):
+    """'lib:<key>' or 'tpl:<id>' -> (template row or None, library key or None, checklist dict)"""
+    ref = str(ref or '')
+    if ref.startswith('lib:') and ref[4:] in IN_LIBRARY:
+        return None, ref[4:], _in_library_dict(ref[4:])
+    if ref.startswith('tpl:') and ref[4:].isdigit():
+        t = db.session.get(InspectionTemplate, int(ref[4:]))
+        if t and t.company_id == user.company_id and not t.archived:
+            return t, None, _in_template_dict(t)
+    raise ValueError('Choose a checklist.')
+
+
+def _in_eval(items, answers):
+    """score = passed checks / (passed + failed); a number outside its range counts as failed; N/A is left out."""
+    passed = failed = critical = 0
+    failed_items = []
+    for it in items:
+        a = answers.get(it['id']) or {}
+        v = a.get('value')
+        bad = False
+        if it['type'] == 'check':
+            if v == 'pass':
+                passed += 1
+            elif v == 'fail':
+                bad = True
+        elif it['type'] == 'number' and v not in (None, ''):
+            try:
+                x = float(v)
+                bad = (it.get('min') is not None and x < it['min']) or (it.get('max') is not None and x > it['max'])
+                if not bad and (it.get('min') is not None or it.get('max') is not None):
+                    passed += 1
+            except (TypeError, ValueError):
+                pass
+        if bad:
+            failed += 1
+            critical += 1 if it.get('critical') else 0
+            failed_items.append(it)
+    return passed, failed, critical, failed_items
+
+
+def _in_missing(items, answers):
+    out = []
+    for it in items:
+        if not it.get('required'):
+            continue
+        v = (answers.get(it['id']) or {}).get('value')
+        if v in (None, '') or (it['type'] == 'check' and v not in ('pass', 'fail', 'na')):
+            out.append(it['text'])
+    return out
+
+
+def _in_clean_answers(items, raw):
+    ids = {it['id']: it for it in items}
+    out = {}
+    if not isinstance(raw, dict):
+        return out
+    for k, a in list(raw.items())[:IN_MAX_ITEMS + 10]:
+        it = ids.get(str(k))
+        if not it or not isinstance(a, dict):
+            continue
+        v = a.get('value')
+        if it['type'] == 'check':
+            v = v if v in ('pass', 'fail', 'na') else None
+        elif it['type'] == 'number':
+            v = str(v).strip() if v not in (None, '') and re.fullmatch(r'-?\d+(\.\d+)?', str(v).strip()) else None
+        else:
+            v = _rc_text(v, 2000) or None
+        row = {'value': v, 'note': _rc_text(a.get('note'), 1000) or None}
+        act = a.get('action') if isinstance(a.get('action'), dict) else {}
+        row['action'] = {'assignee_id': act.get('assignee_id') or None, 'due_date': _rc_text(act.get('due_date'), 10) or None,
+                         'title': _rc_text(act.get('title'), 300) or None}
+        out[str(k)] = row
+    return out
+
+
+def _in_can_view(user, ins):
+    return ins.company_id == user.company_id and (ins.inspector_id == user.id or _rc_staff(user))
+
+
+def _in_get(user, iid):
+    ins = db.session.get(Inspection, iid)
+    return ins if ins and _in_can_view(user, ins) else None
+
+
+def _in_dict(ins, full=False):
+    names = _in_names([ins.inspector_id])
+    pct = round(100 * ins.score / ins.max_score) if ins.max_score else None
+    out = {'id': ins.id, 'title': ins.title, 'site': ins.site, 'status': ins.status, 'template_id': ins.template_id,
+           'library_key': ins.library_key, 'schedule_id': ins.schedule_id, 'inspector_id': ins.inspector_id,
+           'inspector': names.get(ins.inspector_id), 'score': ins.score, 'max_score': ins.max_score, 'percent': pct,
+           'failed_count': ins.failed_count or 0, 'critical_failed': ins.critical_failed or 0,
+           'started_at': _in_iso(ins.started_at), 'completed_at': _in_iso(ins.completed_at), 'updated_at': _in_iso(ins.updated_at)}
+    if full:
+        out.update({'items': _tbt_json(ins.items, []), 'answers': _tbt_json(ins.answers, {}), 'note': ins.note, 'signed_name': ins.signed_name,
+                    'photos': [{'id': p.id, 'item_id': p.item_id} for p in
+                               InspectionPhoto.query.filter(InspectionPhoto.inspection_id == ins.id).order_by(InspectionPhoto.id).all()],
+                    'actions': [_in_action_dict(a) for a in
+                                InspectionAction.query.filter(InspectionAction.inspection_id == ins.id).order_by(InspectionAction.id).all()]})
+    return out
+
+
+def _in_action_dict(a, names=None):
+    names = names if names is not None else _in_names([a.assignee_id, a.done_by])
+    today = datetime.utcnow().date()
+    return {'id': a.id, 'inspection_id': a.inspection_id, 'item_id': a.item_id, 'title': a.title, 'detail': a.detail, 'priority': a.priority,
+            'assignee_id': a.assignee_id, 'assignee': names.get(a.assignee_id), 'due_date': a.due_date.isoformat() if a.due_date else None,
+            'overdue': bool(a.status == 'open' and a.due_date and a.due_date < today), 'status': a.status, 'done_note': a.done_note,
+            'done_by': names.get(a.done_by), 'done_at': _in_iso(a.done_at), 'verified_at': _in_iso(a.verified_at), 'created_at': _in_iso(a.created_at)}
+
+
+def _in_notify(targets, title, text, url, priority='medium', email=False):
+    """targets = [(user_id, email)], read before the thread starts. In-app first, then optional e-mail."""
+    targets = [t for t in targets if t and t[0]]
+    if not targets:
+        return
+
+    def run():
+        from html import escape as _esc
+        with app.app_context():
+            try:
+                for uid, _e in targets:
+                    try:
+                        if create_notification(uid, title[:200], text[:900], type='warning' if priority in ('critical', 'high') else 'info',
+                                               priority=priority, action_url=url, expires_in_hours=168) is None:
+                            db.session.rollback()
+                    except Exception as e:
+                        db.session.rollback()
+                        logger.error(f'inspection notification failed: {e}')
+                if email:
+                    for _uid, em in targets:
+                        if em:
+                            try:
+                                send_email(to=em, subject=title[:200], body=f'<p>{_esc(text[:900])}</p><p>Open Inspections in SafeTrack Pro.</p>')
+                            except Exception as e:
+                                logger.error(f'inspection e-mail failed: {e}')
+            finally:
+                db.session.remove()
+    threading.Thread(target=run, daemon=True).start()
+
+
+def _in_user_target(uid):
+    u = db.session.get(_TbtUser, uid) if uid else None
+    return [(u.id, getattr(u, 'email', None))] if u and getattr(u, 'is_active', True) is not False else []
+
+
+def _in_dir(cid):
+    return os.path.join(BASE_UPLOAD_DIR, 'inspections', str(int(cid)))
+
+
+# ------------------------------------------------------------------------------------------- checklists
+@app.route('/api/inspections/library', methods=['GET'])
+@jwt_required
+def in_library_route():
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    own = (InspectionTemplate.query.filter(InspectionTemplate.company_id == user.company_id, InspectionTemplate.archived.is_(False))
+           .order_by(InspectionTemplate.name).all())
+    return jsonify({'success': True, 'data': {'company': [_in_template_dict(t) for t in own],
+                                              'library': [_in_library_dict(k) for k in IN_LIBRARY],
+                                              'can_manage': _rc_staff(user)}}), 200
+
+
+@app.route('/api/inspections/templates', methods=['POST'])
+@app.route('/api/inspections/templates/<int:tid>', methods=['PUT', 'DELETE'])
+@jwt_required
+def in_template_route(tid=None):
+    user = request.user
+    deny = _in_staff_403(user)
+    if deny:
+        return deny
+    t = None
+    if tid is not None:
+        t = db.session.get(InspectionTemplate, tid)
+        if not t or t.company_id != user.company_id:
+            return jsonify({'success': False, 'error': 'Checklist not found.'}), 404
+        if request.method == 'DELETE':
+            t.archived = True                      # past inspections keep their own copy of the questions
+            db.session.commit()
+            return jsonify({'success': True}), 200
+    data = _in_body()
+    if t is None and data.get('copy_of'):
+        key = str(data.get('copy_of'))
+        if key not in IN_LIBRARY:
+            return jsonify({'success': False, 'error': 'Unknown library checklist.'}), 400
+        src = IN_LIBRARY[key]
+        data = {'name': data.get('name') or src['name'], 'category': src['category'], 'description': src['description'],
+                'items': src['items'], 'source': key}
+    name = _rc_text(data.get('name'), 160) if 'name' in data or t is None else t.name
+    if not name or len(name) < 3:
+        return jsonify({'success': False, 'error': 'Give the checklist a name.'}), 400
+    try:
+        items = _in_clean_items(data.get('items')) if ('items' in data or t is None) else None
+    except ValueError as e:
+        return jsonify({'success': False, 'error': str(e)}), 400
+    if t is None:
+        if InspectionTemplate.query.filter(InspectionTemplate.company_id == user.company_id).count() >= 300:
+            return jsonify({'success': False, 'error': 'Checklist limit reached.'}), 400
+        t = InspectionTemplate(company_id=user.company_id, created_by=user.id, source=_rc_text(data.get('source'), 40) or None)
+        db.session.add(t)
+    t.name = name
+    if 'category' in data or t.category is None:
+        t.category = _rc_text(data.get('category'), 60) or 'General'
+    if 'description' in data:
+        t.description = _rc_text(data.get('description'), 500) or None
+    if items is not None:
+        t.items = json.dumps(items)
+    db.session.commit()
+    return jsonify({'success': True, 'data': _in_template_dict(t)}), 201 if tid is None else 200
+
+
+# ------------------------------------------------------------------------------------------- inspections
+@app.route('/api/inspections', methods=['GET'])
+@jwt_required
+def in_list_route():
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    q = Inspection.query.filter(Inspection.company_id == user.company_id)
+    if not _rc_staff(user) or request.args.get('mine') == '1':
+        q = q.filter(Inspection.inspector_id == user.id)
+    st = request.args.get('status')
+    if st in ('in_progress', 'completed'):
+        q = q.filter(Inspection.status == st)
+    if request.args.get('failed') == '1':
+        q = q.filter(Inspection.failed_count > 0)
+    text = _rc_text(request.args.get('q'), 80)
+    if text:
+        like = '%' + text.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_') + '%'
+        q = q.filter(or_(Inspection.title.ilike(like, escape='\\'), Inspection.site.ilike(like, escape='\\')))
+    try:
+        page = max(1, int(request.args.get('page', 1)))
+    except ValueError:
+        page = 1
+    total = q.count()
+    rows = q.order_by(Inspection.id.desc()).offset((page - 1) * 20).limit(20).all()
+    return jsonify({'success': True, 'data': {'items': [_in_dict(r) for r in rows], 'total': total, 'page': page}}), 200
+
+
+@app.route('/api/inspections', methods=['POST'])
+@jwt_required
+def in_start_route():
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    data = _in_body()
+    sched = None
+    if data.get('schedule_id'):
+        try:
+            sched = db.session.get(InspectionSchedule, int(data.get('schedule_id')))
+        except (TypeError, ValueError):
+            sched = None
+        if not sched or sched.company_id != user.company_id or not sched.active:
+            return jsonify({'success': False, 'error': 'Schedule not found.'}), 404
+        if sched.assignee_id not in (None, user.id) and not _rc_staff(user):
+            return jsonify({'success': False, 'error': 'This inspection is assigned to someone else.'}), 403
+        data = {**data, 'ref': f'tpl:{sched.template_id}' if sched.template_id else f'lib:{sched.library_key}',
+                'title': data.get('title') or sched.title, 'site': data.get('site') or sched.site}
+    try:
+        t, key, chk = _in_resolve_ref(user, data.get('ref'))
+    except ValueError as e:
+        return jsonify({'success': False, 'error': str(e)}), 400
+    open_count = Inspection.query.filter(Inspection.company_id == user.company_id, Inspection.inspector_id == user.id,
+                                         Inspection.status == 'in_progress').count()
+    if open_count >= 30:
+        return jsonify({'success': False, 'error': 'You have 30 unfinished inspections. Finish or delete some first.'}), 400
+    ins = Inspection(company_id=user.company_id, template_id=t.id if t else None, library_key=key, schedule_id=sched.id if sched else None,
+                     title=_rc_text(data.get('title'), 200) or chk['name'], site=_rc_text(data.get('site'), 200) or None,
+                     inspector_id=user.id, status='in_progress', items=json.dumps(chk['items']), answers='{}')
+    db.session.add(ins)
+    db.session.commit()
+    return jsonify({'success': True, 'data': _in_dict(ins, full=True)}), 201
+
+
+@app.route('/api/inspections/<int:iid>', methods=['GET', 'PUT', 'DELETE'])
+@jwt_required
+def in_one_route(iid):
+    user = request.user
+    ins = _in_get(user, iid)
+    if not ins:
+        return jsonify({'success': False, 'error': 'Inspection not found.'}), 404
+    if request.method == 'GET':
+        out = _in_dict(ins, full=True)
+        out['can_edit'] = ins.status == 'in_progress' and ins.inspector_id == user.id
+        return jsonify({'success': True, 'data': out}), 200
+    if request.method == 'DELETE':
+        if ins.status != 'in_progress' or (ins.inspector_id != user.id and not _rc_staff(user)):
+            return jsonify({'success': False, 'error': 'Completed inspections are kept as a record and cannot be deleted.'}), 409
+        names = [p.file_name for p in InspectionPhoto.query.filter(InspectionPhoto.inspection_id == ins.id).all()]
+        db.session.delete(ins)
+        db.session.commit()
+        for n in names:
+            try:
+                os.remove(os.path.join(_in_dir(user.company_id), n))
+            except OSError:
+                pass
+        return jsonify({'success': True}), 200
+    if ins.status != 'in_progress' or ins.inspector_id != user.id:
+        return jsonify({'success': False, 'error': 'Only the inspector can change an unfinished inspection.'}), 409
+    data = _in_body()
+    items = _tbt_json(ins.items, [])
+    if 'answers' in data:
+        merged = _tbt_json(ins.answers, {})
+        merged.update(_in_clean_answers(items, data.get('answers')))
+        ins.answers = json.dumps(merged)
+    for k, n in (('title', 200), ('site', 200)):
+        if k in data:
+            v = _rc_text(data.get(k), n)
+            if k == 'title' and not v:
+                return jsonify({'success': False, 'error': 'The inspection needs a title.'}), 400
+            setattr(ins, k, v or None)
+    if 'note' in data:
+        ins.note = _rc_text(data.get('note'), 4000) or None
+    ins.updated_at = datetime.utcnow()
+    db.session.commit()
+    return jsonify({'success': True, 'data': {'id': ins.id, 'updated_at': _in_iso(ins.updated_at)}}), 200
+
+
+@app.route('/api/inspections/<int:iid>/complete', methods=['POST'])
+@jwt_required
+def in_complete_route(iid):
+    user = request.user
+    ins = _in_get(user, iid)
+    if not ins:
+        return jsonify({'success': False, 'error': 'Inspection not found.'}), 404
+    if ins.status != 'in_progress' or ins.inspector_id != user.id:
+        return jsonify({'success': False, 'error': 'Only the inspector can finish this inspection.'}), 409
+    data = _in_body()
+    items = _tbt_json(ins.items, [])
+    answers = _tbt_json(ins.answers, {})
+    if 'answers' in data:
+        answers.update(_in_clean_answers(items, data.get('answers')))
+    missing = _in_missing(items, answers)
+    if missing:
+        return jsonify({'success': False, 'error': f'{len(missing)} required question(s) not answered.', 'missing': missing[:20]}), 400
+    signed = _rc_text(data.get('signed_name'), 160)
+    if len(signed) < 2:
+        return jsonify({'success': False, 'error': 'Type your name to sign the inspection.'}), 400
+    passed, failed, critical, failed_items = _in_eval(items, answers)
+    # check every chosen action owner before anything is saved
+    today = datetime.utcnow().date()
+    plans = []
+    for it in failed_items:
+        act = (answers.get(it['id']) or {}).get('action') or {}
+        try:
+            who = _in_user_in_company(user.company_id, act.get('assignee_id'))
+            due = _ct_date(act.get('due_date')) if act.get('due_date') else today + timedelta(days=1 if it.get('critical') else 7)
+        except ValueError as e:
+            return jsonify({'success': False, 'error': f'"{it["text"][:60]}": {e}'}), 400
+        if due < today:
+            return jsonify({'success': False, 'error': f'"{it["text"][:60]}": the due date is in the past.'}), 400
+        note = (answers.get(it['id']) or {}).get('note')
+        plans.append(InspectionAction(company_id=ins.company_id, inspection_id=ins.id, item_id=it['id'],
+                                      title=act.get('title') or f'Fix: {it["text"]}'[:300],
+                                      detail=(f'Found in "{ins.title}"' + (f' at {ins.site}' if ins.site else '') + (f'. Note: {note}' if note else ''))[:2000],
+                                      priority='critical' if it.get('critical') else 'high' if it['type'] == 'number' else 'medium',
+                                      assignee_id=who, due_date=due))
+    # claim the completion atomically: a double tap must not create the actions twice
+    claimed = (Inspection.query.filter(Inspection.id == ins.id, Inspection.status == 'in_progress')
+               .update({'status': 'completed'}, synchronize_session=False))
+    if not claimed:
+        db.session.rollback()
+        return jsonify({'success': False, 'error': 'This inspection was already finished.'}), 409
+    ins = db.session.get(Inspection, iid)
+    ins.answers = json.dumps(answers)
+    ins.score, ins.max_score = passed, passed + failed
+    ins.failed_count, ins.critical_failed = failed, critical
+    ins.signed_name, ins.completed_at = signed, datetime.utcnow()
+    if 'note' in data:
+        ins.note = _rc_text(data.get('note'), 4000) or None
+    for a in plans:
+        db.session.add(a)
+    if ins.schedule_id:
+        s = db.session.get(InspectionSchedule, ins.schedule_id)
+        if s and s.company_id == ins.company_id:
+            step = timedelta(days=IN_FREQ.get(s.frequency, 7))
+            nxt = s.next_due + step
+            while nxt <= today:
+                nxt += step
+            s.next_due, s.notified_on = nxt, None
+    db.session.commit()
+    for a in plans:
+        if a.assignee_id and a.assignee_id != user.id:
+            _in_notify(_in_user_target(a.assignee_id), f'Action for you: {a.title[:120]}',
+                       f'From the inspection "{ins.title}". Due {a.due_date.isoformat()}.', '/inspections?tab=actions', a.priority)
+    if critical:
+        _in_notify([(u.id, getattr(u, 'email', None)) for u in _rc_staff_users(ins.company_id, user.id)],
+                   f'Critical finding: {ins.title}'[:200],
+                   f'{critical} critical item(s) failed in "{ins.title}"' + (f' at {ins.site}' if ins.site else '') + f'. Signed by {signed}.',
+                   f'/inspections?open={ins.id}', 'critical', email=True)
+    return jsonify({'success': True, 'data': _in_dict(ins, full=True)}), 200
+
+
+# ------------------------------------------------------------------------------------------- photos
+@app.route('/api/inspections/<int:iid>/photos', methods=['POST'])
+@jwt_required
+def in_photo_add_route(iid):
+    user = request.user
+    ins = _in_get(user, iid)
+    if not ins:
+        return jsonify({'success': False, 'error': 'Inspection not found.'}), 404
+    if ins.status != 'in_progress' or ins.inspector_id != user.id:
+        return jsonify({'success': False, 'error': 'Photos can be added only while the inspection is open.'}), 409
+    item_id = str(request.form.get('item_id') or '')
+    if item_id and item_id not in {it['id'] for it in _tbt_json(ins.items, [])}:
+        return jsonify({'success': False, 'error': 'Unknown question.'}), 400
+    if InspectionPhoto.query.filter(InspectionPhoto.inspection_id == ins.id).count() >= IN_MAX_PHOTOS:
+        return jsonify({'success': False, 'error': f'Up to {IN_MAX_PHOTOS} photos per inspection.'}), 400
+    up = request.files.get('file')
+    if not up or not up.filename:
+        return jsonify({'success': False, 'error': 'Choose a photo.'}), 400
+    raw = up.read(IN_MAX_PHOTO + 1)
+    if len(raw) > IN_MAX_PHOTO:
+        return jsonify({'success': False, 'error': 'The photo is larger than 8 MB.'}), 400
+    kind = next((v for k, v in IN_MIME.items() if raw.startswith(k)), None)
+    if not kind:
+        return jsonify({'success': False, 'error': 'Only JPG or PNG photos.'}), 400
+    try:                                                        # must really be a picture, not a file with a picture header
+        from PIL import Image as _PILImage
+        with _PILImage.open(io.BytesIO(raw)) as im:
+            im.verify()
+    except Exception:
+        return jsonify({'success': False, 'error': 'The photo could not be read.'}), 400
+    folder = _in_dir(ins.company_id)
+    os.makedirs(folder, exist_ok=True)
+    name = f'{uuid.uuid4().hex}.{kind[1]}'
+    with open(os.path.join(folder, name), 'wb') as fh:
+        fh.write(raw)
+    p = InspectionPhoto(company_id=ins.company_id, inspection_id=ins.id, item_id=item_id or None, file_name=name, file_mime=kind[0], uploaded_by=user.id)
+    db.session.add(p)
+    db.session.commit()
+    return jsonify({'success': True, 'data': {'id': p.id, 'item_id': p.item_id}}), 201
+
+
+@app.route('/api/inspections/photos/<int:pid>', methods=['GET', 'DELETE'])
+@jwt_required
+def in_photo_route(pid):
+    user = request.user
+    p = db.session.get(InspectionPhoto, pid)
+    ins = db.session.get(Inspection, p.inspection_id) if p else None
+    if not p or not ins or not _in_can_view(user, ins):
+        return jsonify({'success': False, 'error': 'Photo not found.'}), 404
+    path = os.path.join(_in_dir(p.company_id), p.file_name) if re.fullmatch(r'[0-9a-f]{32}\.(png|jpg)', p.file_name or '') else None
+    if request.method == 'DELETE':
+        if ins.status != 'in_progress' or ins.inspector_id != user.id:
+            return jsonify({'success': False, 'error': 'Photos of a finished inspection are kept.'}), 409
+        db.session.delete(p)
+        db.session.commit()
+        if path and os.path.exists(path):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        return jsonify({'success': True}), 200
+    if not path or not os.path.exists(path):
+        return jsonify({'success': False, 'error': 'Photo file missing.'}), 404
+    resp = send_file(path, mimetype=p.file_mime, as_attachment=False, download_name=f'inspection-{ins.id}-{p.id}.{p.file_name.rsplit(".", 1)[1]}')
+    resp.headers['X-Content-Type-Options'] = 'nosniff'
+    resp.headers['Cache-Control'] = 'private, no-store'
+    return resp
+
+
+# ------------------------------------------------------------------------------------------- report
+def _in_pdf(ins):
+    import fitz as _fz
+    from html import escape as _e
+    items = _tbt_json(ins.items, [])
+    answers = _tbt_json(ins.answers, {})
+    photos = InspectionPhoto.query.filter(InspectionPhoto.inspection_id == ins.id).order_by(InspectionPhoto.id).all()
+    actions = InspectionAction.query.filter(InspectionAction.inspection_id == ins.id).order_by(InspectionAction.id).all()
+    names = _in_names([ins.inspector_id] + [a.assignee_id for a in actions])
+    folder = _in_dir(ins.company_id)
+    by_item = {}
+    for p in photos:
+        if re.fullmatch(r'[0-9a-f]{32}\.(png|jpg)', p.file_name or '') and os.path.exists(os.path.join(folder, p.file_name)):
+            by_item.setdefault(p.item_id or '', []).append(p.file_name)
+    label = {'pass': 'Pass', 'fail': 'FAIL', 'na': 'N/A'}
+    pct = f'{round(100 * ins.score / ins.max_score)}%' if ins.max_score else 'n/a'
+    comp = db.session.get(_TbtCompany, ins.company_id) if ins.company_id else None
+    h = [f'<h1>{_e(ins.title)}</h1>',
+         f'<p>{_e(getattr(comp, "name", "") or "")}' + (f' - {_e(ins.site)}' if ins.site else '') + '</p>',
+         '<table><tr><th>Inspector</th><th>Started</th><th>Completed</th><th>Score</th><th>Failed</th></tr>'
+         f'<tr><td>{_e(names.get(ins.inspector_id) or "")}</td><td>{ins.started_at.strftime("%d %b %Y %H:%M") if ins.started_at else ""} UTC</td>'
+         f'<td>{ins.completed_at.strftime("%d %b %Y %H:%M") + " UTC" if ins.completed_at else "Not finished"}</td><td>{pct}</td>'
+         f'<td>{ins.failed_count or 0} ({ins.critical_failed or 0} critical)</td></tr></table>']
+    # MuPDF stops the whole document at an image inside a table cell, so photos go under their section's table
+    section, pending = None, []
+
+    def close_section():
+        h.append('</table>')
+        for text, fn in pending:
+            h.append(f'<p class="cap">Photo: {_e(text[:120])}</p><p><img src="{fn}" width="220"/></p>')
+        pending.clear()
+
+    for it in items:
+        if it.get('section') != section:
+            if section is not None:
+                close_section()
+            section = it.get('section')
+            h.append(f'<h2>{_e(section or "")}</h2><table><tr><th style="width:62%">Question</th><th>Answer</th><th>Note</th></tr>')
+        a = answers.get(it['id']) or {}
+        v = a.get('value')
+        shown = label.get(v, v) if it['type'] == 'check' else (f'{v} {it.get("unit") or ""}' if v not in (None, '') else '')
+        bad = it in _in_eval([it], {it['id']: a})[3]
+        color = ' style="color:#b00000;font-weight:bold"' if bad else ''
+        h.append(f'<tr><td>{_e(it["text"])}{" (critical)" if it.get("critical") else ""}</td><td{color}>{_e(shown or "-")}</td>'
+                 f'<td>{_e(a.get("note") or "")}</td></tr>')
+        pending.extend((it['text'], fn) for fn in by_item.get(it['id'], [])[:4])
+    if section is not None:
+        close_section()
+    general = by_item.get('', [])
+    if general:
+        h.append('<h2>Photos</h2>' + ''.join(f'<p><img src="{fn}" width="260"/></p>' for fn in general[:12]))
+    if ins.note:
+        h.append(f'<h2>Summary</h2><p>{_e(ins.note)}</p>')
+    if actions:
+        h.append('<h2>Actions</h2><table><tr><th>Action</th><th>Owner</th><th>Due</th><th>Status</th></tr>' +
+                 ''.join(f'<tr><td>{_e(a.title)}</td><td>{_e(names.get(a.assignee_id) or "Not assigned")}</td>'
+                         f'<td>{a.due_date.strftime("%d %b %Y") if a.due_date else ""}</td><td>{_e(a.status)}</td></tr>' for a in actions) + '</table>')
+    h.append(f'<p>Signed: {_e(ins.signed_name or "")}</p>' if ins.signed_name else '<p>Not signed: inspection not finished.</p>')
+    h.append('<p style="color:#777;font-size:8pt">Generated by SafeTrack Pro. Times are UTC.</p>')
+    css = ('* { font-family: sans-serif; } body { font-size: 9.5pt; } h1 { color: #0b3d91; font-size: 16pt; } '
+           'h2 { color: #0b3d91; font-size: 11.5pt; } table { border-collapse: collapse; width: 100%; } '
+           'td, th { border: 1px solid #d0d7e2; padding: 3px; text-align: left; vertical-align: top; } th { background: #eef3fb; } .cap { color: #555; font-size: 8.5pt; margin-bottom: 2px; }')
+    archive = _fz.Archive(folder) if os.path.isdir(folder) else None
+    story = _fz.Story(html=''.join(h), user_css=css, archive=archive)
+    buf = io.BytesIO()
+    writer = _fz.DocumentWriter(buf)
+    box = _fz.paper_rect('a4')
+    more = True
+    while more:
+        dev = writer.begin_page(box)
+        more, _ = story.place(box + (40, 40, -40, -40))
+        story.draw(dev)
+        writer.end_page()
+    writer.close()
+    return buf.getvalue()
+
+
+@app.route('/api/inspections/<int:iid>/pdf', methods=['GET'])
+@jwt_required
+def in_pdf_route(iid):
+    user = request.user
+    ins = _in_get(user, iid)
+    if not ins:
+        return jsonify({'success': False, 'error': 'Inspection not found.'}), 404
+    try:
+        pdf = _in_pdf(ins)
+    except Exception as e:
+        logger.error(f'inspection pdf {iid}: {e}')
+        return jsonify({'success': False, 'error': 'The report could not be made.'}), 500
+    safe = re.sub(r'[^A-Za-z0-9 _-]+', '', ins.title or 'inspection').strip().replace(' ', '_')[:60] or 'inspection'
+    resp = send_file(io.BytesIO(pdf), mimetype='application/pdf', as_attachment=True, download_name=f'{safe}_{ins.id}.pdf')
+    resp.headers['Cache-Control'] = 'private, no-store'
+    return resp
+
+
+# ------------------------------------------------------------------------------------------- schedules
+def _in_schedule_dict(s, names, today):
+    return {'id': s.id, 'title': s.title, 'site': s.site, 'template_id': s.template_id, 'library_key': s.library_key,
+            'ref': f'tpl:{s.template_id}' if s.template_id else f'lib:{s.library_key}', 'assignee_id': s.assignee_id,
+            'assignee': names.get(s.assignee_id), 'frequency': s.frequency, 'next_due': s.next_due.isoformat(), 'active': bool(s.active),
+            'due_in_days': (s.next_due - today).days, 'overdue': bool(s.active and s.next_due < today)}
+
+
+@app.route('/api/inspections/schedules', methods=['GET', 'POST'])
+@app.route('/api/inspections/schedules/<int:sid>', methods=['PUT', 'DELETE'])
+@jwt_required
+def in_schedule_route(sid=None):
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    today = datetime.utcnow().date()
+    if request.method == 'GET':
+        q = InspectionSchedule.query.filter(InspectionSchedule.company_id == user.company_id)
+        if not _rc_staff(user) or request.args.get('mine') == '1':
+            q = q.filter(InspectionSchedule.active.is_(True), or_(InspectionSchedule.assignee_id == user.id, InspectionSchedule.assignee_id.is_(None)))
+        rows = q.order_by(InspectionSchedule.next_due).limit(500).all()
+        names = _in_names([r.assignee_id for r in rows])
+        return jsonify({'success': True, 'data': [_in_schedule_dict(r, names, today) for r in rows]}), 200
+    deny = _in_staff_403(user)
+    if deny:
+        return deny
+    s = None
+    if sid is not None:
+        s = db.session.get(InspectionSchedule, sid)
+        if not s or s.company_id != user.company_id:
+            return jsonify({'success': False, 'error': 'Schedule not found.'}), 404
+        if request.method == 'DELETE':
+            db.session.delete(s)
+            db.session.commit()
+            return jsonify({'success': True}), 200
+    data = _in_body()
+    if s is None:
+        if InspectionSchedule.query.filter(InspectionSchedule.company_id == user.company_id).count() >= 500:
+            return jsonify({'success': False, 'error': 'Schedule limit reached.'}), 400
+        s = InspectionSchedule(company_id=user.company_id, created_by=user.id, active=True)
+    try:
+        if 'ref' in data or sid is None:
+            t, key, chk = _in_resolve_ref(user, data.get('ref'))
+            s.template_id, s.library_key = (t.id if t else None), key
+            if not data.get('title') and not s.title:
+                s.title = chk['name']
+        if 'title' in data:
+            s.title = _rc_text(data.get('title'), 200) or s.title
+        if 'site' in data:
+            s.site = _rc_text(data.get('site'), 200) or None
+        if 'assignee_id' in data:
+            s.assignee_id = _in_user_in_company(user.company_id, data.get('assignee_id'))
+        if 'frequency' in data or sid is None:
+            if data.get('frequency') not in IN_FREQ:
+                raise ValueError('Choose how often.')
+            s.frequency = data['frequency']
+        if 'next_due' in data or sid is None:
+            d = _ct_date(data.get('next_due')) or today
+            s.next_due, s.notified_on = d, None
+        if 'active' in data:
+            s.active = bool(data.get('active'))
+    except ValueError as e:
+        db.session.rollback()
+        return jsonify({'success': False, 'error': str(e)}), 400
+    if not s.title:
+        return jsonify({'success': False, 'error': 'Give the schedule a title.'}), 400
+    if sid is None:
+        db.session.add(s)
+    db.session.commit()
+    if s.assignee_id and s.assignee_id != user.id and sid is None:
+        _in_notify(_in_user_target(s.assignee_id), f'Inspection assigned: {s.title[:120]}',
+                   f'{s.frequency.capitalize()}, first due {s.next_due.isoformat()}' + (f' at {s.site}' if s.site else '') + '.', '/inspections?tab=todo')
+    return jsonify({'success': True, 'data': _in_schedule_dict(s, _in_names([s.assignee_id]), today)}), 201 if sid is None else 200
+
+
+# ------------------------------------------------------------------------------------------- actions
+@app.route('/api/inspections/actions', methods=['GET'])
+@jwt_required
+def in_actions_route():
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    q = InspectionAction.query.filter(InspectionAction.company_id == user.company_id)
+    if not _rc_staff(user) or request.args.get('mine') == '1':
+        q = q.filter(InspectionAction.assignee_id == user.id)
+    st = request.args.get('status', 'open')
+    if st in ('open', 'done', 'verified'):
+        q = q.filter(InspectionAction.status == st)
+    rows = q.order_by(InspectionAction.due_date.is_(None), InspectionAction.due_date, InspectionAction.id).limit(300).all()
+    names = _in_names([r.assignee_id for r in rows] + [r.done_by for r in rows])
+    titles = {i.id: i.title for i in Inspection.query.filter(Inspection.id.in_({r.inspection_id for r in rows} or {0})).all()}
+    out = []
+    for r in rows:
+        d = _in_action_dict(r, names)
+        d['inspection_title'] = titles.get(r.inspection_id)
+        out.append(d)
+    return jsonify({'success': True, 'data': out, 'can_manage': _rc_staff(user)}), 200
+
+
+@app.route('/api/inspections/actions/<int:aid>', methods=['PUT'])
+@jwt_required
+def in_action_update_route(aid):
+    user = request.user
+    a = db.session.get(InspectionAction, aid)
+    if not a or a.company_id != user.company_id:
+        return jsonify({'success': False, 'error': 'Action not found.'}), 404
+    staff = _rc_staff(user)
+    if not staff and a.assignee_id != user.id:
+        return jsonify({'success': False, 'error': 'This action is assigned to someone else.'}), 403
+    data = _in_body()
+    op = data.get('op')
+    now = datetime.utcnow()
+    if op == 'done':
+        if a.status != 'open':
+            return jsonify({'success': False, 'error': 'This action is already closed.'}), 409
+        note = _rc_text(data.get('note'), 2000)
+        if len(note) < 3:
+            return jsonify({'success': False, 'error': 'Say what was done.'}), 400
+        a.status, a.done_note, a.done_by, a.done_at = 'done', note, user.id, now
+    elif op == 'verify':
+        if not staff:
+            return jsonify({'success': False, 'error': 'Supervisors verify actions.'}), 403
+        if a.status != 'done':
+            return jsonify({'success': False, 'error': 'Only a done action can be verified.'}), 409
+        if a.done_by == user.id:
+            return jsonify({'success': False, 'error': 'Someone other than the person who did the work must verify it.'}), 409
+        a.status, a.verified_by, a.verified_at = 'verified', user.id, now
+    elif op == 'reopen':
+        if not staff:
+            return jsonify({'success': False, 'error': 'Supervisors reopen actions.'}), 403
+        a.status, a.verified_by, a.verified_at, a.notified_on = 'open', None, None, None
+        a.detail = ((a.detail or '') + f'\nReopened {now.strftime("%d %b %Y")}: ' + (_rc_text(data.get('note'), 500) or 'not fixed'))[:4000]
+    elif op == 'edit':
+        if not staff:
+            return jsonify({'success': False, 'error': 'Supervisors change actions.'}), 403
+        try:
+            if 'assignee_id' in data:
+                before = a.assignee_id
+                a.assignee_id = _in_user_in_company(user.company_id, data.get('assignee_id'))
+                if a.assignee_id and a.assignee_id != before and a.assignee_id != user.id:
+                    _in_notify(_in_user_target(a.assignee_id), f'Action for you: {a.title[:120]}',
+                               'Assigned to you' + (f', due {a.due_date.isoformat()}' if a.due_date else '') + '.', '/inspections?tab=actions', a.priority)
+            if 'due_date' in data:
+                a.due_date, a.notified_on = _ct_date(data.get('due_date')), None
+            if 'title' in data and _rc_text(data.get('title'), 300):
+                a.title = _rc_text(data.get('title'), 300)
+            if data.get('priority') in ('critical', 'high', 'medium'):
+                a.priority = data['priority']
+        except ValueError as e:
+            db.session.rollback()
+            return jsonify({'success': False, 'error': str(e)}), 400
+    else:
+        return jsonify({'success': False, 'error': 'Unknown change.'}), 400
+    db.session.commit()
+    return jsonify({'success': True, 'data': _in_action_dict(a)}), 200
+
+
+# ------------------------------------------------------------------------------------------- insights
+@app.route('/api/inspections/stats', methods=['GET'])
+@jwt_required
+def in_stats_route():
+    user = request.user
+    deny = _in_staff_403(user)
+    if deny:
+        return deny
+    try:
+        days = min(366, max(7, int(request.args.get('days', 90))))
+    except ValueError:
+        days = 90
+    since = datetime.utcnow() - timedelta(days=days)
+    today = datetime.utcnow().date()
+    done = (Inspection.query.filter(Inspection.company_id == user.company_id, Inspection.status == 'completed', Inspection.completed_at >= since)
+            .order_by(Inspection.completed_at).all())
+    fails, by_title = {}, {}
+    for ins in done:
+        items = {it['id']: it for it in _tbt_json(ins.items, [])}
+        _p, _f, _c, bad = _in_eval(list(items.values()), _tbt_json(ins.answers, {}))
+        for it in bad:
+            key = it['text'][:140]
+            fails[key] = fails.get(key, 0) + 1
+        b = by_title.setdefault(ins.title, {'title': ins.title, 'count': 0, 'score': 0, 'max': 0})
+        b['count'] += 1
+        b['score'] += ins.score or 0
+        b['max'] += ins.max_score or 0
+    acts = InspectionAction.query.filter(InspectionAction.company_id == user.company_id).all()
+    scheds = InspectionSchedule.query.filter(InspectionSchedule.company_id == user.company_id, InspectionSchedule.active.is_(True)).all()
+    total_s = sum(i.score or 0 for i in done)
+    total_m = sum(i.max_score or 0 for i in done)
+    closed = [a for a in acts if a.done_at and a.created_at]
+    weeks = {}
+    for ins in done:
+        wk = (ins.completed_at.date() - timedelta(days=ins.completed_at.weekday())).isoformat()
+        weeks[wk] = weeks.get(wk, 0) + 1
+    return jsonify({'success': True, 'data': {
+        'days': days, 'completed': len(done), 'average_score': round(100 * total_s / total_m) if total_m else None,
+        'with_failures': sum(1 for i in done if i.failed_count), 'critical_findings': sum(i.critical_failed or 0 for i in done),
+        'in_progress': Inspection.query.filter(Inspection.company_id == user.company_id, Inspection.status == 'in_progress').count(),
+        'schedules_overdue': sum(1 for s in scheds if s.next_due < today), 'schedules_active': len(scheds),
+        'actions_open': sum(1 for a in acts if a.status == 'open'),
+        'actions_overdue': sum(1 for a in acts if a.status == 'open' and a.due_date and a.due_date < today),
+        'actions_awaiting_verification': sum(1 for a in acts if a.status == 'done'),
+        'avg_days_to_close': round(sum((a.done_at - a.created_at).total_seconds() for a in closed) / 86400 / len(closed), 1) if closed else None,
+        'top_failures': [{'text': k, 'count': v} for k, v in sorted(fails.items(), key=lambda kv: -kv[1])[:10]],
+        'by_checklist': sorted([{'title': b['title'], 'count': b['count'], 'percent': round(100 * b['score'] / b['max']) if b['max'] else None}
+                                for b in by_title.values()], key=lambda r: -r['count'])[:15],
+        'per_week': [{'week': k, 'count': v} for k, v in sorted(weeks.items())],
+    }}), 200
+
+
+@app.route('/api/inspections/people', methods=['GET'])
+@jwt_required
+def in_people_route():
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    rows = [u for u in _TbtUser.query.filter(_TbtUser.company_id == user.company_id).all() if getattr(u, 'is_active', True) is not False]
+    return jsonify({'success': True, 'data': sorted([{'id': u.id, 'name': _rc_text(getattr(u, 'name', None) or getattr(u, 'email', None) or f'User {u.id}', 160)}
+                                                     for u in rows], key=lambda r: r['name'].lower())}), 200
+
+
+# ------------------------------------------------------------------------------------------- reminders
+def _in_reminders(today=None):
+    """Once a day at most per item: schedules due today or overdue, and open actions due tomorrow or overdue."""
+    today = today or datetime.utcnow().date()
+    sent = 0
+    rows = (InspectionSchedule.query.filter(InspectionSchedule.active.is_(True), InspectionSchedule.next_due <= today,
+                                            or_(InspectionSchedule.notified_on.is_(None), InspectionSchedule.notified_on < today)).limit(500).all())
+    for s in rows:
+        claimed = (InspectionSchedule.query.filter(InspectionSchedule.id == s.id,
+                                                   or_(InspectionSchedule.notified_on.is_(None), InspectionSchedule.notified_on < today))
+                   .update({'notified_on': today}, synchronize_session=False))
+        db.session.commit()
+        if not claimed:
+            continue
+        late = (today - s.next_due).days
+        targets = _in_user_target(s.assignee_id) if s.assignee_id else [(u.id, getattr(u, 'email', None)) for u in _rc_staff_users(s.company_id)]
+        _in_notify(targets, f'Inspection {"overdue" if late else "due today"}: {s.title[:120]}',
+                   (f'{late} day(s) overdue' if late else 'Due today') + (f' at {s.site}' if s.site else '') + '.', '/inspections?tab=todo',
+                   'high' if late else 'medium', email=late >= 3)
+        sent += 1
+    acts = (InspectionAction.query.filter(InspectionAction.status == 'open', InspectionAction.due_date.isnot(None),
+                                          InspectionAction.due_date <= today + timedelta(days=1),
+                                          or_(InspectionAction.notified_on.is_(None), InspectionAction.notified_on < today)).limit(500).all())
+    for a in acts:
+        claimed = (InspectionAction.query.filter(InspectionAction.id == a.id,
+                                                 or_(InspectionAction.notified_on.is_(None), InspectionAction.notified_on < today))
+                   .update({'notified_on': today}, synchronize_session=False))
+        db.session.commit()
+        if not claimed:
+            continue
+        late = (today - a.due_date).days
+        targets = _in_user_target(a.assignee_id) if a.assignee_id else [(u.id, getattr(u, 'email', None)) for u in _rc_staff_users(a.company_id)]
+        _in_notify(targets, f'Action {"overdue" if late > 0 else "due"}: {a.title[:120]}',
+                   f'{late} day(s) overdue.' if late > 0 else 'Due today.' if late == 0 else 'Due tomorrow.', '/inspections?tab=actions',
+                   'high' if late > 0 else a.priority, email=late >= 3)
+        sent += 1
+    return sent
+
+
+def _in_watch_loop():
+    time.sleep(420)
+    while True:
+        try:
+            with app.app_context():
+                _in_reminders()
+        except Exception as e:
+            logger.error(f'inspection reminder watcher: {e}')
+        finally:
+            try:
+                with app.app_context():
+                    db.session.remove()
+            except Exception:
+                pass
+        time.sleep(3 * 3600)
+
+
+if os.environ.get('READY_CHECK_WATCHER', '1') == '1':
+    threading.Thread(target=_in_watch_loop, name='inspection-reminder-watcher', daemon=True).start()
+
+
 # =====================================================================================================
 # AUTO MIGRATIONS (2026-11-23)
 # Railway's Data tab appends LIMIT to every query, so CREATE/ALTER statements fail there. Instead the
@@ -170521,7 +171656,7 @@ def dcp_decide_cr(rid):
 #   - a failing statement is logged and the file is retried on the next start
 # Set AUTO_MIGRATE=0 on Railway to switch this off.
 # =====================================================================================================
-AUTO_MIGRATIONS = ('DEPLOY_2026-11-23_FULL.sql', '2026-11-24_company_quotes.sql', '2026-11-25_ready_checks.sql', '2026-11-26_muster_contractors.sql', '2026-11-27_document_control_plus.sql')
+AUTO_MIGRATIONS = ('DEPLOY_2026-11-23_FULL.sql', '2026-11-24_company_quotes.sql', '2026-11-25_ready_checks.sql', '2026-11-26_muster_contractors.sql', '2026-11-27_document_control_plus.sql', '2026-11-27_inspections.sql')
 _MIGRATION_LOCK_KEY = 74230115
 
 
