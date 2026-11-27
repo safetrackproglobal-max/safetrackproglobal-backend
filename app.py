@@ -178261,6 +178261,798 @@ IN_LIBRARY.update({
 })
 
 
+# ============================================================================
+# CHEMICAL SAFETY PART 3: NEW-CHEMICAL APPROVAL, EXPOSURE MONITORING, MAJOR-HAZARD THRESHOLDS, SPILL RESPONSE (2026-11-27)
+# ============================================================================
+# New-chemical approval: before a chemical is bought it is checked against what is stored where it will go (EPA chart),
+# against stock already on site, for CMR hazards that need a substitution reason, for the major-hazard thresholds and for
+# the SDS date; a second person approves and the approved chemical goes into the register in one step.
+# Exposure: air samples (TWA from periods, STEL) against the limit from the SDS / country rule, the mixture index
+# (sum C/OEL, for substances acting on the same organ) and group statistics. Health data: supervisors see everyone.
+# Major-hazard thresholds: register quantities in tonnes against Seveso III (Directive 2012/18/EU Annex I, Parts 1 and 2,
+# note 4 aggregation) and pounds against OSHA PSM (29 CFR 1910.119 Appendix A, plus the 10,000 lb flammable rule).
+# Spill response: steps for one chemical from its GHS hazards, reactivity group, the SDS spill text and what is stored
+# next to it, and a spill report that notifies supervisors.
+# DB: chem_requests, chem_exposures, chem_mh_classes, chem_spills -> sql/2026-11-27_chemical_part3.sql (auto migration)
+
+
+class ChemRequest(db.Model):
+    __tablename__ = 'chem_requests'
+    __table_args__ = {'extend_existing': True}
+    id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id', ondelete='CASCADE'), nullable=False, index=True)
+    substance_id = db.Column(db.Integer, db.ForeignKey('chem_substances.id', ondelete='SET NULL'), nullable=True)
+    name = db.Column(db.String(200), nullable=False)
+    cas = db.Column(db.String(40))
+    supplier = db.Column(db.String(160))
+    purpose = db.Column(db.String(1000), nullable=False)
+    location = db.Column(db.String(160), nullable=False)
+    quantity = db.Column(db.Float)
+    unit = db.Column(db.String(12))
+    groups = db.Column(db.Text)                                              # JSON EPA groups
+    sds_date = db.Column(db.Date)
+    alternative = db.Column(db.String(1000))
+    controls = db.Column(db.String(1000))
+    checks = db.Column(db.Text)                                              # JSON result of the automatic checks at submit
+    status = db.Column(db.String(10), nullable=False, default='submitted')  # submitted | approved | rejected | added
+    decision_note = db.Column(db.String(1000))
+    decided_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    decided_at = db.Column(db.DateTime)
+    item_id = db.Column(db.Integer, db.ForeignKey('chem_items.id', ondelete='SET NULL'), nullable=True)
+    requested_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+
+class ChemExposure(db.Model):
+    __tablename__ = 'chem_exposures'
+    __table_args__ = {'extend_existing': True}
+    id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id', ondelete='CASCADE'), nullable=False, index=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    person = db.Column(db.String(120), nullable=False)
+    seg = db.Column(db.String(120), nullable=False)
+    item_id = db.Column(db.Integer, db.ForeignKey('chem_items.id', ondelete='SET NULL'), nullable=True)
+    substance = db.Column(db.String(200), nullable=False)
+    cas = db.Column(db.String(40))
+    kind = db.Column(db.String(4), nullable=False)                           # twa | stel
+    unit = db.Column(db.String(6), nullable=False)                           # ppm | mg/m3
+    periods = db.Column(db.Text, nullable=False)                             # JSON [{conc, minutes}]
+    value = db.Column(db.Float, nullable=False)                              # 8-h TWA or the 15-min result
+    limit = db.Column(db.Float, nullable=False)
+    limit_source = db.Column(db.String(200))
+    ratio = db.Column(db.Float, nullable=False)
+    result = db.Column(db.String(8), nullable=False)                         # below | action | over
+    sampled_on = db.Column(db.Date, nullable=False)
+    note = db.Column(db.String(500))
+    created_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+
+class ChemMhClass(db.Model):
+    __tablename__ = 'chem_mh_classes'
+    __table_args__ = {'extend_existing': True}
+    item_id = db.Column(db.Integer, db.ForeignKey('chem_items.id', ondelete='CASCADE'), primary_key=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id', ondelete='CASCADE'), nullable=False, index=True)
+    seveso_cats = db.Column(db.Text)                                         # JSON list of Part 1 keys
+    seveso_named = db.Column(db.String(10))                                  # Part 2 key
+    psm_key = db.Column(db.String(10))                                       # Appendix A key or 'flammable'
+    conv_kg = db.Column(db.Float)                                            # density kg/L for volumes, kg per cylinder / drum
+    set_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    set_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+
+class ChemSpill(db.Model):
+    __tablename__ = 'chem_spills'
+    __table_args__ = {'extend_existing': True}
+    id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id', ondelete='CASCADE'), nullable=False, index=True)
+    item_id = db.Column(db.Integer, db.ForeignKey('chem_items.id', ondelete='SET NULL'), nullable=True)
+    chemical = db.Column(db.String(200), nullable=False)
+    location = db.Column(db.String(160))
+    size = db.Column(db.String(6), nullable=False)                           # small | large
+    amount = db.Column(db.String(60))
+    description = db.Column(db.String(1000))
+    injuries = db.Column(db.Boolean, nullable=False, default=False)
+    reached_drain = db.Column(db.Boolean, nullable=False, default=False)
+    status = db.Column(db.String(6), nullable=False, default='open')        # open | closed
+    close_note = db.Column(db.String(1000))
+    reported_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    reported_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    closed_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    closed_at = db.Column(db.DateTime)
+
+
+# Seveso III, Directive 2012/18/EU Annex I Part 1: category -> (description, group, lower-tier t, upper-tier t)
+CS_SEVESO_P1 = {
+    'H1': ('Acute toxic Category 1, all exposure routes', 'health', 5, 20),
+    'H2': ('Acute toxic Category 2 (all routes) or Category 3 (inhalation)', 'health', 50, 200),
+    'H3': ('STOT single exposure Category 1', 'health', 50, 200),
+    'P1a': ('Explosives (unstable, Div. 1.1, 1.2, 1.3, 1.5, 1.6)', 'physical', 10, 50),
+    'P1b': ('Explosives Div. 1.4', 'physical', 50, 200),
+    'P2': ('Flammable gases Category 1 or 2', 'physical', 10, 50),
+    'P3a': ('Flammable aerosols containing flammable gases Cat 1/2 or flammable liquids Cat 1 (net)', 'physical', 150, 500),
+    'P3b': ('Flammable aerosols, other (net)', 'physical', 5000, 50000),
+    'P4': ('Oxidising gases Category 1', 'physical', 50, 200),
+    'P5a': ('Flammable liquids Category 1, or Cat 2/3 kept above boiling point', 'physical', 10, 50),
+    'P5b': ('Flammable liquids Cat 2/3 under process conditions that may create a major-accident hazard', 'physical', 50, 200),
+    'P5c': ('Flammable liquids Category 2 or 3 (other)', 'physical', 5000, 50000),
+    'P6a': ('Self-reactive substances / organic peroxides Type A or B', 'physical', 10, 50),
+    'P6b': ('Self-reactive substances / organic peroxides Type C to F', 'physical', 50, 200),
+    'P7': ('Pyrophoric liquids or solids Category 1', 'physical', 50, 200),
+    'P8': ('Oxidising liquids or solids Category 1, 2 or 3', 'physical', 50, 200),
+    'E1': ('Hazardous to the aquatic environment, Acute 1 or Chronic 1', 'environment', 100, 200),
+    'E2': ('Hazardous to the aquatic environment, Chronic 2', 'environment', 200, 500),
+    'O1': ('Hazard statement EUH014 (reacts violently with water)', None, 100, 500),
+    'O2': ('In contact with water emits flammable gases, Category 1', None, 100, 500),
+    'O3': ('Hazard statement EUH029 (contact with water liberates toxic gas)', None, 50, 200),
+}
+# Annex I Part 2 named substances: key -> (name, CAS list, lower t, upper t)
+CS_SEVESO_P2 = {
+    'n09': ('Bromine', ['7726-95-6'], 20, 100), 'n10': ('Chlorine', ['7782-50-5'], 10, 25), 'n13': ('Fluorine', ['7782-41-4'], 10, 20),
+    'n14': ('Formaldehyde (concentration >= 90%)', ['50-00-0'], 5, 50), 'n15': ('Hydrogen', ['1333-74-0'], 5, 50),
+    'n16': ('Hydrogen chloride (liquefied gas)', ['7647-01-0'], 25, 250), 'n18': ('Liquefied flammable gases Cat 1 or 2 (including LPG) and natural gas', [], 50, 200),
+    'n19': ('Acetylene', ['74-86-2'], 5, 50), 'n20': ('Ethylene oxide', ['75-21-8'], 5, 50), 'n21': ('Propylene oxide', ['75-56-9'], 5, 50),
+    'n22': ('Methanol', ['67-56-1'], 500, 5000), 'n24': ('Methylisocyanate', ['624-83-9'], 0.15, 0.15), 'n25': ('Oxygen', ['7782-44-7'], 200, 2000),
+    'n26': ('Toluene diisocyanate (2,4- and 2,6-)', ['584-84-9', '91-08-7'], 10, 100), 'n27': ('Carbonyl dichloride (phosgene)', ['75-44-5'], 0.3, 0.75),
+    'n28': ('Arsine', ['7784-42-1'], 0.2, 1), 'n29': ('Phosphine', ['7803-51-2'], 0.2, 1), 'n31': ('Sulphur trioxide', ['7446-11-9'], 15, 75),
+    'n34': ('Petroleum products and alternative fuels (gasolines, kerosenes, gas oils incl. diesel, heavy fuel oils)', [], 2500, 25000),
+    'n35': ('Anhydrous ammonia', ['7664-41-7'], 50, 200), 'n36': ('Boron trifluoride', ['7637-07-2'], 5, 20), 'n37': ('Hydrogen sulphide', ['7783-06-4'], 5, 20),
+    'n41': ('Sodium hypochlorite mixtures, Aquatic Acute 1, < 5% active chlorine', [], 200, 500),
+    'n03': ('Ammonium nitrate, technical grade (note 15)', [], 350, 2500), 'n02': ('Ammonium nitrate, fertiliser grade (note 14)', [], 1250, 5000),
+}
+# OSHA 29 CFR 1910.119 Appendix A threshold quantities (pounds), from osha.gov
+CS_PSM = {
+    'a01': ('Ammonia, anhydrous', ['7664-41-7'], 10000), 'a02': ('Ammonia solutions (>44% ammonia by weight)', [], 15000),
+    'a03': ('Arsine', ['7784-42-1'], 100), 'a04': ('Bromine', ['7726-95-6'], 1500), 'a05': ('Chlorine', ['7782-50-5'], 1500),
+    'a06': ('Chlorine dioxide', ['10049-04-4'], 1000), 'a07': ('Ethylene oxide', ['75-21-8'], 5000), 'a08': ('Fluorine', ['7782-41-4'], 1000),
+    'a09': ('Formaldehyde (formalin)', ['50-00-0'], 1000), 'a10': ('Hydrogen chloride / hydrochloric acid, anhydrous', ['7647-01-0'], 5000),
+    'a11': ('Hydrogen fluoride / hydrofluoric acid, anhydrous', ['7664-39-3'], 1000), 'a12': ('Hydrogen cyanide, anhydrous', ['74-90-8'], 1000),
+    'a13': ('Hydrogen peroxide (52% by weight or greater)', [], 7500), 'a14': ('Hydrogen sulfide', ['7783-06-4'], 1500),
+    'a15': ('Methyl isocyanate', ['624-83-9'], 250), 'a16': ('Nitric acid (94.5% by weight or greater)', [], 500), 'a17': ('Ozone', ['10028-15-6'], 100),
+    'a18': ('Phosgene (carbonyl chloride)', ['75-44-5'], 100), 'a19': ('Phosphine', ['7803-51-2'], 100), 'a20': ('Sulfur dioxide (liquid)', ['7446-09-5'], 1000),
+    'a21': ('Sulfur trioxide', ['7446-11-9'], 1000), 'a22': ('Acrolein', ['107-02-8'], 150), 'a23': ('Acetaldehyde', ['75-07-0'], 2500),
+    'a24': ('Oleum (65% to 80%)', ['8014-95-7'], 1000), 'a25': ('Perchloric acid (>60% by weight)', ['7601-90-3'], 5000),
+    'a26': ('Peracetic acid (>60%)', ['79-21-0'], 1000), 'a27': ('Phosphoryl chloride', ['10025-87-3'], 1000),
+    'flammable': ('Category 1 flammable gas or flammable liquid with flash point below 37.8 C (100 F), on site in one location', [], 10000),
+}
+CS_PSM_FLAMMABLE_NOTE = ('1910.119(a)(1)(ii) excludes hydrocarbon fuels used only as fuel for the workplace (e.g. propane for heating) and flammable '
+                         'liquids stored or transferred in atmospheric tanks below their normal boiling point without chilling; check your process.')
+# GHS hazard statement -> suggested Seveso Part 1 categories (confirm: acute toxicity statements do not say Category 1 or 2)
+CS_H_TO_SEVESO = {'H300': 'H1', 'H310': 'H1', 'H330': 'H1', 'H331': 'H2', 'H301': None, 'H370': 'H3', 'H200': 'P1a', 'H201': 'P1a', 'H202': 'P1a',
+                  'H203': 'P1a', 'H204': 'P1b', 'H220': 'P2', 'H221': 'P2', 'H222': 'P3a', 'H223': 'P3a', 'H270': 'P4', 'H224': 'P5a', 'H225': 'P5c',
+                  'H226': 'P5c', 'H240': 'P6a', 'H241': 'P6a', 'H242': 'P6b', 'H250': 'P7', 'H271': 'P8', 'H272': 'P8', 'H400': 'E1', 'H410': 'E1',
+                  'H411': 'E2', 'H260': 'O2', 'EUH014': 'O1', 'EUH029': 'O3'}
+CS_CMR = {'H340': 'may cause genetic defects', 'H341': 'suspected of causing genetic defects', 'H350': 'may cause cancer',
+          'H351': 'suspected of causing cancer', 'H360': 'may damage fertility or the unborn child', 'H361': 'suspected of damaging fertility or the unborn child'}
+CS_HIGH_TOX = {'H300', 'H310', 'H330', 'H334', 'H372'}
+CS_SDS_MAX_YEARS = 5
+CS_LB_PER_T = 2204.62
+
+
+def _cs_hcodes(sub):
+    d = _tbt_json(sub.data, {}) if sub else {}
+    out = set()
+    for h in ((d.get('ghs') or {}).get('h') or []):
+        for m in re.finditer(r'\b(EUH\d{3}|H\d{3})', h):
+            out.add(m.group(1))
+    return out
+
+
+def _cs_norm_cas(c):
+    return re.sub(r'\s+', '', c or '')
+
+
+def _cs_suggest_mh(name, cas, hcodes):
+    cas = _cs_norm_cas(cas)
+    named = next((k for k, v in CS_SEVESO_P2.items() if cas and cas in v[1]), None)
+    psm = next((k for k, v in CS_PSM.items() if cas and cas in v[1]), None)
+    cats = []
+    for h in sorted(hcodes):
+        c = CS_H_TO_SEVESO.get(h)
+        if c and c not in cats:
+            cats.append(c)
+    if not psm and hcodes & {'H220', 'H221', 'H224', 'H225'}:
+        psm = 'flammable'
+    return {'seveso_cats': cats, 'seveso_named': named, 'psm_key': psm}
+
+
+def _cs_tonnes(qty, unit, conv):
+    """(tonnes, problem). Volumes need density (kg/L); cylinders / drums need kg per container."""
+    if qty is None:
+        return None, 'No quantity in the register.'
+    u = (unit or '').strip().lower()
+    if u in ('kg',):
+        return qty / 1000.0, None
+    if u in ('g',):
+        return qty / 1e6, None
+    if u in ('t', 'tonne', 'tonnes'):
+        return qty, None
+    if u in ('l', 'ml', 'm³', 'm3'):
+        if not conv:
+            return None, 'Give the density (kg per litre) to convert the volume.'
+        litres = qty * {'l': 1, 'ml': 0.001, 'm³': 1000, 'm3': 1000}[u]
+        return litres * conv / 1000.0, None
+    if u in ('cylinders', 'drums') or not u:
+        if not conv:
+            return None, f'Give the kg per {"container" if not u else u[:-1]} to convert.'
+        return qty * conv / 1000.0, None
+    return None, f'Unit "{unit}" cannot be converted.'
+
+
+def _cs_mh_compute(cid, extra=None):
+    """Seveso III note 4 sums and OSHA PSM checks over the in-use register (plus an optional planned item)."""
+    items = ChemItem.query.filter_by(company_id=cid, status='in_use').all()
+    cls = {c.item_id: c for c in ChemMhClass.query.filter_by(company_id=cid).all()}
+    rows, problems = [], []
+    for it in items:
+        c = cls.get(it.id)
+        if not c:
+            continue
+        t, prob = _cs_tonnes(it.quantity, it.unit, c.conv_kg)
+        r = {'item_id': it.id, 'name': it.name, 'location': it.location, 'tonnes': t, 'cats': _tbt_json(c.seveso_cats, []), 'named': c.seveso_named, 'psm': c.psm_key}
+        if prob:
+            problems.append({'item_id': it.id, 'name': it.name, 'problem': prob})
+        else:
+            rows.append(r)
+    if extra:
+        rows.append(extra)
+    sums = {g: {'lower': 0.0, 'upper': 0.0, 'parts': []} for g in ('health', 'physical', 'environment')}
+    single = []
+    for r in rows:
+        if r['tonnes'] is None:
+            continue
+        if r['named'] in CS_SEVESO_P2:
+            n = CS_SEVESO_P2[r['named']]
+            ql, qu = n[2], n[3]
+            if r['tonnes'] >= ql:
+                single.append({'name': r['name'], 'tonnes': round(r['tonnes'], 3), 'lower': ql, 'upper': qu, 'basis': n[0]})
+        for cat in r['cats']:
+            if cat not in CS_SEVESO_P1:
+                continue
+            _, grp, ql, qu = CS_SEVESO_P1[cat]
+            if r['named'] in CS_SEVESO_P2:
+                ql, qu = CS_SEVESO_P2[r['named']][2], CS_SEVESO_P2[r['named']][3]
+            if not grp:
+                if r['tonnes'] >= ql:
+                    single.append({'name': r['name'], 'tonnes': round(r['tonnes'], 3), 'lower': ql, 'upper': qu, 'basis': f'{cat} {CS_SEVESO_P1[cat][0]}'})
+                continue
+            s = sums[grp]
+            s['lower'] += r['tonnes'] / ql
+            s['upper'] += r['tonnes'] / qu
+            s['parts'].append({'name': r['name'], 'cat': cat, 'tonnes': round(r['tonnes'], 3), 'share_lower': round(r['tonnes'] / ql, 4), 'planned': bool(r.get('planned'))})
+    tier = 'none'
+    if any(s['upper'] >= 1 for s in sums.values()) or any(x['tonnes'] >= x['upper'] for x in single):
+        tier = 'upper'
+    elif any(s['lower'] >= 1 for s in sums.values()) or single:
+        tier = 'lower'
+    for s in sums.values():
+        s['lower'], s['upper'] = round(s['lower'], 4), round(s['upper'], 4)
+        s['parts'].sort(key=lambda p: -p['share_lower'])
+    psm_hits = {}
+    for r in rows:
+        if r['psm'] not in CS_PSM or r['tonnes'] is None:
+            continue
+        key = (r['psm'], _mn_norm(r['location']) if r['psm'] == 'flammable' else '')
+        h = psm_hits.setdefault(key, {'key': r['psm'], 'name': CS_PSM[r['psm']][0], 'tq_lb': CS_PSM[r['psm']][2], 'lb': 0.0, 'items': [],
+                                      'location': r['location'] if r['psm'] == 'flammable' else None})
+        h['lb'] += r['tonnes'] * CS_LB_PER_T
+        h['items'].append(r['name'])
+    psm = []
+    for h in psm_hits.values():
+        h['lb'] = round(h['lb'], 1)
+        h['over'] = h['lb'] >= h['tq_lb']
+        h['pct'] = round(h['lb'] / h['tq_lb'] * 100, 1)
+        psm.append(h)
+    psm.sort(key=lambda h: -h['pct'])
+    return {'tier': tier, 'sums': sums, 'single': single, 'psm': psm, 'problems': problems, 'classified': len(rows) - (1 if extra else 0)}
+
+
+# ---------------------------------------------------------------- major-hazard thresholds
+@app.route('/api/chem/major-hazard', methods=['GET'])
+@jwt_required
+def cs_major_hazard():
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    res = _cs_mh_compute(user.company_id)
+    items = ChemItem.query.filter_by(company_id=user.company_id, status='in_use').order_by(ChemItem.name).all()
+    cls = {c.item_id: c for c in ChemMhClass.query.filter_by(company_id=user.company_id).all()}
+    subs = {s.id: s for s in ChemSubstance.query.filter(ChemSubstance.id.in_({i.substance_id for i in items if i.substance_id} or {0})).all()}
+    lst = []
+    for it in items:
+        c = cls.get(it.id)
+        sug = _cs_suggest_mh(it.name, it.cas, _cs_hcodes(subs.get(it.substance_id)))
+        lst.append({'id': it.id, 'name': it.name, 'cas': it.cas, 'location': it.location, 'quantity': it.quantity, 'unit': it.unit,
+                    'classified': bool(c), 'seveso_cats': _tbt_json(c.seveso_cats, []) if c else [], 'seveso_named': c.seveso_named if c else None,
+                    'psm_key': c.psm_key if c else None, 'conv_kg': c.conv_kg if c else None, 'suggested': sug})
+    return jsonify({'success': True, 'data': res, 'items': lst, 'can_manage': bool(_rc_staff(user)),
+                    'seveso_p1': [{'id': k, 'name': v[0], 'group': v[1], 'lower': v[2], 'upper': v[3]} for k, v in CS_SEVESO_P1.items()],
+                    'seveso_p2': [{'id': k, 'name': v[0], 'lower': v[2], 'upper': v[3]} for k, v in CS_SEVESO_P2.items()],
+                    'psm_list': [{'id': k, 'name': v[0], 'tq_lb': v[2]} for k, v in CS_PSM.items()],
+                    'psm_note': CS_PSM_FLAMMABLE_NOTE,
+                    'sources': ['Directive 2012/18/EU (Seveso III) Annex I Parts 1 and 2, note 4', 'OSHA 29 CFR 1910.119 Appendix A and (a)(1)(ii)']}), 200
+
+
+@app.route('/api/chem/major-hazard/<int:iid>', methods=['PUT'])
+@jwt_required
+def cs_major_hazard_set(iid):
+    user = request.user
+    deny = _cs_staff_403(user)
+    if deny:
+        return deny
+    it = _cs_item(user, iid)
+    if not it:
+        return jsonify({'success': False, 'error': 'Chemical not found.'}), 404
+    data = _in_body()
+    if data.get('clear'):
+        ChemMhClass.query.filter_by(item_id=it.id).delete()
+        db.session.commit()
+        return jsonify({'success': True}), 200
+    cats = [c for c in (data.get('seveso_cats') or []) if c in CS_SEVESO_P1]
+    named = data.get('seveso_named') or None
+    psm = data.get('psm_key') or None
+    if named and named not in CS_SEVESO_P2 or psm and psm not in CS_PSM:
+        return jsonify({'success': False, 'error': 'Unknown listed substance.'}), 400
+    try:
+        conv = float(data['conv_kg']) if data.get('conv_kg') not in (None, '') else None
+    except (TypeError, ValueError):
+        return jsonify({'success': False, 'error': 'Density / kg per container must be a number.'}), 400
+    if conv is not None and not (0 < conv <= 100000):
+        return jsonify({'success': False, 'error': 'Density / kg per container out of range.'}), 400
+    if not cats and not named and not psm:
+        return jsonify({'success': False, 'error': 'Choose at least one category or listed substance, or clear the classification.'}), 400
+    c = db.session.get(ChemMhClass, it.id) or ChemMhClass(item_id=it.id, company_id=it.company_id)
+    c.seveso_cats, c.seveso_named, c.psm_key, c.conv_kg, c.set_by, c.set_at = json.dumps(cats), named, psm, conv, user.id, datetime.utcnow()
+    db.session.add(c)
+    db.session.commit()
+    t, prob = _cs_tonnes(it.quantity, it.unit, conv)
+    return jsonify({'success': True, 'tonnes': t, 'problem': prob, 'data': _cs_mh_compute(user.company_id)}), 200
+
+
+# ---------------------------------------------------------------- new-chemical approval
+def _cs_request_checks(cid, name, cas, location, groups, hcodes, sds_date, alternative, controls, quantity, unit, mh_extra=None):
+    out = []      # [{level: block|warn|ok, text}]
+    loc_key = re.sub(r'\s+', ' ', (location or '').strip().lower())
+    here = [i for i in ChemItem.query.filter_by(company_id=cid, status='in_use').all() if re.sub(r'\s+', ' ', (i.location or '').strip().lower()) == loc_key]
+    worst = []
+    for it in here:
+        for ga in groups:
+            for gb in _tbt_json(it.groups, []):
+                c = _cs_pair(ga, gb)
+                if c and _cs_rank(c) >= 1:
+                    worst.append((_cs_rank(c), it.name, _cs_explain(c)))
+    worst.sort(key=lambda w: -w[0])
+    if not groups:
+        out.append({'level': 'warn', 'text': 'No reactivity group: storage compatibility cannot be checked. Choose the EPA group(s).'})
+    elif worst:
+        top = worst[0]
+        out.append({'level': 'block' if top[0] >= 3 else 'warn', 'text': f'Storage at {location}: {top[1]} is stored there ({top[2]}).'
+                    + (f' {len(worst) - 1} more conflict(s).' if len(worst) > 1 else '')})
+        better = []
+        locs = {}
+        for i in ChemItem.query.filter_by(company_id=cid, status='in_use').all():
+            if i.location:
+                locs.setdefault(re.sub(r'\s+', ' ', i.location.strip().lower()), [i.location, []])[1].append(i)
+        for k, (label, rows) in locs.items():
+            if k == loc_key:
+                continue
+            if not any(_cs_pair(ga, gb) for it in rows for ga in groups for gb in _tbt_json(it.groups, [])):
+                better.append(label)
+        if better:
+            out.append({'level': 'ok', 'text': f'No listed reaction with what is stored at: {", ".join(better[:5])}.'})
+    else:
+        out.append({'level': 'ok', 'text': f'No listed reaction with the {len(here)} chemical(s) stored at {location}.'})
+    nc = _cs_norm_cas(cas)
+    dup = [i for i in ChemItem.query.filter_by(company_id=cid, status='in_use').all() if (nc and _cs_norm_cas(i.cas) == nc) or i.name.strip().lower() == (name or '').strip().lower()]
+    if dup:
+        out.append({'level': 'warn', 'text': 'Already on site: ' + '; '.join(f'{d.name} at {d.location or "?"} ({d.quantity or "?"} {d.unit or ""})' for d in dup[:4]) + '. Use the existing stock first.'})
+    cmr = sorted(h for h in hcodes if h in CS_CMR)
+    if cmr:
+        txt = f'CMR hazard ({", ".join(f"{h} {CS_CMR[h]}" for h in cmr)}): a safer alternative must be considered first.'
+        out.append({'level': 'block' if len((alternative or '').strip()) < 20 else 'warn', 'text': txt + ('' if len((alternative or '').strip()) >= 20 else ' Explain the alternatives looked at.')})
+    tox = sorted(hcodes & CS_HIGH_TOX)
+    if tox and len((controls or '').strip()) < 10:
+        out.append({'level': 'block', 'text': f'Highly toxic or sensitising ({", ".join(tox)}): describe the controls (enclosure, extraction, respirators).'})
+    if sds_date is None:
+        out.append({'level': 'block', 'text': 'Get the supplier SDS before approval and give its revision date.'})
+    elif sds_date < datetime.utcnow().date().replace(year=datetime.utcnow().year - CS_SDS_MAX_YEARS):
+        out.append({'level': 'warn', 'text': f'The SDS is dated {sds_date.isoformat()}, more than {CS_SDS_MAX_YEARS} years ago: ask the supplier for the current version.'})
+    if mh_extra:
+        before, after = _cs_mh_compute(cid), _cs_mh_compute(cid, mh_extra)
+        if after['tier'] != before['tier']:
+            out.append({'level': 'block', 'text': f'This quantity would make the site a Seveso {after["tier"]}-tier establishment (now: {before["tier"]}).'})
+        over = [p for p in after['psm'] if p['over'] and not any(b['key'] == p['key'] and b['over'] and b.get('location') == p.get('location') for b in before['psm'])]
+        if over:
+            out.append({'level': 'block', 'text': f'This quantity would bring {over[0]["name"]} to {over[0]["lb"]:g} lb, at or above the OSHA PSM threshold {over[0]["tq_lb"]:g} lb.'})
+    return out
+
+
+def _cs_req_dict(r, names):
+    return {'id': r.id, 'name': r.name, 'cas': r.cas, 'supplier': r.supplier, 'purpose': r.purpose, 'location': r.location, 'quantity': r.quantity,
+            'unit': r.unit, 'groups': _tbt_json(r.groups, []), 'sds_date': r.sds_date.isoformat() if r.sds_date else None, 'alternative': r.alternative,
+            'controls': r.controls, 'checks': _tbt_json(r.checks, []), 'status': r.status, 'decision_note': r.decision_note, 'decided_by': names.get(r.decided_by),
+            'decided_at': _in_iso(r.decided_at), 'item_id': r.item_id, 'requested_by': names.get(r.requested_by), 'requested_by_id': r.requested_by,
+            'created_at': _in_iso(r.created_at), 'blocked': any(c['level'] == 'block' for c in _tbt_json(r.checks, []))}
+
+
+def _cs_req_inputs(user, data):
+    name = _rc_text(data.get('name'), 200)
+    if len(name) < 2:
+        raise ValueError('Give the chemical name.')
+    purpose = _rc_text(data.get('purpose'), 1000)
+    if len(purpose) < 5:
+        raise ValueError('Say what it is needed for.')
+    location = _mn_area(data.get('location'))
+    if len(location) < 2:
+        raise ValueError('Say where it will be stored.')
+    groups = [str(g) for g in (data.get('groups') or []) if str(g) in CS_EPA_GROUPS]
+    q = data.get('quantity')
+    q = None if q in (None, '') else float(q)
+    if q is not None and not (0 <= q <= 1e9):
+        raise ValueError('Quantity out of range.')
+    sub = None
+    if data.get('substance_id'):
+        sub = db.session.get(ChemSubstance, int(data['substance_id'])) if str(data['substance_id']).isdigit() else None
+    sds = _ct_date(data.get('sds_date')) if data.get('sds_date') else None
+    if sds and sds > datetime.utcnow().date():
+        raise ValueError('The SDS date cannot be in the future.')
+    conv = data.get('conv_kg')
+    conv = None if conv in (None, '') else float(conv)
+    return {'name': name, 'cas': _rc_text(data.get('cas'), 40) or (sub.cas if sub else None), 'supplier': _rc_text(data.get('supplier'), 160) or None,
+            'purpose': purpose, 'location': location, 'quantity': q, 'unit': _rc_text(data.get('unit'), 12) or None, 'groups': groups, 'sds_date': sds,
+            'alternative': _rc_text(data.get('alternative'), 1000) or None, 'controls': _rc_text(data.get('controls'), 1000) or None, 'sub': sub, 'conv': conv}
+
+
+def _cs_req_run_checks(user, v):
+    hcodes = _cs_hcodes(v['sub'])
+    extra = None
+    sug = _cs_suggest_mh(v['name'], v['cas'], hcodes)
+    if v['quantity'] is not None and (sug['seveso_cats'] or sug['seveso_named'] or sug['psm_key']):
+        t, _ = _cs_tonnes(v['quantity'], v['unit'], v['conv'])
+        if t is not None:
+            extra = {'item_id': None, 'name': f'{v["name"]} (requested)', 'location': v['location'], 'tonnes': t, 'cats': sug['seveso_cats'],
+                     'named': sug['seveso_named'], 'psm': sug['psm_key'], 'planned': True}
+    checks = _cs_request_checks(user.company_id, v['name'], v['cas'], v['location'], v['groups'], hcodes, v['sds_date'], v['alternative'], v['controls'],
+                                v['quantity'], v['unit'], extra)
+    if v['sub'] is None:
+        checks.append({'level': 'warn', 'text': 'Not looked up in PubChem: hazard checks (CMR, toxicity, thresholds) could not run. Look it up by name or CAS.'})
+    return checks
+
+
+@app.route('/api/chem/requests', methods=['GET', 'POST'])
+@jwt_required
+def cs_requests():
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    if request.method == 'GET':
+        rows = ChemRequest.query.filter_by(company_id=user.company_id).order_by(ChemRequest.created_at.desc()).limit(300).all()
+        names = _in_names([x for r in rows for x in (r.requested_by, r.decided_by)])
+        return jsonify({'success': True, 'data': [_cs_req_dict(r, names) for r in rows], 'can_manage': bool(_rc_staff(user)), 'me': user.id}), 200
+    data = _in_body()
+    try:
+        v = _cs_req_inputs(user, data)
+    except (TypeError, ValueError) as e:
+        return jsonify({'success': False, 'error': str(e) or 'Check the values.'}), 400
+    checks = _cs_req_run_checks(user, v)
+    if data.get('preview'):
+        return jsonify({'success': True, 'checks': checks}), 200
+    r = ChemRequest(company_id=user.company_id, substance_id=v['sub'].id if v['sub'] else None, name=v['name'], cas=v['cas'], supplier=v['supplier'],
+                    purpose=v['purpose'], location=v['location'], quantity=v['quantity'], unit=v['unit'], groups=json.dumps(v['groups']),
+                    sds_date=v['sds_date'], alternative=v['alternative'], controls=v['controls'], checks=json.dumps(checks), requested_by=user.id)
+    db.session.add(r)
+    db.session.commit()
+    _in_notify([(u.id, getattr(u, 'email', None)) for u in _rc_staff_users(user.company_id, user.id)], f'New chemical to approve: {r.name}'[:200],
+               f'{r.purpose[:300]} | {sum(1 for c in checks if c["level"] == "block")} blocking issue(s)', '/hse-management/industry/chemical?tab=approval', 'normal')
+    return jsonify({'success': True, 'data': _cs_req_dict(r, _in_names([user.id]))}), 201
+
+
+@app.route('/api/chem/requests/<int:rid>', methods=['PUT'])
+@jwt_required
+def cs_request_one(rid):
+    """action: approve {note} | reject {note} | add (approved -> register item) ."""
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    r = db.session.get(ChemRequest, rid)
+    if not r or r.company_id != user.company_id:
+        return jsonify({'success': False, 'error': 'Request not found.'}), 404
+    data = _in_body()
+    action = data.get('action')
+    if action in ('approve', 'reject'):
+        if not _rc_staff(user):
+            return jsonify({'success': False, 'error': 'Only supervisors and admins decide.'}), 403
+        if r.status != 'submitted':
+            return jsonify({'success': False, 'error': f'This request is {r.status}.'}), 409
+        if r.requested_by == user.id:
+            return jsonify({'success': False, 'error': 'Someone other than the requester must decide.'}), 409
+        note = _rc_text(data.get('note'), 1000)
+        if action == 'reject' and len(note) < 3:
+            return jsonify({'success': False, 'error': 'Say why it is rejected.'}), 400
+        if action == 'approve':
+            v = {'name': r.name, 'cas': r.cas, 'location': r.location, 'groups': _tbt_json(r.groups, []), 'quantity': r.quantity, 'unit': r.unit,
+                 'sds_date': r.sds_date, 'alternative': r.alternative, 'controls': r.controls, 'sub': db.session.get(ChemSubstance, r.substance_id) if r.substance_id else None,
+                 'conv': None}
+            checks = _cs_req_run_checks(user, v)
+            r.checks = json.dumps(checks)
+            blocks = [c['text'] for c in checks if c['level'] == 'block']
+            if blocks and len(note) < 10:
+                db.session.commit()
+                return jsonify({'success': False, 'code': 'BLOCKED', 'checks': checks,
+                                'error': 'Blocking issues: ' + ' '.join(blocks) + ' To approve anyway, write the conditions (at least 10 characters).'}), 409
+        r.status = 'approved' if action == 'approve' else 'rejected'
+        r.decision_note, r.decided_by, r.decided_at = note or None, user.id, datetime.utcnow()
+        db.session.commit()
+        if r.requested_by:
+            u = db.session.get(User, r.requested_by)
+            _in_notify([(r.requested_by, getattr(u, 'email', None))], f'Chemical {r.status}: {r.name}'[:200], note or '', '/hse-management/industry/chemical?tab=approval', 'normal')
+    elif action == 'add':
+        if r.status != 'approved':
+            return jsonify({'success': False, 'error': 'Only an approved request can be added to the register.'}), 409
+        if not (_rc_staff(user) or r.requested_by == user.id):
+            return jsonify({'success': False, 'error': 'Only the requester or a supervisor can add it.'}), 403
+        it = ChemItem(company_id=r.company_id, substance_id=r.substance_id, name=r.name, cas=r.cas, location=r.location, quantity=r.quantity, unit=r.unit,
+                      supplier=r.supplier, groups=r.groups or '[]', groups_confirmed=bool(_tbt_json(r.groups, [])), received_on=datetime.utcnow().date(),
+                      status='in_use', notes=f'Approved by request #{r.id}' + (f': {r.decision_note}' if r.decision_note else ''), created_by=user.id)
+        db.session.add(it)
+        db.session.flush()
+        r.item_id, r.status = it.id, 'added'
+        db.session.commit()
+    else:
+        return jsonify({'success': False, 'error': 'Unknown action.'}), 400
+    return jsonify({'success': True, 'data': _cs_req_dict(r, _in_names([r.requested_by, r.decided_by]))}), 200
+
+
+# ---------------------------------------------------------------- exposure monitoring
+def _cs_exp_dict(e, names):
+    return {'id': e.id, 'person': e.person, 'user_id': e.user_id, 'seg': e.seg, 'item_id': e.item_id, 'substance': e.substance, 'cas': e.cas, 'kind': e.kind,
+            'unit': e.unit, 'periods': _tbt_json(e.periods, []), 'value': round(e.value, 4), 'limit': e.limit, 'limit_source': e.limit_source,
+            'ratio': round(e.ratio, 3), 'pct': round(e.ratio * 100), 'result': e.result, 'sampled_on': e.sampled_on.isoformat(), 'note': e.note,
+            'by': names.get(e.created_by)}
+
+
+@app.route('/api/chem/exposure', methods=['GET', 'POST'])
+@jwt_required
+def cs_exposure():
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    staff = bool(_rc_staff(user))
+    if request.method == 'GET':
+        q = ChemExposure.query.filter_by(company_id=user.company_id)
+        if not staff:
+            q = q.filter(ChemExposure.user_id == user.id)
+        rows = q.order_by(ChemExposure.sampled_on.desc(), ChemExposure.id.desc()).limit(3000).all()
+        names = _in_names([r.created_by for r in rows])
+        # mixture index per person per day (TWA results only)
+        mix = {}
+        for r in rows:
+            if r.kind != 'twa':
+                continue
+            k = (r.user_id or r.person.strip().lower(), r.sampled_on)
+            m = mix.setdefault(k, {'person': r.person, 'date': r.sampled_on.isoformat(), 'index': 0.0, 'parts': []})
+            m['index'] += r.ratio
+            m['parts'].append(f'{r.substance} {round(r.ratio * 100)}%')
+        mixtures = []
+        for m in mix.values():
+            if len(m['parts']) > 1:
+                m['index'] = round(m['index'], 2)
+                m['over'] = m['index'] > 1
+                mixtures.append(m)
+        mixtures.sort(key=lambda m: -m['index'])
+        groups = {}
+        for r in rows:
+            if r.kind == 'twa':
+                groups.setdefault((r.seg.strip().lower(), (_cs_norm_cas(r.cas) or r.substance.strip().lower()), r.unit), []).append(r)
+        segs = []
+        for _, rs in groups.items():
+            st = _mn_seg_stats([x.value for x in rs], rs[0].limit)
+            segs.append({'seg': rs[0].seg, 'substance': rs[0].substance, 'unit': rs[0].unit, 'limit': rs[0].limit, **st})
+        segs.sort(key=lambda s: ({'red': 0, 'amber': 1, 'unknown': 2, 'green': 3}[s['level']], s['seg']))
+        flagged = {}
+        for r in rows:
+            if r.result in ('action', 'over') and r.sampled_on >= datetime.utcnow().date() - timedelta(days=365):
+                k = r.user_id or r.person.strip().lower()
+                f = flagged.setdefault(k, {'person': r.person, 'user_id': r.user_id, 'worst_pct': 0, 'substances': []})
+                f['worst_pct'] = max(f['worst_pct'], round(r.ratio * 100))
+                if r.substance not in f['substances']:
+                    f['substances'].append(r.substance)
+        return jsonify({'success': True, 'samples': [_cs_exp_dict(r, names) for r in rows], 'mixtures': mixtures, 'segs': segs,
+                        'workers': sorted(flagged.values(), key=lambda f: -f['worst_pct']) if staff else [], 'can_manage': staff}), 200
+    if not staff:
+        return jsonify({'success': False, 'error': 'Only supervisors and hygienists record exposure results.'}), 403
+    data = _in_body()
+    uid, person = None, _rc_text(data.get('person'), 120)
+    if data.get('user_id'):
+        u = db.session.get(User, int(data['user_id'])) if str(data['user_id']).isdigit() else None
+        if not u or u.company_id != user.company_id:
+            return jsonify({'success': False, 'error': 'Worker not found in your company.'}), 400
+        uid, person = u.id, (_in_names([u.id]).get(u.id) or person)
+    seg = _rc_text(data.get('seg'), 120)
+    it = None
+    if data.get('item_id'):
+        it = _cs_item(user, int(data['item_id'])) if str(data['item_id']).isdigit() else None
+        if not it:
+            return jsonify({'success': False, 'error': 'Chemical not in your register.'}), 400
+    substance = (it.name if it else _rc_text(data.get('substance'), 200))
+    if len(person or '') < 2 or len(seg) < 2 or len(substance or '') < 2:
+        return jsonify({'success': False, 'error': 'Give the worker, the exposure group and the substance.'}), 400
+    kind, unit = data.get('kind'), data.get('unit')
+    if kind not in ('twa', 'stel') or unit not in ('ppm', 'mg/m3'):
+        return jsonify({'success': False, 'error': 'Choose TWA or STEL and ppm or mg/m3.'}), 400
+    try:
+        limit = float(data.get('limit'))
+        periods = [{'conc': float(p['conc']), 'minutes': float(p['minutes'])} for p in (data.get('periods') or []) if isinstance(p, dict)]
+        sampled_on = _ct_date(data.get('sampled_on')) or datetime.utcnow().date()
+    except (TypeError, ValueError, KeyError):
+        return jsonify({'success': False, 'error': 'The limit, concentrations and minutes must be numbers.'}), 400
+    if not (0 < limit <= 1e6):
+        return jsonify({'success': False, 'error': 'Enter the exposure limit from the SDS section 8 or your country list.'}), 400
+    if not periods or any(p['conc'] < 0 or p['minutes'] <= 0 for p in periods):
+        return jsonify({'success': False, 'error': 'Add at least one sampling period with its concentration and minutes.'}), 400
+    total_min = sum(p['minutes'] for p in periods)
+    if kind == 'twa' and total_min > 1440 or kind == 'stel' and len(periods) != 1:
+        return jsonify({'success': False, 'error': 'TWA periods up to 24 h in all; a STEL result is one 15-minute sample.'}), 400
+    if sampled_on > datetime.utcnow().date():
+        return jsonify({'success': False, 'error': 'The sample date cannot be in the future.'}), 400
+    value = sum(p['conc'] * p['minutes'] for p in periods) / 480.0 if kind == 'twa' else periods[0]['conc']
+    ratio = value / limit
+    result = 'over' if ratio > 1 else 'action' if ratio >= 0.5 else 'below'
+    e = ChemExposure(company_id=user.company_id, user_id=uid, person=person, seg=seg, item_id=it.id if it else None, substance=substance,
+                     cas=(it.cas if it else _rc_text(data.get('cas'), 40)) or None, kind=kind, unit=unit, periods=json.dumps(periods), value=value, limit=limit,
+                     limit_source=_rc_text(data.get('limit_source'), 200) or None, ratio=ratio, result=result, sampled_on=sampled_on,
+                     note=_rc_text(data.get('note'), 500) or None, created_by=user.id)
+    db.session.add(e)
+    db.session.commit()
+    warnings = []
+    if kind == 'twa' and total_min < 360:
+        warnings.append(f'Periods cover {total_min:g} minutes: time not sampled is counted as no exposure. Sample most of the shift.')
+    if kind == 'stel' and abs(periods[0]['minutes'] - 15) > 1:
+        warnings.append('A STEL sample should be 15 minutes.')
+    if result == 'over':
+        _in_notify([(u.id, getattr(u, 'email', None)) for u in _rc_staff_users(user.company_id, user.id)], f'Exposure over the limit: {substance}'[:200],
+                   f'{seg}: {value:.3g} {unit} {kind.upper()} against {limit:g}.', '/hse-management/industry/chemical?tab=exposure', 'high')
+    return jsonify({'success': True, 'data': _cs_exp_dict(e, _in_names([user.id])), 'warnings': warnings}), 201
+
+
+# ---------------------------------------------------------------- spill response
+def _cs_spill_guide(it, sub, size, place):
+    hc = _cs_hcodes(sub)
+    groups = _tbt_json(it.groups, [])
+    d = _tbt_json(sub.data, {}) if sub else {}
+    flam = bool(hc & {'H220', 'H221', 'H222', 'H223', 'H224', 'H225', 'H226', 'H228'}) or '101' in groups
+    corrosive = bool(hc & {'H314', 'H318', 'H290'})
+    inhal = bool(hc & {'H330', 'H331', 'H332', 'H335', 'H334'})
+    toxic = bool(hc & {'H300', 'H301', 'H310', 'H311', 'H330', 'H331'})
+    oxid = bool(hc & {'H270', 'H271', 'H272'}) or '104' in groups
+    water_r = bool(hc & {'H260', 'H261', 'EUH014', 'EUH029'}) or '107' in groups
+    env = bool(hc & {'H400', 'H410', 'H411', 'H412'})
+    large = size == 'large'
+    steps = []
+
+    def S(phase, text, why=None):
+        steps.append({'phase': phase, 'text': text, 'why': why})
+    S('now', 'Raise the alarm and keep people away from the spill.')
+    if large or toxic or inhal:
+        S('now', 'Evacuate the area' + (' and close the doors behind you' if place == 'indoor' else ', moving upwind') + '. Call the emergency team / services.',
+          'large spill' if large else 'toxic by inhalation' if inhal else 'toxic')
+        S('now', 'As a first precaution isolate at least 50 m for liquids or 25 m for solids in all directions (ERG general guidance); for a road or rail release follow the ERG guide for the UN number.')
+    if flam:
+        S('now', 'Remove all ignition sources: no smoking, no flames, stop hot work, switch off engines; use non-sparking tools.', 'flammable')
+    S('ppe', 'Wear: ' + ', '.join(x for x in [
+        'chemical splash goggles and face shield' if corrosive else 'safety goggles',
+        'chemical-resistant gloves (material from SDS section 8)', 'chemical-resistant apron or suit' if corrosive or large else None,
+        'self-contained breathing apparatus' if (inhal and large) or hc & {'H330'} else 'respirator with the cartridge named in SDS section 8' if inhal else None] if x) + '.')
+    if not large and not toxic:
+        S('contain', 'Stop the leak if it is safe (close the valve, turn the container upright).')
+    if env:
+        S('contain', 'Cover or block drains and keep it out of soil and water: it is harmful to aquatic life.', 'environment hazard')
+    else:
+        S('contain', 'Keep the spill out of drains.')
+    if water_r:
+        S('clean', 'Do NOT use water. Cover with dry sand or another dry inert material.', 'reacts with water')
+    elif oxid:
+        S('clean', 'Use inert absorbent only (dry sand, vermiculite). Never sawdust, paper, rags or other combustible material.', 'oxidiser')
+    elif set(groups) & {'1', '2', '3'}:
+        S('clean', 'Neutralise with an acid spill neutraliser (for example sodium bicarbonate) or absorb with an acid-compatible absorbent.', 'acid')
+    elif '10' in groups:
+        S('clean', 'Neutralise with a caustic spill neutraliser or absorb with a caustic-compatible absorbent.', 'caustic')
+    elif flam:
+        S('clean', 'Absorb with a non-combustible absorbent (sand, vermiculite, chemical spill pads).', 'flammable')
+    else:
+        S('clean', 'Absorb with a suitable absorbent from the spill kit.')
+    S('clean', 'Shovel into a labelled, closed container. Record it in the chemical waste log.')
+    neighbours = []
+    if it.location:
+        loc = re.sub(r'\s+', ' ', it.location.strip().lower())
+        for o in ChemItem.query.filter(ChemItem.company_id == it.company_id, ChemItem.status == 'in_use', ChemItem.id != it.id).all():
+            if re.sub(r'\s+', ' ', (o.location or '').strip().lower()) != loc:
+                continue
+            codes = [c for ga in groups for gb in _tbt_json(o.groups, []) for c in [_cs_pair(ga, gb)] if c]
+            if codes:
+                worst = max(codes, key=_cs_rank)
+                neighbours.append({'name': o.name, 'meaning': _cs_explain(worst), 'severity': _cs_rank(worst)})
+    neighbours.sort(key=lambda n: -n['severity'])
+    for n in neighbours[:4]:
+        S('now', f'Keep the spill away from {n["name"]} stored here: {n["meaning"].lower()}.', 'stored next to it')
+    S('after', 'Clean the area, decontaminate tools and PPE, restock the spill kit and report the spill.')
+    sds = [{'source': s.get('source'), 'text': s.get('text')} for s in (d.get('sections') or {}).get('spill', [])[:2]]
+    return {'chemical': it.name, 'location': it.location, 'hazards': sorted(hc), 'groups': [CS_EPA_GROUPS.get(g, g) for g in groups], 'steps': steps,
+            'sds_spill': sds, 'neighbours': neighbours, 'notes': [] if sub else ['No PubChem record: hazards are taken from the reactivity group only. Read the supplier SDS section 6.']}
+
+
+@app.route('/api/chem/items/<int:iid>/spill-guide', methods=['GET'])
+@jwt_required
+def cs_spill_guide(iid):
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    it = _cs_item(user, iid)
+    if not it:
+        return jsonify({'success': False, 'error': 'Chemical not found.'}), 404
+    sub = db.session.get(ChemSubstance, it.substance_id) if it.substance_id else None
+    size = 'large' if request.args.get('size') == 'large' else 'small'
+    place = 'outdoor' if request.args.get('place') == 'outdoor' else 'indoor'
+    return jsonify({'success': True, 'data': _cs_spill_guide(it, sub, size, place)}), 200
+
+
+@app.route('/api/chem/spills', methods=['GET', 'POST'])
+@app.route('/api/chem/spills/<int:sid>', methods=['PUT'])
+@jwt_required
+def cs_spills(sid=None):
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    if request.method == 'GET':
+        rows = ChemSpill.query.filter_by(company_id=user.company_id).order_by(ChemSpill.reported_at.desc()).limit(300).all()
+        names = _in_names([x for r in rows for x in (r.reported_by, r.closed_by)])
+        return jsonify({'success': True, 'can_manage': bool(_rc_staff(user)), 'data': [{
+            'id': r.id, 'item_id': r.item_id, 'chemical': r.chemical, 'location': r.location, 'size': r.size, 'amount': r.amount, 'description': r.description,
+            'injuries': r.injuries, 'reached_drain': r.reached_drain, 'status': r.status, 'close_note': r.close_note, 'reported_by': names.get(r.reported_by),
+            'reported_at': _in_iso(r.reported_at), 'closed_by': names.get(r.closed_by), 'closed_at': _in_iso(r.closed_at)} for r in rows]}), 200
+    data = _in_body()
+    if sid is None:
+        it = None
+        if data.get('item_id'):
+            it = _cs_item(user, int(data['item_id'])) if str(data['item_id']).isdigit() else None
+            if not it:
+                return jsonify({'success': False, 'error': 'Chemical not in your register.'}), 400
+        chem = it.name if it else _rc_text(data.get('chemical'), 200)
+        if len(chem or '') < 2:
+            return jsonify({'success': False, 'error': 'What was spilled?'}), 400
+        s = ChemSpill(company_id=user.company_id, item_id=it.id if it else None, chemical=chem, location=_mn_area(data.get('location')) or (it.location if it else None),
+                      size='large' if data.get('size') == 'large' else 'small', amount=_rc_text(data.get('amount'), 60) or None,
+                      description=_rc_text(data.get('description'), 1000) or None, injuries=bool(data.get('injuries')), reached_drain=bool(data.get('reached_drain')),
+                      reported_by=user.id)
+        db.session.add(s)
+        db.session.commit()
+        urgent = s.size == 'large' or s.injuries or s.reached_drain
+        _in_notify([(u.id, getattr(u, 'email', None)) for u in _rc_staff_users(user.company_id, user.id)],
+                   f'Chemical spill: {s.chemical}{" at " + s.location if s.location else ""}'[:200],
+                   ', '.join(x for x in [s.size + ' spill', 'people hurt' if s.injuries else None, 'reached a drain' if s.reached_drain else None, s.amount] if x),
+                   '/hse-management/industry/chemical?tab=spill', 'critical' if urgent else 'high', email=urgent)
+        return jsonify({'success': True, 'data': {'id': s.id}}), 201
+    s = db.session.get(ChemSpill, sid)
+    if not s or s.company_id != user.company_id:
+        return jsonify({'success': False, 'error': 'Spill not found.'}), 404
+    if not _rc_staff(user):
+        return jsonify({'success': False, 'error': 'Only supervisors close spills.'}), 403
+    if s.status != 'open':
+        return jsonify({'success': False, 'error': 'Already closed.'}), 409
+    note = _rc_text(data.get('note'), 1000)
+    if len(note) < 10:
+        return jsonify({'success': False, 'error': 'Say how it was cleaned up and what will stop it happening again (at least 10 characters).'}), 400
+    s.status, s.close_note, s.closed_by, s.closed_at = 'closed', note, user.id, datetime.utcnow()
+    db.session.commit()
+    return jsonify({'success': True, 'data': {'id': s.id, 'status': s.status}}), 200
+
+
 # =====================================================================================================
 # AUTO MIGRATIONS (2026-11-23)
 # Railway's Data tab appends LIMIT to every query, so CREATE/ALTER statements fail there. Instead the
@@ -178271,7 +179063,7 @@ IN_LIBRARY.update({
 #   - a failing statement is logged and the file is retried on the next start
 # Set AUTO_MIGRATE=0 on Railway to switch this off.
 # =====================================================================================================
-AUTO_MIGRATIONS = ('DEPLOY_2026-11-23_FULL.sql', '2026-11-24_company_quotes.sql', '2026-11-25_ready_checks.sql', '2026-11-26_muster_contractors.sql', '2026-11-27_document_control_plus.sql', '2026-11-27_inspections.sql', '2026-11-27_chemical_safety.sql', '2026-11-27_chemical_waste.sql', '2026-11-27_equipment.sql', '2026-11-27_incident_outcomes.sql', '2026-11-27_oil_gas.sql', '2026-11-27_vision_reports.sql', '2026-11-27_mining.sql', '2026-11-27_mfg_wh.sql', '2026-11-27_og_part2.sql', '2026-11-27_mining_part2.sql')
+AUTO_MIGRATIONS = ('DEPLOY_2026-11-23_FULL.sql', '2026-11-24_company_quotes.sql', '2026-11-25_ready_checks.sql', '2026-11-26_muster_contractors.sql', '2026-11-27_document_control_plus.sql', '2026-11-27_inspections.sql', '2026-11-27_chemical_safety.sql', '2026-11-27_chemical_waste.sql', '2026-11-27_equipment.sql', '2026-11-27_incident_outcomes.sql', '2026-11-27_oil_gas.sql', '2026-11-27_vision_reports.sql', '2026-11-27_mining.sql', '2026-11-27_mfg_wh.sql', '2026-11-27_og_part2.sql', '2026-11-27_mining_part2.sql', '2026-11-27_chemical_part3.sql')
 _MIGRATION_LOCK_KEY = 74230115
 
 
