@@ -174333,8 +174333,10 @@ def og_gas_tests():
         inst = {e.id: e for e in EquipmentItem.query.filter(EquipmentItem.id.in_({r.instrument_id for r in rows if r.instrument_id} or {0})).all()}
         detectors = EquipmentItem.query.filter(EquipmentItem.company_id == user.company_id, EquipmentItem.category == 'gas_detector',
                                                EquipmentItem.status != 'retired').order_by(EquipmentItem.tag_no).all()
+        now_ = datetime.utcnow()
         return jsonify({'success': True, 'data': [_og_gas_dict(r, names, inst) for r in rows], 'defaults': OG_GAS_DEFAULTS,
-                        'detectors': [{'id': e.id, 'label': f'{e.tag_no} {e.name}', 'state': _eq_state(e)[0], 'state_label': _eq_state(e)[1]} for e in detectors]}), 200
+                        'detectors': [{'id': e.id, 'label': f'{e.tag_no} {e.name}', 'state': _eq_state(e)[0], 'state_label': _eq_state(e)[1],
+                                       'bump_ok': _og_bump_state(e, now_)[0], 'bump_label': _og_bump_state(e, now_)[1]} for e in detectors]}), 200
     data = _in_body()
     p = None
     if data.get('permit_id'):
@@ -174372,6 +174374,9 @@ def og_gas_tests():
         inst = _eq_get(user, int(data['instrument_id'])) if str(data['instrument_id']).isdigit() else None
         if not inst:
             return jsonify({'success': False, 'error': 'Gas detector not found in your equipment register.'}), 400
+        blk = _og_bump_block(inst)
+        if blk:
+            return jsonify({'success': False, 'code': 'BUMP_REQUIRED', 'error': blk}), 409
     t = OgGasTest(company_id=user.company_id, permit_id=p.id if p else None, location=_rc_text(data.get('location'), 200) or (p.location if p else None),
                   tested_at=tested_at, other_name=_rc_text(data.get('other_name'), 60) or None, instrument_id=inst.id if inst else None,
                   instrument_text=None if inst else (_rc_text(data.get('instrument_text'), 120) or None), tested_by=user.id, **vals)
@@ -176645,6 +176650,718 @@ IN_LIBRARY.update({
 })
 
 
+# ============================================================================
+# OIL & GAS PART 2: SHIFT HANDOVER, BARRIER HEALTH, GAS DETECTOR CHECKS, DROPPED OBJECTS (2026-11-27)
+# ============================================================================
+# Shift handover is built from live data (permits, isolations, bypasses, failed gas tests, temporary changes, detectors,
+# dropped-object findings): the incoming person acknowledges every item, and anything that appeared during the handover
+# must be acknowledged too. Barrier health groups everything that weakens a safety barrier by area. Gas detectors need a
+# passing bump test or calibration in the last 24 hours (ISEA: before each day's use) before they can be used for a gas
+# test; a failed check takes the detector out of service. Dropped objects: findings at height with their drop energy
+# (m x g x h) and the consequence read from the DROPS Calculator, plus survey coverage by area.
+# DB: og_handovers, og_detector_checks, og_drops_surveys, og_drops_findings -> sql/2026-11-27_og_part2.sql (auto migration)
+
+
+class OgHandover(db.Model):
+    __tablename__ = 'og_handovers'
+    __table_args__ = {'extend_existing': True}
+    id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id', ondelete='CASCADE'), nullable=False, index=True)
+    area = db.Column(db.String(200))                                         # empty = whole site
+    shift_label = db.Column(db.String(80))
+    outgoing_id = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    incoming_id = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    status = db.Column(db.String(10), nullable=False, default='open')       # open | accepted | cancelled
+    items = db.Column(db.Text)                                               # JSON list
+    cleared = db.Column(db.Text)                                             # JSON list: items closed since the last handover
+    notes = db.Column(db.Text)
+    concerns = db.Column(db.Text)
+    notified = db.Column(db.Boolean, nullable=False, default=False)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    accepted_at = db.Column(db.DateTime)
+
+
+class OgDetectorCheck(db.Model):
+    __tablename__ = 'og_detector_checks'
+    __table_args__ = {'extend_existing': True}
+    id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id', ondelete='CASCADE'), nullable=False, index=True)
+    instrument_id = db.Column(db.Integer, db.ForeignKey('equipment_items.id', ondelete='CASCADE'), nullable=False, index=True)
+    kind = db.Column(db.String(12), nullable=False)                          # bump | calibration
+    checked_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    result = db.Column(db.String(6), nullable=False)                         # pass | fail
+    sensors = db.Column(db.Text)                                             # JSON list
+    tolerance_pct = db.Column(db.Float)
+    reasons = db.Column(db.Text)                                             # JSON list
+    note = db.Column(db.String(500))
+    checked_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+
+class OgDropsSurvey(db.Model):
+    __tablename__ = 'og_drops_surveys'
+    __table_args__ = {'extend_existing': True}
+    id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id', ondelete='CASCADE'), nullable=False, index=True)
+    area = db.Column(db.String(200), nullable=False)
+    items_checked = db.Column(db.Integer)
+    findings = db.Column(db.Integer, nullable=False, default=0)
+    note = db.Column(db.String(500))
+    surveyed_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    surveyed_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+
+class OgDropsFinding(db.Model):
+    __tablename__ = 'og_drops_findings'
+    __table_args__ = {'extend_existing': True}
+    id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id', ondelete='CASCADE'), nullable=False, index=True)
+    survey_id = db.Column(db.Integer, db.ForeignKey('og_drops_surveys.id', ondelete='SET NULL'), nullable=True, index=True)
+    area = db.Column(db.String(200), nullable=False)
+    item = db.Column(db.String(200), nullable=False)
+    position = db.Column(db.String(200))
+    issue = db.Column(db.String(20), nullable=False)
+    mass_kg = db.Column(db.Float, nullable=False)
+    height_m = db.Column(db.Float, nullable=False)
+    energy_j = db.Column(db.Float, nullable=False)
+    consequence = db.Column(db.String(8))                                    # minor | serious | fatal (from the DROPS Calculator)
+    people_below = db.Column(db.Boolean, nullable=False, default=True)
+    status = db.Column(db.String(8), nullable=False, default='open')        # open | fixed
+    action = db.Column(db.String(500))
+    fix_note = db.Column(db.String(500))
+    found_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    found_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    fixed_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    fixed_at = db.Column(db.DateTime)
+
+
+OG_BUMP_VALID_H = 24                         # ISEA statement: bump test or calibration check before each day's use
+OG_CAL_TOLERANCE = 10.0                      # default % for a calibration check; use the maker's figure
+OG_HANDOVER_REMIND_MIN = 120
+OG_DROPS_STALE_DAYS = 90
+OG_DROPS_ISSUES = {'no_secondary': 'No secondary retention (safety wire, net, sling)', 'loose': 'Loose or missing fixings',
+                   'corroded': 'Corrosion or fatigue', 'damaged': 'Damaged or deformed', 'loose_item': 'Loose item or debris at height',
+                   'untethered': 'Tools or equipment not tethered', 'other': 'Other'}
+OG_DROPS_CONSEQ = {'minor': 1, 'serious': 2, 'fatal': 3}
+OG_SENSOR_GASES = ('O2', 'LEL', 'H2S', 'CO', 'SO2', 'NO2', 'NH3', 'CL2', 'VOC', 'OTHER')
+
+
+def _og_in_area(loc, area):
+    a = _og_norm_loc(area)
+    if not a:
+        return True
+    n = _og_norm_loc(loc)
+    return bool(n) and (n == a or a in n)
+
+
+# ---------------------------------------------------------------- gas detector checks
+def _og_last_check(instrument_id, kind=None, result=None):
+    q = OgDetectorCheck.query.filter(OgDetectorCheck.instrument_id == instrument_id)
+    if kind:
+        q = q.filter(OgDetectorCheck.kind == kind)
+    if result:
+        q = q.filter(OgDetectorCheck.result == result)
+    return q.order_by(OgDetectorCheck.checked_at.desc(), OgDetectorCheck.id.desc()).first()
+
+
+def _og_bump_state(e, now=None):
+    """(ok, label, last_check). OK = the latest check passed and a pass is less than 24 h old."""
+    now = now or datetime.utcnow()
+    last = _og_last_check(e.id)
+    if not last:
+        return False, 'No bump test recorded: bump test before use', None
+    if last.result != 'pass':
+        return False, f'Failed its last {last.kind} ({"; ".join(_tbt_json(last.reasons, []))[:160]}): do not use', last
+    age_h = (now - last.checked_at).total_seconds() / 3600
+    if age_h > OG_BUMP_VALID_H:
+        return False, f'Last bump test {int(age_h)} h ago: bump test before use', last
+    return True, f'Bump tested {int(age_h * 60) // 60} h {int(age_h * 60) % 60} min ago', last
+
+
+def _og_bump_block(inst):
+    """Called by the gas test route: the error text when this detector may not be used, else None."""
+    if not inst or inst.category != 'gas_detector':
+        return None
+    ok, label, _ = _og_bump_state(inst)
+    return None if ok else f'Detector {inst.tag_no}: {label}. Record a bump test in Oil & Gas > Gas detectors first.'
+
+
+def _og_check_dict(c, names):
+    return {'id': c.id, 'instrument_id': c.instrument_id, 'kind': c.kind, 'checked_at': _in_iso(c.checked_at), 'result': c.result,
+            'sensors': _tbt_json(c.sensors, []), 'tolerance_pct': c.tolerance_pct, 'reasons': _tbt_json(c.reasons, []), 'note': c.note,
+            'checked_by': names.get(c.checked_by)}
+
+
+def _og_detector_dict(e, now=None):
+    ok, label, last = _og_bump_state(e, now)
+    cal = _og_last_check(e.id, 'calibration')
+    code, slabel, level = _eq_state(e)
+    return {'id': e.id, 'tag_no': e.tag_no, 'name': e.name, 'location': e.location, 'state': code, 'state_label': slabel, 'state_level': level,
+            'bump_ok': ok, 'bump_label': label, 'last_check': ({'kind': last.kind, 'result': last.result, 'at': _in_iso(last.checked_at)} if last else None),
+            'last_calibration': _in_iso(cal.checked_at) if cal else None, 'cert_due': e.cert_due.isoformat() if e.cert_due else None,
+            'usable': ok and code == 'ok'}
+
+
+@app.route('/api/og/detectors', methods=['GET'])
+@jwt_required
+def og_detectors():
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    rows = EquipmentItem.query.filter(EquipmentItem.company_id == user.company_id, EquipmentItem.category == 'gas_detector',
+                                      EquipmentItem.status != 'retired').order_by(EquipmentItem.tag_no).all()
+    now = datetime.utcnow()
+    data = [_og_detector_dict(e, now) for e in rows]
+    return jsonify({'success': True, 'data': data, 'gases': list(OG_SENSOR_GASES), 'tolerance_default': OG_CAL_TOLERANCE,
+                    'valid_hours': OG_BUMP_VALID_H,
+                    'counts': {'usable': sum(1 for d in data if d['usable']), 'need_bump': sum(1 for d in data if not d['bump_ok'] and not (d['last_check'] or {}).get('result') == 'fail'),
+                               'failed': sum(1 for d in data if (d['last_check'] or {}).get('result') == 'fail'), 'total': len(data)}}), 200
+
+
+@app.route('/api/og/detectors/<int:eid>/checks', methods=['GET', 'POST'])
+@jwt_required
+def og_detector_checks(eid):
+    """GET: history. POST: {kind: bump|calibration, sensors: [{gas, applied, reading, alarmed}], tolerance_pct, note}."""
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    e = _eq_get(user, eid)
+    if not e or e.category != 'gas_detector':
+        return jsonify({'success': False, 'error': 'Gas detector not found in your equipment register.'}), 404
+    if request.method == 'GET':
+        rows = OgDetectorCheck.query.filter(OgDetectorCheck.instrument_id == e.id).order_by(OgDetectorCheck.checked_at.desc()).limit(200).all()
+        names = _og_names([r.checked_by for r in rows])
+        return jsonify({'success': True, 'detector': _og_detector_dict(e), 'data': [_og_check_dict(r, names) for r in rows]}), 200
+    if e.status == 'retired':
+        return jsonify({'success': False, 'error': 'This detector is retired.'}), 409
+    data = _in_body()
+    kind = data.get('kind')
+    if kind not in ('bump', 'calibration'):
+        return jsonify({'success': False, 'error': 'Choose bump test or calibration.'}), 400
+    try:
+        tol = float(data.get('tolerance_pct')) if data.get('tolerance_pct') not in (None, '') else OG_CAL_TOLERANCE
+    except (TypeError, ValueError):
+        return jsonify({'success': False, 'error': 'Tolerance must be a number.'}), 400
+    if not (0 < tol <= 50):
+        return jsonify({'success': False, 'error': 'Tolerance must be between 0 and 50 %.'}), 400
+    sensors, reasons = [], []
+    for s in (data.get('sensors') or [])[:8]:
+        if not isinstance(s, dict):
+            continue
+        gas = str(s.get('gas') or '').upper()
+        if gas not in OG_SENSOR_GASES:
+            return jsonify({'success': False, 'error': f'Unknown sensor gas {gas or "(empty)"}.'}), 400
+        vals = {}
+        for k in ('applied', 'reading'):
+            v = s.get(k)
+            if v in (None, ''):
+                vals[k] = None
+                continue
+            try:
+                vals[k] = float(v)
+            except (TypeError, ValueError):
+                return jsonify({'success': False, 'error': f'{gas}: {k} must be a number.'}), 400
+            if vals[k] < 0 or vals[k] > 1000000:
+                return jsonify({'success': False, 'error': f'{gas}: {k} is out of range.'}), 400
+        alarmed = s.get('alarmed')
+        ok = True
+        if kind == 'bump':
+            if alarmed is not True:
+                ok = False
+                reasons.append(f'{gas} sensor did not alarm')
+        else:
+            if vals['applied'] in (None, 0) or vals['reading'] is None:
+                return jsonify({'success': False, 'error': f'{gas}: give the test gas concentration and the reading.'}), 400
+            dev = abs(vals['reading'] - vals['applied']) / vals['applied'] * 100
+            if dev > tol:
+                ok = False
+                reasons.append(f'{gas} read {vals["reading"]:g} for {vals["applied"]:g} applied ({dev:.0f}% off, limit {tol:g}%)')
+            if alarmed is False:
+                ok = False
+                reasons.append(f'{gas} sensor did not alarm')
+        sensors.append({'gas': gas, 'applied': vals['applied'], 'reading': vals['reading'], 'alarmed': alarmed if isinstance(alarmed, bool) else None, 'ok': ok})
+    if not sensors:
+        return jsonify({'success': False, 'error': 'Add at least one sensor.'}), 400
+    if len({s['gas'] for s in sensors}) != len(sensors):
+        return jsonify({'success': False, 'error': 'Each sensor only once.'}), 400
+    result = 'fail' if reasons else 'pass'
+    c = OgDetectorCheck(company_id=user.company_id, instrument_id=e.id, kind=kind, result=result, sensors=json.dumps(sensors),
+                        tolerance_pct=tol if kind == 'calibration' else None, reasons=json.dumps(reasons),
+                        note=_rc_text(data.get('note'), 500) or None, checked_by=user.id)
+    db.session.add(c)
+    marker = ('Failed bump test', 'Failed calibration')
+    if result == 'fail':
+        e.status = 'out_of_service'
+        e.status_reason = (f'{marker[0] if kind == "bump" else marker[1]}: {"; ".join(reasons)}')[:500]
+        _eq_log(e, 'status', f'Out of service: {e.status_reason}', user.id)
+    else:
+        if kind == 'calibration':
+            months = EQ_CATEGORIES['gas_detector'][4] or 6
+            today = datetime.utcnow().date()
+            m = today.month - 1 + months
+            y, m = today.year + m // 12, m % 12 + 1
+            e.cert_due = today.replace(year=y, month=m, day=min(today.day, 28))
+            e.cert_name = e.cert_name or 'Calibration'
+            _eq_log(e, 'certificate', f'Calibration passed; next due {e.cert_due.isoformat()}', user.id)
+        if e.status == 'out_of_service' and (e.status_reason or '').startswith(marker):
+            if kind == 'calibration':
+                e.status, e.status_reason = 'in_service', None
+                _eq_log(e, 'status', 'Back in service after a passing calibration', user.id)
+    db.session.commit()
+    if result == 'fail':
+        _in_notify([(u.id, getattr(u, 'email', None)) for u in _rc_staff_users(user.company_id, user.id)], f'Gas detector failed: {e.tag_no}'[:200],
+                   '; '.join(reasons)[:900], '/hse-management/industry/oil_gas?tab=detectors', 'high')
+    msg = None
+    if result == 'pass' and kind == 'bump' and e.status == 'out_of_service':
+        msg = 'Bump test passed, but the detector stays out of service until it passes a calibration.'
+    return jsonify({'success': True, 'data': _og_check_dict(c, _og_names([user.id])), 'detector': _og_detector_dict(e), 'message': msg}), 201
+
+
+# ---------------------------------------------------------------- dropped objects
+def _og_drops_dict(f, names):
+    return {'id': f.id, 'survey_id': f.survey_id, 'area': f.area, 'item': f.item, 'position': f.position, 'issue': f.issue,
+            'issue_name': OG_DROPS_ISSUES.get(f.issue, f.issue), 'mass_kg': f.mass_kg, 'height_m': f.height_m, 'energy_j': round(f.energy_j, 1),
+            'consequence': f.consequence, 'people_below': f.people_below, 'status': f.status, 'action': f.action, 'fix_note': f.fix_note,
+            'found_by': names.get(f.found_by), 'found_at': _in_iso(f.found_at), 'fixed_by': names.get(f.fixed_by), 'fixed_at': _in_iso(f.fixed_at),
+            'priority': _og_drops_priority(f)}
+
+
+def _og_drops_priority(f):
+    """(rank, advice). Consequence from the DROPS Calculator first, then people below, then energy."""
+    c = OG_DROPS_CONSEQ.get(f.consequence or '', 0)
+    if f.status != 'open':
+        return [0, 'Fixed']
+    if c == 3 and f.people_below:
+        return [4, 'Barrier off the area below now; fix before anyone works or passes underneath.']
+    if c == 3:
+        return [3, 'Fix before the next work at or below this point.']
+    if c == 2:
+        return [2, 'Secure this shift and keep people out from below until fixed.']
+    if c == 1:
+        return [1, 'Secure at the next routine visit.']
+    return [1, 'Read the consequence from the DROPS Calculator (mass and height) and set it.']
+
+
+def _og_drops_energy(mass, height):
+    return float(mass) * 9.81 * float(height)
+
+
+@app.route('/api/og/drops', methods=['GET'])
+@jwt_required
+def og_drops():
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    q = OgDropsFinding.query.filter(OgDropsFinding.company_id == user.company_id)
+    if request.args.get('all') != '1':
+        q = q.filter(OgDropsFinding.status == 'open')
+    rows = q.order_by(OgDropsFinding.found_at.desc()).limit(2000).all()
+    names = _og_names([x for r in rows for x in (r.found_by, r.fixed_by)])
+    data = sorted([_og_drops_dict(r, names) for r in rows], key=lambda d: (-d['priority'][0], -d['energy_j']))
+    surveys = OgDropsSurvey.query.filter(OgDropsSurvey.company_id == user.company_id).order_by(OgDropsSurvey.surveyed_at.desc()).limit(2000).all()
+    last = {}
+    for s in surveys:
+        k = _og_norm_loc(s.area)
+        if k not in last:
+            last[k] = s
+    now = datetime.utcnow()
+    snames = _og_names([s.surveyed_by for s in last.values()])
+    open_by_area = {}
+    for r in rows:
+        if r.status == 'open':
+            open_by_area[_og_norm_loc(r.area)] = open_by_area.get(_og_norm_loc(r.area), 0) + 1
+    coverage = sorted([{'area': s.area, 'last_survey': _in_iso(s.surveyed_at), 'days': (now - s.surveyed_at).days, 'by': snames.get(s.surveyed_by),
+                        'stale': (now - s.surveyed_at).days > OG_DROPS_STALE_DAYS, 'open_findings': open_by_area.get(k, 0)} for k, s in last.items()],
+                      key=lambda x: -x['days'])
+    return jsonify({'success': True, 'data': data, 'coverage': coverage, 'stale_days': OG_DROPS_STALE_DAYS,
+                    'issues': [{'id': k, 'name': v} for k, v in OG_DROPS_ISSUES.items()], 'can_manage': bool(_rc_staff(user))}), 200
+
+
+@app.route('/api/og/drops/surveys', methods=['POST'])
+@jwt_required
+def og_drops_survey():
+    """{area, items_checked, note, findings: [{item, position, issue, mass_kg, height_m, consequence, people_below, action}]}"""
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    data = _in_body()
+    area = _rc_text(data.get('area'), 200)
+    if len(area) < 2:
+        return jsonify({'success': False, 'error': 'Give the area surveyed.'}), 400
+    try:
+        items_checked = int(data['items_checked']) if data.get('items_checked') not in (None, '') else None
+    except (TypeError, ValueError):
+        return jsonify({'success': False, 'error': 'Items checked must be a whole number.'}), 400
+    found = []
+    for i, f in enumerate((data.get('findings') or [])[:100]):
+        if not isinstance(f, dict):
+            continue
+        item = _rc_text(f.get('item'), 200)
+        if len(item) < 2:
+            return jsonify({'success': False, 'error': f'Finding {i + 1}: say what the item is.'}), 400
+        if f.get('issue') not in OG_DROPS_ISSUES:
+            return jsonify({'success': False, 'error': f'Finding {i + 1}: choose the issue.'}), 400
+        try:
+            mass, height = float(f.get('mass_kg')), float(f.get('height_m'))
+        except (TypeError, ValueError):
+            return jsonify({'success': False, 'error': f'Finding {i + 1}: give the mass (kg) and the height it could fall (m).'}), 400
+        if not (0 < mass <= 100000 and 0 < height <= 1000):
+            return jsonify({'success': False, 'error': f'Finding {i + 1}: mass or height out of range.'}), 400
+        if f.get('consequence') not in (None, '', 'minor', 'serious', 'fatal'):
+            return jsonify({'success': False, 'error': f'Finding {i + 1}: consequence must be minor, serious or fatal.'}), 400
+        found.append(OgDropsFinding(company_id=user.company_id, area=area, item=item, position=_rc_text(f.get('position'), 200) or None,
+                                    issue=f['issue'], mass_kg=mass, height_m=height, energy_j=_og_drops_energy(mass, height),
+                                    consequence=f.get('consequence') or None, people_below=f.get('people_below') is not False,
+                                    action=_rc_text(f.get('action'), 500) or None, found_by=user.id))
+    s = OgDropsSurvey(company_id=user.company_id, area=area, items_checked=items_checked, findings=len(found),
+                      note=_rc_text(data.get('note'), 500) or None, surveyed_by=user.id)
+    db.session.add(s)
+    db.session.flush()
+    for f in found:
+        f.survey_id = s.id
+        db.session.add(f)
+    db.session.commit()
+    urgent = [f for f in found if _og_drops_priority(f)[0] >= 3]
+    if urgent:
+        _in_notify([(u.id, getattr(u, 'email', None)) for u in _rc_staff_users(user.company_id, user.id)],
+                   f'Dropped object risk: {len(urgent)} potentially fatal at {area}'[:200],
+                   '; '.join(f'{f.item} ({f.mass_kg:g} kg at {f.height_m:g} m, {f.energy_j:.0f} J)' for f in urgent[:5]),
+                   '/hse-management/industry/oil_gas?tab=drops', 'critical', email=True)
+    names = _og_names([user.id])
+    return jsonify({'success': True, 'survey_id': s.id, 'data': [_og_drops_dict(f, names) for f in found]}), 201
+
+
+@app.route('/api/og/drops/<int:fid>', methods=['PUT'])
+@jwt_required
+def og_drops_one(fid):
+    """action: fix {note} | consequence {consequence} ."""
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    f = db.session.get(OgDropsFinding, fid)
+    if not f or f.company_id != user.company_id:
+        return jsonify({'success': False, 'error': 'Finding not found.'}), 404
+    data = _in_body()
+    if data.get('action') == 'fix':
+        if f.status != 'open':
+            return jsonify({'success': False, 'error': 'Already fixed.'}), 409
+        note = _rc_text(data.get('note'), 500)
+        if len(note) < 5:
+            return jsonify({'success': False, 'error': 'Say how it was secured (for example "safety wire fitted").'}), 400
+        f.status, f.fix_note, f.fixed_by, f.fixed_at = 'fixed', note, user.id, datetime.utcnow()
+    elif data.get('action') == 'consequence':
+        if data.get('consequence') not in ('minor', 'serious', 'fatal'):
+            return jsonify({'success': False, 'error': 'Consequence must be minor, serious or fatal.'}), 400
+        f.consequence = data['consequence']
+    else:
+        return jsonify({'success': False, 'error': 'Unknown action.'}), 400
+    db.session.commit()
+    return jsonify({'success': True, 'data': _og_drops_dict(f, _og_names([f.found_by, f.fixed_by]))}), 200
+
+
+# ---------------------------------------------------------------- shift handover
+def _og_handover_items(cid, area, now=None):
+    """Live items the next shift must know about, for one area (or the whole site)."""
+    now = now or datetime.utcnow()
+    items = []
+
+    def add(key, kind, level, title, detail, tab):
+        items.append({'key': key, 'kind': kind, 'level': level, 'title': title, 'detail': detail, 'tab': tab})
+    permits = [p for p in WorkPermit.query.filter(WorkPermit.company_id == cid, WorkPermit.status.in_(('active', 'suspended'))).limit(1000).all()
+               if _og_in_area(p.location, area)]
+    pnum = {p.id: p.permit_number for p in permits}
+    for p in permits:
+        over = bool(p.end_at and p.end_at < now)
+        add(f'permit:{p.id}', 'permit', 'high' if over or p.status == 'suspended' else 'normal',
+            f'{p.permit_number} {p.permit_type.replace("_", " ")} is {p.status}{" and past its end time" if over else ""}',
+            f'{p.title or ""}{" at " + p.location if p.location else ""}'.strip(), 'permits')
+    for i in OgIsolation.query.filter(OgIsolation.company_id == cid, OgIsolation.status.in_(('isolated', 'verified'))).limit(2000).all():
+        p = None if i.permit_id in pnum else db.session.get(WorkPermit, i.permit_id)
+        if i.permit_id not in pnum and not (p and _og_in_area(p.location, area)):
+            continue
+        add(f'iso:{i.id}', 'isolation', 'high' if i.status == 'isolated' else 'normal',
+            f'Isolation {i.point_tag} in place ({OG_METHODS.get(i.method, i.method)}){"; NOT verified" if i.status == "isolated" else ""}',
+            f'Permit {pnum.get(i.permit_id) or (p.permit_number if p else "")}; {OG_ENERGY.get(i.energy_type, i.energy_type)}', 'permits')
+    for b in OgBypass.query.filter(OgBypass.company_id == cid, OgBypass.status == 'active').limit(1000).all():
+        if not _og_in_area(b.location, area):
+            continue
+        over = b.planned_end < now
+        add(f'bypass:{b.id}', 'bypass', 'high', f'{OG_BYPASS_TYPES.get(b.device_type, b.device_type)} {b.device_tag} is bypassed{"; past its planned end" if over else ""}',
+            f'Meanwhile: {b.mitigation}', 'bypass')
+    since = now - timedelta(hours=12)
+    tests = OgGasTest.query.filter(OgGasTest.company_id == cid, OgGasTest.tested_at >= since).order_by(OgGasTest.tested_at.desc()).limit(1000).all()
+    seen = set()
+    for t in tests:
+        k = (t.permit_id, _og_norm_loc(t.location))
+        if k in seen:
+            continue
+        seen.add(k)
+        if t.result == 'fail' and _og_in_area(t.location, area):
+            add(f'gas:{t.id}', 'gas', 'high', f'Last gas test failed at {t.location or "the work site"}', '; '.join(_tbt_json(t.reasons, [])), 'gas')
+    for m in OgMoc.query.filter(OgMoc.company_id == cid, OgMoc.temporary.is_(True), OgMoc.status.in_(('approved', 'implemented'))).limit(500).all():
+        if not _og_in_area(m.location, area):
+            continue
+        exp = bool(m.expires_on and m.expires_on < now.date())
+        add(f'moc:{m.id}', 'change', 'high' if exp else 'normal', f'Temporary change {m.number} {m.title} in place{"; past its end date" if exp else ""}',
+            f'Ends {m.expires_on.isoformat() if m.expires_on else "(no date)"}', 'moc')
+    for e in EquipmentItem.query.filter(EquipmentItem.company_id == cid, EquipmentItem.category == 'gas_detector', EquipmentItem.status != 'retired').limit(500).all():
+        if not _og_in_area(e.location, area):
+            continue
+        last = _og_last_check(e.id)
+        if (last and last.result == 'fail') or e.status == 'out_of_service':
+            add(f'det:{e.id}', 'detector', 'normal', f'Gas detector {e.tag_no} out of service', e.status_reason or 'Failed its last check', 'detectors')
+    for f in OgDropsFinding.query.filter(OgDropsFinding.company_id == cid, OgDropsFinding.status == 'open').limit(1000).all():
+        if not _og_in_area(f.area, area) or _og_drops_priority(f)[0] < 2:
+            continue
+        add(f'drops:{f.id}', 'dropped object', 'high', f'Dropped object risk: {f.item} at {f.area}', _og_drops_priority(f)[1], 'drops')
+    items.sort(key=lambda x: (x['level'] != 'high', x['kind']))
+    return items
+
+
+def _og_ho_dict(h, names):
+    items = _tbt_json(h.items, [])
+    return {'id': h.id, 'area': h.area, 'shift_label': h.shift_label, 'status': h.status, 'outgoing': names.get(h.outgoing_id), 'outgoing_id': h.outgoing_id,
+            'incoming': names.get(h.incoming_id), 'items': items, 'cleared': _tbt_json(h.cleared, []), 'notes': h.notes, 'concerns': h.concerns,
+            'created_at': _in_iso(h.created_at), 'accepted_at': _in_iso(h.accepted_at),
+            'acknowledged': sum(1 for i in items if i.get('ack')), 'total': len(items)}
+
+
+def _og_ho_previous(cid, area, before_id=None):
+    q = OgHandover.query.filter(OgHandover.company_id == cid, OgHandover.status == 'accepted')
+    if before_id:
+        q = q.filter(OgHandover.id < before_id)
+    a = _og_norm_loc(area)
+    for h in q.order_by(OgHandover.accepted_at.desc()).limit(200).all():
+        if _og_norm_loc(h.area) == a:
+            return h
+    return None
+
+
+def _og_ho_compare(items, prev):
+    prev_items = {i['key']: i for i in _tbt_json(prev.items, [])} if prev else {}
+    for i in items:
+        i['new'] = bool(prev) and i['key'] not in prev_items
+    now_keys = {i['key'] for i in items}
+    cleared = [{'key': k, 'title': v.get('title')} for k, v in prev_items.items() if k not in now_keys]
+    return items, cleared
+
+
+@app.route('/api/og/handovers', methods=['GET', 'POST'])
+@jwt_required
+def og_handovers():
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    if request.method == 'GET':
+        if request.args.get('preview') == '1':
+            area = _rc_text(request.args.get('area'), 200)
+            items, cleared = _og_ho_compare(_og_handover_items(user.company_id, area), _og_ho_previous(user.company_id, area))
+            return jsonify({'success': True, 'data': {'items': items, 'cleared': cleared}}), 200
+        rows = OgHandover.query.filter(OgHandover.company_id == user.company_id).order_by(OgHandover.created_at.desc()).limit(60).all()
+        names = _og_names([x for r in rows for x in (r.outgoing_id, r.incoming_id)])
+        return jsonify({'success': True, 'data': [_og_ho_dict(r, names) for r in rows], 'me': user.id}), 200
+    data = _in_body()
+    area = _rc_text(data.get('area'), 200)
+    for h in OgHandover.query.filter(OgHandover.company_id == user.company_id, OgHandover.status == 'open').all():
+        if _og_norm_loc(h.area) == _og_norm_loc(area):
+            return jsonify({'success': False, 'error': 'A handover for this area is already waiting to be accepted.'}), 409
+    items, cleared = _og_ho_compare(_og_handover_items(user.company_id, area), _og_ho_previous(user.company_id, area))
+    notes_by_key = data.get('item_notes') if isinstance(data.get('item_notes'), dict) else {}
+    for i in items:
+        i['ack'] = False
+        n = _rc_text(notes_by_key.get(i['key']), 300)
+        if n:
+            i['note'] = n
+    notes = _rc_text(data.get('notes'), 4000)
+    if not items and len(notes) < 3:
+        return jsonify({'success': False, 'error': 'Nothing live to hand over: write a note for the next shift.'}), 400
+    h = OgHandover(company_id=user.company_id, area=area or None, shift_label=_rc_text(data.get('shift_label'), 80) or None, outgoing_id=user.id,
+                   items=json.dumps(items), cleared=json.dumps(cleared), notes=notes or None)
+    db.session.add(h)
+    db.session.commit()
+    return jsonify({'success': True, 'data': _og_ho_dict(h, _og_names([user.id]))}), 201
+
+
+@app.route('/api/og/handovers/<int:hid>', methods=['PUT'])
+@jwt_required
+def og_handover_one(hid):
+    """action: ack {key, ack} | accept {concerns} | cancel . The incoming person must be someone other than the outgoing one."""
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    h = db.session.get(OgHandover, hid)
+    if not h or h.company_id != user.company_id:
+        return jsonify({'success': False, 'error': 'Handover not found.'}), 404
+    if h.status != 'open':
+        return jsonify({'success': False, 'error': f'This handover is {h.status}.'}), 409
+    data = _in_body()
+    action = data.get('action')
+    items = _tbt_json(h.items, [])
+    if action == 'cancel':
+        if user.id != h.outgoing_id and not _rc_staff(user):
+            return jsonify({'success': False, 'error': 'Only the person handing over or a supervisor can cancel.'}), 403
+        h.status = 'cancelled'
+    elif action in ('ack', 'accept'):
+        if user.id == h.outgoing_id:
+            return jsonify({'success': False, 'error': 'The person taking over must acknowledge the items, not the person handing over.'}), 409
+        if action == 'ack':
+            hit = [i for i in items if i.get('key') == data.get('key')]
+            if not hit:
+                return jsonify({'success': False, 'error': 'Item not found.'}), 404
+            hit[0]['ack'] = data.get('ack') is not False
+            hit[0]['ack_by'] = user.id
+        else:
+            live = _og_handover_items(h.company_id, h.area or '')
+            known = {i['key'] for i in items}
+            added = [dict(i, ack=False, new=True, during=True) for i in live if i['key'] not in known]
+            if added:
+                items.extend(added)
+                h.items = json.dumps(items)
+                db.session.commit()
+                return jsonify({'success': False, 'code': 'CHANGED', 'data': _og_ho_dict(h, _og_names([h.outgoing_id])),
+                                'error': f'{len(added)} item(s) appeared during the handover. Acknowledge them too.'}), 409
+            waiting = [i['title'] for i in items if not i.get('ack')]
+            if waiting:
+                return jsonify({'success': False, 'code': 'NOT_ACKNOWLEDGED',
+                                'error': f'{len(waiting)} item(s) not acknowledged yet: {"; ".join(waiting[:3])}'}), 409
+            h.status, h.incoming_id, h.accepted_at = 'accepted', user.id, datetime.utcnow()
+            h.concerns = _rc_text(data.get('concerns'), 2000) or None
+        h.items = json.dumps(items)
+    else:
+        return jsonify({'success': False, 'error': 'Unknown action.'}), 400
+    db.session.commit()
+    if action == 'accept' and h.concerns:
+        _in_notify([(u.id, getattr(u, 'email', None)) for u in _rc_staff_users(h.company_id, user.id)],
+                   f'Handover accepted with concerns{": " + h.area if h.area else ""}'[:200], h.concerns[:900],
+                   '/hse-management/industry/oil_gas?tab=handover', 'high')
+    return jsonify({'success': True, 'data': _og_ho_dict(h, _og_names([h.outgoing_id, h.incoming_id]))}), 200
+
+
+# ---------------------------------------------------------------- barrier health
+OG_BARRIERS = {'sis': 'Trips, shutdowns and interlocks', 'relief': 'Pressure relief', 'detection': 'Fire, gas and alarm detection',
+               'isolation': 'Isolation and permits', 'change': 'Management of change', 'drops': 'Dropped objects', 'handover': 'Shift handover'}
+
+
+def _og_barrier_issues(cid, now=None):
+    now = now or datetime.utcnow()
+    today = now.date()
+    out = []
+
+    def add(barrier, level, area, text, fix, tab):
+        out.append({'barrier': barrier, 'barrier_name': OG_BARRIERS[barrier], 'level': level, 'area': area or 'Site-wide', 'text': text, 'fix': fix, 'tab': tab})
+    for b in OgBypass.query.filter(OgBypass.company_id == cid, OgBypass.status == 'active').limit(2000).all():
+        bar = {'sis_trip': 'sis', 'interlock': 'sis', 'psv': 'relief', 'fire_gas': 'detection', 'alarm': 'detection'}.get(b.device_type, 'sis')
+        over = b.planned_end < now
+        add(bar, 'red' if over or bar == 'relief' else 'amber', b.location, f'{b.device_tag} bypassed{" past its planned end" if over else ""}',
+            'Reinstate and function-test the device, or re-authorise with a new end and check the compensating measures are still in place.', 'bypass')
+    for e in EquipmentItem.query.filter(EquipmentItem.company_id == cid, EquipmentItem.category == 'gas_detector', EquipmentItem.status != 'retired').limit(1000).all():
+        last = _og_last_check(e.id)
+        if (last and last.result == 'fail') or e.status == 'out_of_service':
+            add('detection', 'amber', e.location, f'Gas detector {e.tag_no} out of service', 'Recalibrate or replace it; make sure enough working detectors remain.', 'detectors')
+        elif e.cert_due and e.cert_due < today:
+            add('detection', 'red', e.location, f'Gas detector {e.tag_no} calibration expired {e.cert_due.isoformat()}', 'Calibrate before any further use.', 'detectors')
+    active = WorkPermit.query.filter(WorkPermit.company_id == cid, WorkPermit.status == 'active').limit(2000).all()
+    loc = {p.id: p.location for p in active}
+    for i in OgIsolation.query.filter(OgIsolation.company_id == cid, OgIsolation.status == 'isolated', OgIsolation.permit_id.in_(list(loc) or [0])).all():
+        add('isolation', 'red', loc.get(i.permit_id), f'Isolation {i.point_tag} not verified on a live permit', 'A second person proves zero energy (try-out) now.', 'permits')
+    for p in active:
+        last = OgGasTest.query.filter(OgGasTest.permit_id == p.id).order_by(OgGasTest.tested_at.desc()).first()
+        if last and last.result == 'fail':
+            add('isolation', 'red', p.location, f'{p.permit_number}: last gas test failed while the permit is live', 'Stop the work, ventilate or purge and retest.', 'gas')
+        recent = [o for o in (_pt_data(p).get('activation_overrides') or []) if isinstance(o, dict) and (o.get('at') or '') >= (now - timedelta(days=7)).isoformat()]
+        if recent:
+            add('isolation', 'amber', p.location, f'{p.permit_number} was started despite gate blockers', 'Check the blockers listed in the override have since been cleared.', 'permits')
+        if p.end_at and p.end_at < now:
+            add('isolation', 'amber', p.location, f'{p.permit_number} is still active past its end time', 'Extend, suspend or close the permit.', 'permits')
+    for m in OgMoc.query.filter(OgMoc.company_id == cid, OgMoc.status.in_(('approved', 'implemented'))).limit(1000).all():
+        if m.temporary and m.expires_on and m.expires_on < today:
+            add('change', 'red', m.location, f'Temporary change {m.number} past its end date', 'Remove the temporary change or extend it through a new MOC review.', 'moc')
+        elif m.status == 'implemented' and m.implemented_at and (now - m.implemented_at).days > 30:
+            gaps = [n for ok, n in ((m.psi_updated, 'process safety information'), (m.procedures_updated, 'procedures')) if not ok]
+            add('change', 'amber', m.location, f'{m.number} implemented {(now - m.implemented_at).days} days ago and not closed'
+                + (f' ({", ".join(gaps)} not updated)' if gaps else ''), 'Finish the documents and the pre-startup review, then close the change.', 'moc')
+    for f in OgDropsFinding.query.filter(OgDropsFinding.company_id == cid, OgDropsFinding.status == 'open').limit(2000).all():
+        r = _og_drops_priority(f)[0]
+        if r >= 2:
+            add('drops', 'red' if r >= 3 else 'amber', f.area, f'{f.item}: {OG_DROPS_ISSUES.get(f.issue, f.issue).lower()} ({f.energy_j:.0f} J)', _og_drops_priority(f)[1], 'drops')
+    for h in OgHandover.query.filter(OgHandover.company_id == cid, OgHandover.status == 'open').all():
+        mins = int((now - h.created_at).total_seconds() // 60)
+        if mins > OG_HANDOVER_REMIND_MIN:
+            add('handover', 'amber', h.area, f'Handover waiting {mins // 60} h {mins % 60} min to be accepted', 'The incoming person reviews and accepts it.', 'handover')
+    return out
+
+
+@app.route('/api/og/barriers', methods=['GET'])
+@jwt_required
+def og_barriers():
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    issues = _og_barrier_issues(user.company_id)
+    areas = {}
+    for i in issues:
+        k = _og_norm_loc(i['area']) or 'site wide'
+        a = areas.setdefault(k, {'area': i['area'], 'red': 0, 'amber': 0, 'barriers': {}, 'issues': []})
+        a[i['level']] += 1
+        if a['barriers'].get(i['barrier']) != 'red':
+            a['barriers'][i['barrier']] = i['level']
+        a['issues'].append(i)
+    out = []
+    for a in areas.values():
+        a['status'] = 'red' if a['red'] else 'amber'
+        a['issues'].sort(key=lambda x: x['level'] != 'red')
+        out.append(a)
+    out.sort(key=lambda a: (-a['red'], -a['amber']))
+    return jsonify({'success': True, 'data': out, 'barriers': [{'id': k, 'name': v} for k, v in OG_BARRIERS.items()],
+                    'totals': {'red': sum(a['red'] for a in out), 'amber': sum(a['amber'] for a in out)},
+                    'note': 'Built only from what is recorded here: bypasses, detectors, isolations, gas tests, permits, changes, dropped-object findings and handovers. '
+                            'Areas with nothing degraded are not listed.'}), 200
+
+
+def _og2_reminders(now=None):
+    """Handovers not accepted after 2 hours: tell the supervisors once."""
+    now = now or datetime.utcnow()
+    n = 0
+    for h in OgHandover.query.filter(OgHandover.status == 'open', OgHandover.notified.is_(False),
+                                     OgHandover.created_at < now - timedelta(minutes=OG_HANDOVER_REMIND_MIN)).limit(500).all():
+        if OgHandover.query.filter(OgHandover.id == h.id, OgHandover.notified.is_(False)).update({'notified': True}, synchronize_session=False):
+            db.session.commit()
+            n += 1
+            _in_notify([(u.id, getattr(u, 'email', None)) for u in _rc_staff_users(h.company_id)],
+                       f'Shift handover not accepted{": " + h.area if h.area else ""}'[:200],
+                       'The incoming shift has not accepted the handover after 2 hours.', '/hse-management/industry/oil_gas?tab=handover', 'high')
+    return n
+
+
+def _og2_watch_loop():
+    time.sleep(720)
+    while True:
+        try:
+            with app.app_context():
+                _og2_reminders()
+        except Exception as e:
+            logger.error(f'oil & gas handover watcher: {e}')
+        finally:
+            try:
+                with app.app_context():
+                    db.session.remove()
+            except Exception:
+                pass
+        time.sleep(900)
+
+
+if os.environ.get('READY_CHECK_WATCHER', '1') == '1':
+    threading.Thread(target=_og2_watch_loop, name='oil-gas-handover-watcher', daemon=True).start()
+
+
 # =====================================================================================================
 # AUTO MIGRATIONS (2026-11-23)
 # Railway's Data tab appends LIMIT to every query, so CREATE/ALTER statements fail there. Instead the
@@ -176655,7 +177372,7 @@ IN_LIBRARY.update({
 #   - a failing statement is logged and the file is retried on the next start
 # Set AUTO_MIGRATE=0 on Railway to switch this off.
 # =====================================================================================================
-AUTO_MIGRATIONS = ('DEPLOY_2026-11-23_FULL.sql', '2026-11-24_company_quotes.sql', '2026-11-25_ready_checks.sql', '2026-11-26_muster_contractors.sql', '2026-11-27_document_control_plus.sql', '2026-11-27_inspections.sql', '2026-11-27_chemical_safety.sql', '2026-11-27_chemical_waste.sql', '2026-11-27_equipment.sql', '2026-11-27_incident_outcomes.sql', '2026-11-27_oil_gas.sql', '2026-11-27_vision_reports.sql', '2026-11-27_mining.sql', '2026-11-27_mfg_wh.sql')
+AUTO_MIGRATIONS = ('DEPLOY_2026-11-23_FULL.sql', '2026-11-24_company_quotes.sql', '2026-11-25_ready_checks.sql', '2026-11-26_muster_contractors.sql', '2026-11-27_document_control_plus.sql', '2026-11-27_inspections.sql', '2026-11-27_chemical_safety.sql', '2026-11-27_chemical_waste.sql', '2026-11-27_equipment.sql', '2026-11-27_incident_outcomes.sql', '2026-11-27_oil_gas.sql', '2026-11-27_vision_reports.sql', '2026-11-27_mining.sql', '2026-11-27_mfg_wh.sql', '2026-11-27_og_part2.sql')
 _MIGRATION_LOCK_KEY = 74230115
 
 
