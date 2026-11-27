@@ -176056,6 +176056,595 @@ def mn_blast_act(bid):
     return jsonify({'success': True, 'data': _mn_blast_dict(b, _in_names([b.reentry_by]))}), 200
 
 
+# ============================================================================
+# MANUFACTURING & WAREHOUSE: MACHINE LOCKOUT, GUARDING, RACKING, TRAFFIC (2026-11-27)
+# ============================================================================
+# Manufacturing: machine-specific energy control procedures (OSHA 1910.147(c)(4)); a lockout can only be run from an
+# approved procedure, every energy point must be locked, zero energy verified before work and the machine checked before
+# release; the yearly periodic inspection (1910.147(c)(6)) is tracked. Guarding assessments turn missing / damaged /
+# bypassed guards into findings. Warehouse: racking damage with the SEMA / EN 15635 red-amber-green rule (amber turns red
+# if not repaired in 4 weeks), and forklift-pedestrian events by zone with the effect of each control (before / after).
+# DB: mf_procedures, mf_lockouts, mf_guarding, wh_rack_reports, wh_traffic, wh_zone_controls -> sql/2026-11-27_mfg_wh.sql
+
+
+class MfProcedure(db.Model):
+    __tablename__ = 'mf_procedures'
+    __table_args__ = {'extend_existing': True}
+    id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id', ondelete='CASCADE'), nullable=False, index=True)
+    machine = db.Column(db.String(160), nullable=False)
+    equipment_id = db.Column(db.Integer, db.ForeignKey('equipment_items.id', ondelete='SET NULL'), nullable=True)
+    location = db.Column(db.String(160))
+    energy_points = db.Column(db.Text, nullable=False)                       # JSON [{tag, energy, magnitude, location, method, verify}]
+    notes = db.Column(db.Text)
+    version = db.Column(db.Integer, nullable=False, default=1)
+    approved_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    approved_at = db.Column(db.DateTime)
+    periodic_at = db.Column(db.DateTime)
+    periodic_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    periodic_note = db.Column(db.String(1000))
+    created_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class MfLockout(db.Model):
+    __tablename__ = 'mf_lockouts'
+    __table_args__ = {'extend_existing': True}
+    id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id', ondelete='CASCADE'), nullable=False, index=True)
+    procedure_id = db.Column(db.Integer, db.ForeignKey('mf_procedures.id', ondelete='CASCADE'), nullable=False, index=True)
+    reason = db.Column(db.String(500), nullable=False)
+    points = db.Column(db.Text, nullable=False)                              # JSON [{tag, locked_by, locked_at}]
+    status = db.Column(db.String(12), nullable=False, default='locking')    # locking | locked_out | released
+    started_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    started_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    verified_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    verified_at = db.Column(db.DateTime)
+    verify_note = db.Column(db.String(500))
+    released_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    released_at = db.Column(db.DateTime)
+    release_note = db.Column(db.String(500))
+
+
+class MfGuarding(db.Model):
+    __tablename__ = 'mf_guarding'
+    __table_args__ = {'extend_existing': True}
+    id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id', ondelete='CASCADE'), nullable=False, index=True)
+    machine = db.Column(db.String(160), nullable=False)
+    location = db.Column(db.String(160))
+    points = db.Column(db.Text, nullable=False)                              # JSON [{hazard, guard, status, note}]
+    result = db.Column(db.String(10), nullable=False)                        # ok | deficient
+    assessed_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+
+class WhRackReport(db.Model):
+    __tablename__ = 'wh_rack_reports'
+    __table_args__ = {'extend_existing': True}
+    id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id', ondelete='CASCADE'), nullable=False, index=True)
+    location = db.Column(db.String(120), nullable=False)                     # aisle / bay / level
+    component = db.Column(db.String(20), nullable=False)
+    direction = db.Column(db.String(8))
+    measured_mm = db.Column(db.Float)
+    level = db.Column(db.String(6), nullable=False)                          # green | amber | red
+    description = db.Column(db.String(1000))
+    status = db.Column(db.String(10), nullable=False, default='open')       # open | offloaded | repaired
+    due_on = db.Column(db.Date)
+    reported_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    offloaded_at = db.Column(db.DateTime)
+    repaired_at = db.Column(db.DateTime)
+    repaired_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    repair_note = db.Column(db.String(1000))
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+
+class WhTraffic(db.Model):
+    __tablename__ = 'wh_traffic'
+    __table_args__ = {'extend_existing': True}
+    id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id', ondelete='CASCADE'), nullable=False, index=True)
+    zone = db.Column(db.String(120), nullable=False)
+    kind = db.Column(db.String(20), nullable=False)
+    note = db.Column(db.String(1000))
+    occurred_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    reported_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+
+
+class WhZoneControl(db.Model):
+    __tablename__ = 'wh_zone_controls'
+    __table_args__ = {'extend_existing': True}
+    id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id', ondelete='CASCADE'), nullable=False, index=True)
+    zone = db.Column(db.String(120), nullable=False)
+    control = db.Column(db.String(300), nullable=False)
+    kind = db.Column(db.String(20), nullable=False)                          # see WH_CONTROL_KINDS
+    implemented_on = db.Column(db.Date, nullable=False)
+    created_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+
+MF_ENERGY = ('electrical', 'pneumatic', 'hydraulic', 'mechanical', 'gravity', 'thermal', 'chemical', 'spring / stored', 'other')
+MF_GUARD_STATUS = ('adequate', 'missing', 'damaged', 'bypassed', 'not_applicable')
+MF_HAZARDS = ('Point of operation', 'Power transmission (belts, chains, gears)', 'In-running nip point', 'Rotating parts', 'Flying chips / sparks',
+              'Reciprocating / shearing parts', 'Hot surfaces', 'Other')
+WH_RACK_LIMITS = {'front': 5.0, 'side': 3.0}                                 # mm over a 1 m gauge length (EN 15635 uprights)
+WH_TRAFFIC_KINDS = {'near_miss': 'Near miss', 'collision': 'Collision', 'pedestrian_in_aisle': 'Pedestrian in forklift aisle',
+                    'speeding': 'Speeding', 'blind_corner': 'Blind corner incident', 'rack_strike': 'Rack strike'}
+WH_CONTROL_KINDS = {'separation': 'Physical separation (barriers, walkways)', 'engineering': 'Engineering (mirrors, lights, sensors, speed limiters)',
+                    'admin': 'Rules / signs / training', 'other': 'Other'}
+
+
+# ---------------------------------------------------------------- machine energy control procedures
+def _mf_proc_dict(p, names):
+    now = datetime.utcnow()
+    due = (p.periodic_at or p.approved_at)
+    return {'id': p.id, 'machine': p.machine, 'equipment_id': p.equipment_id, 'location': p.location, 'energy_points': _tbt_json(p.energy_points, []),
+            'notes': p.notes, 'version': p.version, 'approved': bool(p.approved_at), 'approved_by': names.get(p.approved_by), 'approved_at': _in_iso(p.approved_at),
+            'periodic_at': _in_iso(p.periodic_at), 'periodic_by': names.get(p.periodic_by), 'periodic_note': p.periodic_note,
+            'periodic_due': _in_iso(due + timedelta(days=365)) if due else None, 'periodic_overdue': bool(due and due + timedelta(days=365) < now),
+            'steps': _mf_steps(p)}
+
+
+def _mf_steps(p):
+    pts = _tbt_json(p.energy_points, [])
+    s = ['Tell everyone affected that the machine is being shut down and locked out.', f'Shut the {p.machine} down with its normal stop.']
+    for i, e in enumerate(pts, 1):
+        s.append(f'Isolate point {i} - {e.get("tag")} ({e.get("energy")}{", " + e["magnitude"] if e.get("magnitude") else ""}): {e.get("method") or "isolate"}'
+                 f'{" at " + e["location"] if e.get("location") else ""}. Fit your personal lock and tag.')
+    s += ['Release or block stored energy (bleed pressure, block raised parts, let parts stop, discharge capacitors).',
+          'Verify zero energy: make sure people are clear, try the normal start, then return the control to off.'
+          + ''.join(f' Point {i}: {e["verify"]}.' for i, e in enumerate(pts, 1) if e.get('verify')),
+          'Do the work.',
+          'Before release: tools removed, guards back on, everyone clear and told; remove locks (each person removes their own); restart.']
+    return s
+
+
+@app.route('/api/mfg/procedures', methods=['GET', 'POST'])
+@app.route('/api/mfg/procedures/<int:pid>', methods=['PUT'])
+@jwt_required
+def mf_procedures(pid=None):
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    cid = user.company_id
+    if request.method == 'GET':
+        rows = MfProcedure.query.filter(MfProcedure.company_id == cid).order_by(MfProcedure.machine).all()
+        names = _in_names([x for p in rows for x in (p.approved_by, p.periodic_by)])
+        return jsonify({'success': True, 'data': [_mf_proc_dict(p, names) for p in rows], 'can_manage': bool(_rc_staff(user)), 'energy': MF_ENERGY}), 200
+    if not _rc_staff(user):
+        return jsonify({'success': False, 'error': 'Only supervisors and admins write lockout procedures.'}), 403
+    data = _in_body()
+    p = db.session.get(MfProcedure, pid) if pid else MfProcedure(company_id=cid, created_by=user.id)
+    if pid and (not p or p.company_id != cid):
+        return jsonify({'success': False, 'error': 'Procedure not found.'}), 404
+    machine = _rc_text(data.get('machine', p.machine), 160)
+    pts = []
+    for e in (data.get('energy_points') if 'energy_points' in data else _tbt_json(p.energy_points, [])) or []:
+        if not isinstance(e, dict) or not _rc_text(e.get('tag'), 80):
+            continue
+        if e.get('energy') not in MF_ENERGY:
+            return jsonify({'success': False, 'error': f'Choose the energy type for point {_rc_text(e.get("tag"), 80)}.'}), 400
+        pts.append({k: _rc_text(e.get(k), 200) or None for k in ('tag', 'energy', 'magnitude', 'location', 'method', 'verify')})
+    if len(machine) < 2 or not pts:
+        return jsonify({'success': False, 'error': 'Name the machine and list every energy source (point) with its type.'}), 400
+    if data.get('equipment_id'):
+        e = _eq_get(user, int(data['equipment_id'])) if str(data['equipment_id']).isdigit() else None
+        if not e:
+            return jsonify({'success': False, 'error': 'Machine not found in the equipment register.'}), 400
+        p.equipment_id = e.id
+    changed = pid and (machine != p.machine or json.dumps(pts) != p.energy_points)
+    p.machine, p.energy_points = machine, json.dumps(pts[:30])
+    p.location, p.notes = _rc_text(data.get('location', p.location), 160) or None, _rc_text(data.get('notes', p.notes), 4000) or None
+    if changed:                                                             # a changed procedure must be approved again
+        p.version, p.approved_by, p.approved_at = (p.version or 1) + 1, None, None
+    if not pid:
+        db.session.add(p)
+    db.session.commit()
+    return jsonify({'success': True, 'data': _mf_proc_dict(p, {})}), 200 if pid else 201
+
+
+@app.route('/api/mfg/procedures/<int:pid>/<action>', methods=['POST'])
+@jwt_required
+def mf_procedure_act(pid, action):
+    """approve | periodic (yearly inspection: an authorised person watches a lockout and confirms it is followed)."""
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    p = db.session.get(MfProcedure, pid)
+    if not p or p.company_id != user.company_id:
+        return jsonify({'success': False, 'error': 'Procedure not found.'}), 404
+    if not _rc_staff(user):
+        return jsonify({'success': False, 'error': 'Only supervisors and admins can do this.'}), 403
+    if action == 'approve':
+        if p.created_by == user.id and _rc_staff_users(p.company_id, user.id):
+            return jsonify({'success': False, 'error': 'Another supervisor should approve the procedure you wrote.'}), 409
+        p.approved_by, p.approved_at = user.id, datetime.utcnow()
+    elif action == 'periodic':
+        if not p.approved_at:
+            return jsonify({'success': False, 'error': 'Approve the procedure first.'}), 409
+        note = _rc_text(_in_body().get('note'), 1000)
+        if len(note) < 10:
+            return jsonify({'success': False, 'error': 'Record who was observed and whether the procedure was followed (OSHA 1910.147(c)(6)).'}), 400
+        p.periodic_at, p.periodic_by, p.periodic_note = datetime.utcnow(), user.id, note
+    else:
+        return jsonify({'success': False, 'error': 'Unknown action.'}), 400
+    db.session.commit()
+    return jsonify({'success': True, 'data': _mf_proc_dict(p, _in_names([p.approved_by, p.periodic_by]))}), 200
+
+
+@app.route('/api/mfg/procedures/<int:pid>/pdf', methods=['GET'])
+@jwt_required
+def mf_procedure_pdf(pid):
+    """Placard to post on the machine."""
+    import fitz as _fz
+    import html as _h
+    user = request.user
+    p = db.session.get(MfProcedure, pid)
+    if not p or p.company_id != getattr(user, 'company_id', None):
+        return jsonify({'success': False, 'error': 'Procedure not found.'}), 404
+    names = _in_names([p.approved_by])
+    esc = lambda x: _h.escape(str(x or ''))
+    pts = _tbt_json(p.energy_points, [])
+    html_ = (f'<h1 style="color:#a8071a">LOCKOUT PROCEDURE: {esc(p.machine)}</h1><p>{esc(p.location)} | version {p.version} | '
+             f'{"approved by " + esc(names.get(p.approved_by)) + " on " + p.approved_at.strftime("%d %b %Y") if p.approved_at else "<b>NOT APPROVED - DO NOT USE</b>"}</p>'
+             '<h2>Energy sources</h2><table><tr><th>#</th><th>Point</th><th>Energy</th><th>Magnitude</th><th>Where</th><th>How to isolate</th><th>How to verify</th></tr>'
+             + ''.join(f'<tr><td>{i}</td><td>{esc(e.get("tag"))}</td><td>{esc(e.get("energy"))}</td><td>{esc(e.get("magnitude"))}</td><td>{esc(e.get("location"))}</td>'
+                       f'<td>{esc(e.get("method"))}</td><td>{esc(e.get("verify"))}</td></tr>' for i, e in enumerate(pts, 1))
+             + '</table><h2>Steps</h2><ol>' + ''.join(f'<li>{esc(s)}</li>' for s in _mf_steps(p)) + '</ol>'
+             + (f'<p>Notes: {esc(p.notes)}</p>' if p.notes else '') + '<p style="font-size:8pt">OSHA 1910.147 control of hazardous energy.</p>')
+    css = 'h1{font-size:17pt;margin:0} h2{font-size:12pt;margin:10px 0 4px} table{border-collapse:collapse;font-size:8.5pt} td,th{border:1px solid #999;padding:3px 5px} li{margin:3px 0}'
+    story = _fz.Story(html='<body style="font-family:sans-serif;font-size:10pt">' + html_ + '</body>', user_css=css)
+    buf = io.BytesIO()
+    w = _fz.DocumentWriter(buf)
+    more = True
+    while more:
+        dev = w.begin_page(_fz.paper_rect('a4'))
+        more, _ = story.place(_fz.paper_rect('a4') + (36, 36, -36, -36))
+        story.draw(dev)
+        w.end_page()
+    w.close()
+    resp = send_file(io.BytesIO(buf.getvalue()), mimetype='application/pdf', as_attachment=True,
+                     download_name=re.sub(r'[^A-Za-z0-9_-]+', '_', p.machine)[:50] + '_lockout.pdf')
+    resp.headers['Cache-Control'] = 'private, no-store'
+    return resp
+
+
+def _mf_lock_dict(l, proc, names):
+    pts = _tbt_json(l.points, [])
+    return {'id': l.id, 'procedure_id': l.procedure_id, 'machine': proc.machine if proc else None, 'reason': l.reason, 'status': l.status, 'points': pts,
+            'all_locked': all(x.get('locked_at') for x in pts), 'started_by': names.get(l.started_by), 'started_at': _in_iso(l.started_at),
+            'verified_by': names.get(l.verified_by), 'verified_at': _in_iso(l.verified_at), 'verify_note': l.verify_note,
+            'released_by': names.get(l.released_by), 'released_at': _in_iso(l.released_at), 'release_note': l.release_note}
+
+
+@app.route('/api/mfg/lockouts', methods=['GET', 'POST'])
+@jwt_required
+def mf_lockouts():
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    cid = user.company_id
+    if request.method == 'GET':
+        rows = MfLockout.query.filter(MfLockout.company_id == cid).order_by(MfLockout.started_at.desc()).limit(300).all()
+        procs = {p.id: p for p in MfProcedure.query.filter(MfProcedure.company_id == cid).all()}
+        names = _in_names([x for l in rows for x in (l.started_by, l.verified_by, l.released_by)])
+        return jsonify({'success': True, 'data': [_mf_lock_dict(l, procs.get(l.procedure_id), names) for l in rows]}), 200
+    data = _in_body()
+    p = db.session.get(MfProcedure, int(data.get('procedure_id') or 0)) if str(data.get('procedure_id') or '').isdigit() else None
+    if not p or p.company_id != cid:
+        return jsonify({'success': False, 'error': 'Choose the machine procedure.'}), 400
+    if not p.approved_at:
+        return jsonify({'success': False, 'code': 'NOT_APPROVED', 'error': 'This machine has no approved lockout procedure. Get it approved before locking out (OSHA 1910.147(c)(4)).'}), 409
+    reason = _rc_text(data.get('reason'), 500)
+    if len(reason) < 3:
+        return jsonify({'success': False, 'error': 'Say what work needs the lockout.'}), 400
+    if MfLockout.query.filter(MfLockout.procedure_id == p.id, MfLockout.status != 'released').first():
+        return jsonify({'success': False, 'error': 'This machine is already locked out. Join that lockout with your own lock.'}), 409
+    l = MfLockout(company_id=cid, procedure_id=p.id, reason=reason, started_by=user.id,
+                  points=json.dumps([{'tag': e['tag'], 'locked_by': None, 'locked_at': None} for e in _tbt_json(p.energy_points, [])]))
+    db.session.add(l)
+    db.session.commit()
+    warn = ['The yearly periodic inspection of this procedure is overdue.'] if (p.periodic_at or p.approved_at) + timedelta(days=365) < datetime.utcnow() else []
+    return jsonify({'success': True, 'data': _mf_lock_dict(l, p, _in_names([user.id])), 'warnings': warn}), 201
+
+
+@app.route('/api/mfg/lockouts/<int:lid>', methods=['POST'])
+@jwt_required
+def mf_lockout_act(lid):
+    """lock (point index) | verify (all points locked; zero energy proved) | release (after verification; machine checked)."""
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    l = db.session.get(MfLockout, lid)
+    if not l or l.company_id != user.company_id:
+        return jsonify({'success': False, 'error': 'Lockout not found.'}), 404
+    if l.status == 'released':
+        return jsonify({'success': False, 'error': 'This lockout was released.'}), 409
+    data = _in_body()
+    action = data.get('action')
+    pts = _tbt_json(l.points, [])
+    who = getattr(user, 'name', None) or f'User {user.id}'
+    if action == 'lock':
+        i = data.get('point')
+        if not isinstance(i, int) or not (0 <= i < len(pts)):
+            return jsonify({'success': False, 'error': 'Choose the point.'}), 400
+        pts[i]['locked_by'], pts[i]['locked_at'] = who, datetime.utcnow().isoformat()
+        l.points = json.dumps(pts)
+    elif action == 'verify':
+        open_pts = [x['tag'] for x in pts if not x.get('locked_at')]
+        if open_pts:
+            return jsonify({'success': False, 'code': 'NOT_LOCKED', 'error': f'Not locked yet: {", ".join(open_pts)}. Lock every point before verifying.'}), 409
+        note = _rc_text(data.get('note'), 500)
+        if len(note) < 5:
+            return jsonify({'success': False, 'error': 'Say how zero energy was proved (e.g. start button tried, gauge at zero).'}), 400
+        l.status, l.verified_by, l.verified_at, l.verify_note = 'locked_out', user.id, datetime.utcnow(), note
+    elif action == 'release':
+        if l.status != 'locked_out':
+            return jsonify({'success': False, 'error': 'Zero energy was never verified; verify, or release with a supervisor.'}), 409
+        note = _rc_text(data.get('note'), 500)
+        if len(note) < 5 or not data.get('people_clear'):
+            return jsonify({'success': False, 'error': 'Confirm tools removed, guards back on and everyone clear, and add a note.'}), 400
+        l.status, l.released_by, l.released_at, l.release_note = 'released', user.id, datetime.utcnow(), note
+    else:
+        return jsonify({'success': False, 'error': 'Unknown action.'}), 400
+    db.session.commit()
+    return jsonify({'success': True, 'data': _mf_lock_dict(l, db.session.get(MfProcedure, l.procedure_id), _in_names([l.started_by, l.verified_by, l.released_by]))}), 200
+
+
+# ---------------------------------------------------------------- guarding
+@app.route('/api/mfg/guarding', methods=['GET', 'POST'])
+@jwt_required
+def mf_guarding():
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    cid = user.company_id
+    if request.method == 'GET':
+        rows = MfGuarding.query.filter(MfGuarding.company_id == cid).order_by(MfGuarding.created_at.desc()).limit(1000).all()
+        latest = {}
+        for r in rows:
+            latest.setdefault(r.machine.lower(), r)
+        names = _in_names([r.assessed_by for r in latest.values()])
+        out = [{'id': r.id, 'machine': r.machine, 'location': r.location, 'points': _tbt_json(r.points, []), 'result': r.result,
+                'deficiencies': [x for x in _tbt_json(r.points, []) if x['status'] in ('missing', 'damaged', 'bypassed')],
+                'assessed_by': names.get(r.assessed_by), 'at': _in_iso(r.created_at)} for r in latest.values()]
+        out.sort(key=lambda x: (x['result'] != 'deficient', x['machine']))
+        return jsonify({'success': True, 'data': out, 'hazards': MF_HAZARDS, 'statuses': MF_GUARD_STATUS}), 200
+    data = _in_body()
+    machine = _rc_text(data.get('machine'), 160)
+    pts = []
+    for x in (data.get('points') or [])[:30]:
+        if not isinstance(x, dict) or x.get('status') not in MF_GUARD_STATUS or not _rc_text(x.get('hazard'), 120):
+            return jsonify({'success': False, 'error': 'Each hazard point needs what it is and the guard status.'}), 400
+        if x['status'] in ('missing', 'damaged', 'bypassed') and len(_rc_text(x.get('note'), 300)) < 3:
+            return jsonify({'success': False, 'error': f'Say what is wrong at "{_rc_text(x.get("hazard"), 60)}".'}), 400
+        pts.append({'hazard': _rc_text(x['hazard'], 120), 'guard': _rc_text(x.get('guard'), 120) or None, 'status': x['status'], 'note': _rc_text(x.get('note'), 300) or None})
+    if len(machine) < 2 or not pts:
+        return jsonify({'success': False, 'error': 'Name the machine and assess at least one hazard point.'}), 400
+    bad = [x for x in pts if x['status'] in ('missing', 'damaged', 'bypassed')]
+    g = MfGuarding(company_id=cid, machine=machine, location=_rc_text(data.get('location'), 160) or None, points=json.dumps(pts),
+                   result='deficient' if bad else 'ok', assessed_by=user.id)
+    db.session.add(g)
+    db.session.commit()
+    if bad:
+        _in_notify([(u.id, getattr(u, 'email', None)) for u in _rc_staff_users(cid, user.id)], f'Machine guarding deficient: {machine}'[:200],
+                   '; '.join(f'{x["hazard"]}: {x["status"]} ({x["note"]})' for x in bad)[:900], '/hse-management/industry/general?tab=guarding',
+                   'critical' if any(x['status'] in ('missing', 'bypassed') and x['hazard'] == 'Point of operation' for x in bad) else 'high')
+    return jsonify({'success': True, 'data': {'id': g.id, 'result': g.result, 'deficiencies': len(bad)}}), 201
+
+
+# ---------------------------------------------------------------- racking (SEMA / EN 15635 traffic light)
+def _wh_level_from_measure(direction, mm):
+    lim = WH_RACK_LIMITS[direction]
+    return 'red' if mm >= 2 * lim else 'amber' if mm > lim else 'green'
+
+
+def _wh_rack_dict(r, names, today=None):
+    today = today or datetime.utcnow().date()
+    level = r.level
+    escalated = r.status == 'open' and r.level == 'amber' and r.due_on and r.due_on < today
+    if escalated:
+        level = 'red'
+    action = {'red': 'Offload now and isolate the bay; no reloading until repaired.',
+              'amber': f'Offload and do not reload until repaired; repair by {r.due_on.isoformat() if r.due_on else "-"} or it becomes red.',
+              'green': 'Record and re-check at the next inspection.'}[level]
+    return {'id': r.id, 'location': r.location, 'component': r.component, 'direction': r.direction, 'measured_mm': r.measured_mm, 'level': level,
+            'reported_level': r.level, 'escalated': bool(escalated), 'description': r.description, 'status': r.status, 'due_on': r.due_on.isoformat() if r.due_on else None,
+            'action': action if r.status != 'repaired' else 'Repaired', 'reported_by': names.get(r.reported_by), 'at': _in_iso(r.created_at),
+            'offloaded_at': _in_iso(r.offloaded_at), 'repaired_at': _in_iso(r.repaired_at), 'repair_note': r.repair_note}
+
+
+@app.route('/api/wh/racking', methods=['GET', 'POST'])
+@jwt_required
+def wh_racking():
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    cid = user.company_id
+    if request.method == 'GET':
+        rows = WhRackReport.query.filter(WhRackReport.company_id == cid).order_by(WhRackReport.created_at.desc()).limit(2000).all()
+        names = _in_names([r.reported_by for r in rows])
+        out = [_wh_rack_dict(r, names) for r in rows]
+        order = {'red': 0, 'amber': 1, 'green': 2}
+        out.sort(key=lambda x: (x['status'] == 'repaired', order[x['level']], x['at'] or ''))
+        open_ = [x for x in out if x['status'] != 'repaired']
+        return jsonify({'success': True, 'data': out, 'can_manage': bool(_rc_staff(user)), 'limits': WH_RACK_LIMITS,
+                        'counts': {lv: sum(1 for x in open_ if x['level'] == lv) for lv in ('red', 'amber', 'green')}}), 200
+    data = _in_body()
+    loc = _rc_text(data.get('location'), 120)
+    comp = data.get('component')
+    if len(loc) < 1 or comp not in ('upright', 'beam', 'bracing', 'baseplate', 'beam_connector', 'other'):
+        return jsonify({'success': False, 'error': 'Give the bay location and the damaged part.'}), 400
+    mm, direction = data.get('measured_mm'), data.get('direction')
+    if mm not in (None, '') and comp == 'upright':
+        try:
+            mm = float(mm)
+        except (TypeError, ValueError):
+            return jsonify({'success': False, 'error': 'The measurement must be a number of millimetres.'}), 400
+        if direction not in WH_RACK_LIMITS or not (0 <= mm <= 500):
+            return jsonify({'success': False, 'error': 'Give the direction (front or side) and a measurement in mm over a 1 m straight edge.'}), 400
+        level = _wh_level_from_measure(direction, mm)
+    else:
+        mm, direction = None, None
+        level = data.get('level')
+        if level not in ('green', 'amber', 'red'):
+            return jsonify({'success': False, 'error': 'Choose the damage level (or measure the upright).'}), 400
+    r = WhRackReport(company_id=cid, location=loc, component=comp, direction=direction, measured_mm=mm, level=level,
+                     description=_rc_text(data.get('description'), 1000) or None, reported_by=user.id,
+                     due_on=(datetime.utcnow().date() + timedelta(days=28)) if level == 'amber' else None)
+    db.session.add(r)
+    db.session.commit()
+    if level == 'red':
+        _in_notify([(u.id, getattr(u, 'email', None)) for u in _rc_staff_users(cid, user.id)], f'RED rack damage: {loc}'[:200],
+                   f'{comp}{f" {mm} mm {direction}" if mm is not None else ""}. Offload now and isolate the bay.', '/hse-management/industry/general?tab=racking', 'critical', email=True)
+    return jsonify({'success': True, 'data': _wh_rack_dict(r, _in_names([user.id]))}), 201
+
+
+@app.route('/api/wh/racking/<int:rid>', methods=['POST'])
+@jwt_required
+def wh_rack_act(rid):
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    r = db.session.get(WhRackReport, rid)
+    if not r or r.company_id != user.company_id:
+        return jsonify({'success': False, 'error': 'Report not found.'}), 404
+    data = _in_body()
+    if data.get('action') == 'offload':
+        if r.status != 'open':
+            return jsonify({'success': False, 'error': f'Already {r.status}.'}), 409
+        r.status, r.offloaded_at = 'offloaded', datetime.utcnow()
+    elif data.get('action') == 'repair':
+        if not _rc_staff(user):
+            return jsonify({'success': False, 'error': 'Only a supervisor or the racking responsible person can sign off a repair.'}), 403
+        note = _rc_text(data.get('note'), 1000)
+        if len(note) < 5:
+            return jsonify({'success': False, 'error': 'Say what was replaced or repaired (damaged uprights are replaced, not straightened).'}), 400
+        r.status, r.repaired_at, r.repaired_by, r.repair_note = 'repaired', datetime.utcnow(), user.id, note
+    else:
+        return jsonify({'success': False, 'error': 'Unknown action.'}), 400
+    db.session.commit()
+    return jsonify({'success': True, 'data': _wh_rack_dict(r, _in_names([r.reported_by]))}), 200
+
+
+# ---------------------------------------------------------------- forklift / pedestrian traffic by zone
+def _wh_zone_key(z):
+    return re.sub(r'\s+', ' ', (z or '').strip().lower())
+
+
+@app.route('/api/wh/traffic', methods=['GET', 'POST'])
+@jwt_required
+def wh_traffic():
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    cid = user.company_id
+    if request.method == 'POST':
+        data = _in_body()
+        zone, kind = _rc_text(data.get('zone'), 120), data.get('kind')
+        if len(zone) < 1 or kind not in WH_TRAFFIC_KINDS:
+            return jsonify({'success': False, 'error': 'Give the zone and what happened.'}), 400
+        try:
+            at = _pt_parse_dt(data.get('occurred_at')) if data.get('occurred_at') else datetime.utcnow()
+        except ValueError:
+            return jsonify({'success': False, 'error': 'Check the date and time.'}), 400
+        if at > datetime.utcnow() + timedelta(hours=14):
+            return jsonify({'success': False, 'error': 'The time cannot be in the future.'}), 400
+        e = WhTraffic(company_id=cid, zone=zone, kind=kind, note=_rc_text(data.get('note'), 1000) or None, occurred_at=at, reported_by=user.id)
+        db.session.add(e)
+        db.session.commit()
+        if kind == 'collision':
+            _in_notify([(u.id, getattr(u, 'email', None)) for u in _rc_staff_users(cid, user.id)], f'Forklift collision: {zone}'[:200],
+                       e.note or 'Report it as an incident too.', '/hse-management/industry/general?tab=traffic', 'critical', email=True)
+        return jsonify({'success': True, 'data': {'id': e.id}}), 201
+    days = 90
+    since = datetime.utcnow() - timedelta(days=days)
+    ev = WhTraffic.query.filter(WhTraffic.company_id == cid, WhTraffic.occurred_at >= since - timedelta(days=180)).all()
+    ctrls = WhZoneControl.query.filter(WhZoneControl.company_id == cid).order_by(WhZoneControl.implemented_on).all()
+    zones = {}
+    for e in ev:
+        z = zones.setdefault(_wh_zone_key(e.zone), {'zone': e.zone, 'events': [], 'controls': []})
+        z['events'].append(e)
+    for c in ctrls:
+        zones.setdefault(_wh_zone_key(c.zone), {'zone': c.zone, 'events': [], 'controls': []})['controls'].append(c)
+    out = []
+    now = datetime.utcnow()
+    for k, z in zones.items():
+        recent = [e for e in z['events'] if e.occurred_at >= since]
+        weight = sum(5 if e.kind == 'collision' else 2 if e.kind in ('near_miss', 'rack_strike') else 1 for e in recent)
+        effects = []
+        for c in z['controls']:
+            t0 = datetime.combine(c.implemented_on, datetime.min.time())
+            after_days = max(1, min(90, (now - t0).days))
+            before = [e for e in z['events'] if t0 - timedelta(days=after_days) <= e.occurred_at < t0]
+            after = [e for e in z['events'] if t0 <= e.occurred_at < t0 + timedelta(days=after_days)]
+            effects.append({'control': c.control, 'kind': WH_CONTROL_KINDS.get(c.kind, c.kind), 'implemented_on': c.implemented_on.isoformat(), 'days_compared': after_days,
+                            'before_per_week': round(len(before) * 7 / after_days, 2), 'after_per_week': round(len(after) * 7 / after_days, 2),
+                            'verdict': ('too early to tell' if after_days < 14 else 'working' if len(after) < len(before) * 0.7 else 'no clear change' if len(after) <= len(before) else 'worse')})
+        kinds = {}
+        for e in recent:
+            kinds[e.kind] = kinds.get(e.kind, 0) + 1
+        has_sep = any(c.kind == 'separation' for c in z['controls'])
+        advice = []
+        if recent and not has_sep and (kinds.get('pedestrian_in_aisle') or kinds.get('near_miss') or kinds.get('collision')):
+            advice.append('Separate people from forklifts here: fixed barriers and a marked walkway or crossing point (most effective).')
+        if kinds.get('blind_corner'):
+            advice.append('Blind corner: convex mirrors or forklift / pedestrian warning lights, and a stop-and-sound rule.')
+        if kinds.get('speeding'):
+            advice.append('Speed: speed limiters on the trucks or zone speed limits enforced by telematics.')
+        if kinds.get('rack_strike'):
+            advice.append('Rack strikes: column guards and end-of-aisle barriers; check aisle width against the truck turning circle.')
+        out.append({'zone': z['zone'], 'events_90d': len(recent), 'score': weight, 'kinds': {WH_TRAFFIC_KINDS[k]: v for k, v in kinds.items()},
+                    'last': _in_iso(max((e.occurred_at for e in recent), default=None)), 'controls': effects, 'advice': advice})
+    out.sort(key=lambda x: -x['score'])
+    return jsonify({'success': True, 'data': out, 'kinds': WH_TRAFFIC_KINDS, 'control_kinds': WH_CONTROL_KINDS, 'can_manage': bool(_rc_staff(user))}), 200
+
+
+@app.route('/api/wh/traffic/controls', methods=['POST'])
+@jwt_required
+def wh_traffic_control():
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    if not _rc_staff(user):
+        return jsonify({'success': False, 'error': 'Only supervisors and admins record controls.'}), 403
+    data = _in_body()
+    zone, ctrl, kind = _rc_text(data.get('zone'), 120), _rc_text(data.get('control'), 300), data.get('kind')
+    try:
+        on = _ct_date(data.get('implemented_on')) or datetime.utcnow().date()
+    except ValueError as e:
+        return jsonify({'success': False, 'error': str(e)}), 400
+    if len(zone) < 1 or len(ctrl) < 3 or kind not in WH_CONTROL_KINDS:
+        return jsonify({'success': False, 'error': 'Give the zone, the control and its type.'}), 400
+    c = WhZoneControl(company_id=user.company_id, zone=zone, control=ctrl, kind=kind, implemented_on=on, created_by=user.id)
+    db.session.add(c)
+    db.session.commit()
+    return jsonify({'success': True, 'data': {'id': c.id}}), 201
+
+
+IN_LIBRARY.update({
+    'loading_dock': _in_lib('Loading dock check', 'Warehouse', 'Before loading or unloading each trailer.', [
+        ('Vehicle', [('Trailer is restrained (vehicle restraint engaged or wheels chocked) before anyone enters it', 'c'),
+                     'Driver keys removed or driver in the safe waiting area', 'Trailer floor checked: no holes or soft spots', 'Trailer is level / supported (landing legs or trailer stand)']),
+        ('Dock', [('Dock leveller or dock plate is rated for the load and secured', 'c'), 'Dock edge is protected when no trailer is present', 'Lighting inside the trailer is adequate']),
+        ('People', ['Pedestrians kept out of the forklift path on the dock', 'Loads are stable and within the truck capacity']),
+        ('Notes', [('Defects found', 't')]),
+    ]),
+})
+
+
 # =====================================================================================================
 # AUTO MIGRATIONS (2026-11-23)
 # Railway's Data tab appends LIMIT to every query, so CREATE/ALTER statements fail there. Instead the
@@ -176066,7 +176655,7 @@ def mn_blast_act(bid):
 #   - a failing statement is logged and the file is retried on the next start
 # Set AUTO_MIGRATE=0 on Railway to switch this off.
 # =====================================================================================================
-AUTO_MIGRATIONS = ('DEPLOY_2026-11-23_FULL.sql', '2026-11-24_company_quotes.sql', '2026-11-25_ready_checks.sql', '2026-11-26_muster_contractors.sql', '2026-11-27_document_control_plus.sql', '2026-11-27_inspections.sql', '2026-11-27_chemical_safety.sql', '2026-11-27_chemical_waste.sql', '2026-11-27_equipment.sql', '2026-11-27_incident_outcomes.sql', '2026-11-27_oil_gas.sql', '2026-11-27_vision_reports.sql', '2026-11-27_mining.sql')
+AUTO_MIGRATIONS = ('DEPLOY_2026-11-23_FULL.sql', '2026-11-24_company_quotes.sql', '2026-11-25_ready_checks.sql', '2026-11-26_muster_contractors.sql', '2026-11-27_document_control_plus.sql', '2026-11-27_inspections.sql', '2026-11-27_chemical_safety.sql', '2026-11-27_chemical_waste.sql', '2026-11-27_equipment.sql', '2026-11-27_incident_outcomes.sql', '2026-11-27_oil_gas.sql', '2026-11-27_vision_reports.sql', '2026-11-27_mining.sql', '2026-11-27_mfg_wh.sql')
 _MIGRATION_LOCK_KEY = 74230115
 
 
