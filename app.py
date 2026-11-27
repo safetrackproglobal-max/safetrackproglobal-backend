@@ -171187,6 +171187,11 @@ def in_complete_route(iid):
                 nxt += step
             s.next_due, s.notified_on = nxt, None
     db.session.commit()
+    try:
+        _eq_after_inspection(ins, user)                                       # equipment register: tag status, next due
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f'equipment after inspection {ins.id}: {e}')
     for a in plans:
         if a.assignee_id and a.assignee_id != user.id:
             _in_notify(_in_user_target(a.assignee_id), f'Action for you: {a.title[:120]}',
@@ -173187,6 +173192,583 @@ IN_LIBRARY.update({
 })
 
 
+# ============================================================================
+# EQUIPMENT REGISTER & QR SAFETY TAGS (2026-11-27)
+# ============================================================================
+# Company equipment (forklifts, cranes, lifting gear, harnesses, ladders, scaffolds, extinguishers, tools, detectors ...)
+# with a printed QR safety tag. The tag status comes from the equipment's own inspections (Inspections module): safe to
+# use, inspection overdue, certificate expired, or DO NOT USE after a critical failure (until a supervisor releases it).
+# Scanning: signed-in company users see everything; the public status view (no names) only when the company switches it
+# on (company setting eq_settings:<cid>, default off).
+# DB: equipment_items, equipment_inspections, equipment_log -> sql/2026-11-27_equipment.sql (auto migration)
+
+
+class EquipmentItem(db.Model):
+    __tablename__ = 'equipment_items'
+    __table_args__ = (db.UniqueConstraint('company_id', 'tag_no', name='uq_equipment_items_company_tag'), {'extend_existing': True})
+    id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id', ondelete='CASCADE'), nullable=False, index=True)
+    tag_no = db.Column(db.String(20), nullable=False)                         # EQ-0001, per company
+    qr_token = db.Column(db.String(32), nullable=False, unique=True, index=True)
+    name = db.Column(db.String(200), nullable=False)
+    category = db.Column(db.String(30), nullable=False, default='other')
+    make = db.Column(db.String(120))
+    model = db.Column(db.String(120))
+    serial_no = db.Column(db.String(120))
+    location = db.Column(db.String(160))
+    ownership = db.Column(db.String(12), nullable=False, default='owned')    # owned | hired | contractor
+    supplier = db.Column(db.String(160))
+    arrived_on = db.Column(db.Date)
+    checklist_ref = db.Column(db.String(40))                                 # lib:<key> | tpl:<id>
+    inspect_every_days = db.Column(db.Integer)
+    next_due = db.Column(db.Date)
+    cert_name = db.Column(db.String(120))                                    # e.g. "Thorough examination (LOLER)"
+    cert_due = db.Column(db.Date)
+    status = db.Column(db.String(16), nullable=False, default='in_service')  # in_service | out_of_service | retired
+    status_reason = db.Column(db.String(500))
+    last_inspection_id = db.Column(db.Integer)
+    last_inspected_at = db.Column(db.DateTime)
+    last_result = db.Column(db.String(10))                                   # pass | fail | critical
+    notes = db.Column(db.Text)
+    notified_on = db.Column(db.Date)
+    created_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class EquipmentInspection(db.Model):
+    __tablename__ = 'equipment_inspections'
+    __table_args__ = {'extend_existing': True}
+    inspection_id = db.Column(db.Integer, db.ForeignKey('inspections.id', ondelete='CASCADE'), primary_key=True)
+    equipment_id = db.Column(db.Integer, db.ForeignKey('equipment_items.id', ondelete='CASCADE'), nullable=False, index=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id', ondelete='CASCADE'), nullable=False, index=True)
+
+
+class EquipmentLog(db.Model):
+    __tablename__ = 'equipment_log'
+    __table_args__ = {'extend_existing': True}
+    id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id', ondelete='CASCADE'), nullable=False, index=True)
+    equipment_id = db.Column(db.Integer, db.ForeignKey('equipment_items.id', ondelete='CASCADE'), nullable=False, index=True)
+    kind = db.Column(db.String(16), nullable=False)                          # created | status | inspection | certificate | edit
+    text = db.Column(db.String(600), nullable=False)
+    inspection_id = db.Column(db.Integer)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+
+# category -> (label, default checklist, default days between inspections, certificate name, certificate months)
+# Intervals are common practice defaults; the company changes them to match its law and the maker's instructions.
+EQ_CATEGORIES = {
+    'forklift': ('Forklift / lift truck', 'lib:forklift', 1, 'Thorough examination (lifting equipment)', 12),
+    'crane': ('Crane', 'lib:crane', 1, 'Thorough examination (lifting equipment)', 12),
+    'lifting_gear': ('Lifting accessories (slings, shackles, hooks, chain blocks)', 'lib:lifting_gear', 1, 'Thorough examination (lifting accessories)', 6),
+    'mewp': ('Mobile elevating work platform', None, 1, 'Thorough examination (lifting people)', 6),
+    'vehicle': ('Vehicle / mobile plant', 'lib:vehicle', 1, None, None),
+    'harness': ('Harness and lanyard', 'lib:harness', 1, 'Detailed inspection by a competent person', 6),
+    'ladder': ('Ladder / step ladder', 'lib:ladder', 7, None, None),
+    'scaffold': ('Scaffold', 'lib:scaffold', 7, None, None),
+    'extinguisher': ('Fire extinguisher', 'lib:extinguisher', 30, 'Annual service', 12),
+    'electrical': ('Portable electrical tool', 'lib:electrical', 7, 'Portable appliance test', 12),
+    'gas_detector': ('Gas detector', 'lib:gas_detector', 1, 'Calibration', 6),
+    'pressure': ('Pressure system (compressor, receiver, boiler)', None, 30, 'Written-scheme examination', 12),
+    'generator': ('Generator', None, 7, None, None),
+    'machinery': ('Fixed machinery', None, 30, None, None),
+    'ppe': ('Other PPE / rescue kit', None, 30, None, None),
+    'other': ('Other', None, 30, None, None),
+}
+EQ_DEFAULT_SETTINGS = {'public_status': False}
+
+
+def _eq_settings(cid):
+    return _dm_setting_get('eq_settings', cid, EQ_DEFAULT_SETTINGS)
+
+
+def _eq_state(e, today=None):
+    """What the tag says now: (code, label, level)."""
+    today = today or datetime.utcnow().date()
+    if e.status == 'retired':
+        return 'retired', 'Retired: do not use', 'grey'
+    if e.status == 'out_of_service':
+        return 'do_not_use', 'DO NOT USE', 'red'
+    if e.cert_due and e.cert_due < today:
+        return 'cert_expired', f'{e.cert_name or "Certificate"} expired: do not use', 'red'
+    if e.next_due and e.next_due < today:
+        return 'overdue', 'Inspection overdue: inspect before use', 'orange'
+    if not e.last_inspected_at:
+        return 'not_inspected', 'Not inspected yet: inspect before use', 'orange'
+    return 'ok', 'Safe to use', 'green'
+
+
+def _eq_dict(e, full=False, today=None):
+    today = today or datetime.utcnow().date()
+    code, label, level = _eq_state(e, today)
+    cat = EQ_CATEGORIES.get(e.category, EQ_CATEGORIES['other'])
+    d = {'id': e.id, 'tag_no': e.tag_no, 'name': e.name, 'category': e.category, 'category_name': cat[0], 'make': e.make, 'model': e.model,
+         'serial_no': e.serial_no, 'location': e.location, 'ownership': e.ownership, 'supplier': e.supplier,
+         'arrived_on': e.arrived_on.isoformat() if e.arrived_on else None, 'checklist_ref': e.checklist_ref,
+         'inspect_every_days': e.inspect_every_days, 'next_due': e.next_due.isoformat() if e.next_due else None,
+         'cert_name': e.cert_name, 'cert_due': e.cert_due.isoformat() if e.cert_due else None, 'status': e.status,
+         'status_reason': e.status_reason, 'last_inspection_id': e.last_inspection_id, 'last_inspected_at': _in_iso(e.last_inspected_at),
+         'last_result': e.last_result, 'state': code, 'state_label': label, 'state_level': level,
+         'days_to_due': (e.next_due - today).days if e.next_due else None, 'updated_at': _in_iso(e.updated_at)}
+    if full:
+        d.update({'notes': e.notes, 'qr_url': f'{_wf_frontend_url()}/tag/{e.qr_token}'})
+    return d
+
+
+def _eq_public_dict(e):
+    code, label, level = _eq_state(e)
+    cat = EQ_CATEGORIES.get(e.category, EQ_CATEGORIES['other'])
+    return {'tag_no': e.tag_no, 'name': e.name, 'category_name': cat[0], 'state': code, 'state_label': label, 'state_level': level,
+            'last_inspected_on': e.last_inspected_at.date().isoformat() if e.last_inspected_at else None,
+            'last_result': e.last_result, 'next_due': e.next_due.isoformat() if e.next_due else None,
+            'cert_name': e.cert_name, 'cert_due': e.cert_due.isoformat() if e.cert_due else None}
+
+
+def _eq_log(e, kind, text, user_id=None, inspection_id=None):
+    db.session.add(EquipmentLog(company_id=e.company_id, equipment_id=e.id, kind=kind, text=str(text)[:600], user_id=user_id,
+                                inspection_id=inspection_id))
+
+
+def _eq_get(user, eid):
+    e = db.session.get(EquipmentItem, eid)
+    return e if e and e.company_id == getattr(user, 'company_id', None) else None
+
+
+def _eq_next_tag(cid):
+    rows = db.session.query(EquipmentItem.tag_no).filter(EquipmentItem.company_id == cid).all()
+    n = max([int(m.group(1)) for (t,) in rows for m in [re.fullmatch(r'EQ-(\d+)', t or '')] if m] or [0])
+    return f'EQ-{n + 1:04d}'
+
+
+def _eq_check_ref(user, ref):
+    if ref in (None, ''):
+        return None
+    ref = str(ref)
+    if ref.startswith('lib:') and ref[4:] in IN_LIBRARY:
+        return ref
+    if ref.startswith('tpl:') and ref[4:].isdigit():
+        t = db.session.get(InspectionTemplate, int(ref[4:]))
+        if t and t.company_id == user.company_id and not t.archived:
+            return ref
+    raise ValueError('Choose a checklist from the Inspections list.')
+
+
+def _eq_apply(e, data, user):
+    new = e.id is None
+    if 'name' in data or new:
+        name = _rc_text(data.get('name'), 200)
+        if len(name) < 2:
+            raise ValueError('Give the equipment a name, e.g. "Toyota forklift 2.5 t".')
+        e.name = name
+    if 'category' in data or new:
+        c = str(data.get('category') or 'other')
+        if c not in EQ_CATEGORIES:
+            raise ValueError('Unknown equipment type.')
+        e.category = c
+    cat = EQ_CATEGORIES[e.category]
+    for f, n in (('make', 120), ('model', 120), ('serial_no', 120), ('location', 160), ('supplier', 160), ('cert_name', 120), ('notes', 4000)):
+        if f in data:
+            setattr(e, f, _rc_text(data.get(f), n) or None)
+    if 'ownership' in data:
+        o = str(data.get('ownership') or 'owned')
+        if o not in ('owned', 'hired', 'contractor'):
+            raise ValueError('Ownership must be owned, hired or contractor.')
+        e.ownership = o
+    if 'arrived_on' in data:
+        e.arrived_on = _ct_date(data.get('arrived_on'))
+    if 'checklist_ref' in data:
+        e.checklist_ref = _eq_check_ref(user, data.get('checklist_ref'))
+    elif new:
+        e.checklist_ref = cat[1]
+    if 'inspect_every_days' in data:
+        v = data.get('inspect_every_days')
+        if v in (None, ''):
+            e.inspect_every_days = None
+        else:
+            try:
+                v = int(v)
+            except (TypeError, ValueError):
+                raise ValueError('Days between inspections must be a whole number.')
+            if v < 1 or v > 1825:
+                raise ValueError('Days between inspections must be between 1 and 1825.')
+            e.inspect_every_days = v
+    elif new:
+        e.inspect_every_days = cat[2]
+    if 'next_due' in data:
+        e.next_due = _ct_date(data.get('next_due'))
+    elif new:
+        e.next_due = datetime.utcnow().date()                                # inspect on arrival
+    if 'cert_due' in data:
+        e.cert_due = _ct_date(data.get('cert_due'))
+    if new and not e.cert_name and cat[3]:
+        e.cert_name = cat[3]
+
+
+@app.route('/api/equipment/meta', methods=['GET'])
+@jwt_required
+def eq_meta_route():
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    return jsonify({'success': True, 'data': {
+        'categories': [{'id': k, 'name': v[0], 'checklist_ref': v[1], 'every_days': v[2], 'cert_name': v[3], 'cert_months': v[4]}
+                       for k, v in EQ_CATEGORIES.items()],
+        'settings': _eq_settings(user.company_id), 'can_manage': bool(_rc_staff(user))}}), 200
+
+
+@app.route('/api/equipment/settings', methods=['PUT'])
+@jwt_required
+def eq_settings_route():
+    user = request.user
+    deny = _in_company_403(user) or _eq_staff_403(user)
+    if deny:
+        return deny
+    data = _in_body()
+    cur = _eq_settings(user.company_id)
+    if 'public_status' in data:
+        cur['public_status'] = bool(data.get('public_status'))
+    _dm_setting_put('eq_settings', user.company_id, {'public_status': cur['public_status']}, user.id)
+    db.session.commit()
+    return jsonify({'success': True, 'data': cur}), 200
+
+
+def _eq_staff_403(user):
+    if not _rc_staff(user):
+        return jsonify({'success': False, 'error': 'Only supervisors and admins can change the equipment register.'}), 403
+    return None
+
+
+@app.route('/api/equipment', methods=['GET', 'POST'])
+@jwt_required
+def eq_list_route():
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    if request.method == 'GET':
+        rows = (EquipmentItem.query.filter(EquipmentItem.company_id == user.company_id)
+                .order_by(EquipmentItem.tag_no.asc()).limit(5000).all())
+        today = datetime.utcnow().date()
+        out = [_eq_dict(e, today=today) for e in rows]
+        counts = {}
+        for x in out:
+            if x['status'] != 'retired':
+                counts[x['state']] = counts.get(x['state'], 0) + 1
+        return jsonify({'success': True, 'data': out, 'counts': counts, 'can_manage': bool(_rc_staff(user))}), 200
+    deny = _eq_staff_403(user)
+    if deny:
+        return deny
+    data = _in_body()
+    e = EquipmentItem(company_id=user.company_id, created_by=user.id, status='in_service', qr_token=secrets.token_urlsafe(16)[:22])
+    try:
+        _eq_apply(e, data, user)
+    except ValueError as ex:
+        db.session.rollback()
+        return jsonify({'success': False, 'error': str(ex)}), 400
+    e.tag_no = _eq_next_tag(user.company_id)
+    db.session.add(e)
+    try:
+        db.session.flush()
+    except Exception:                                                         # two people added equipment at the same moment
+        db.session.rollback()
+        return jsonify({'success': False, 'error': 'Someone added equipment at the same moment. Save again.'}), 409
+    _eq_log(e, 'created', f'Added to the register as {e.tag_no}' + (f' at {e.location}' if e.location else ''), user.id)
+    db.session.commit()
+    return jsonify({'success': True, 'data': _eq_dict(e, full=True)}), 201
+
+
+@app.route('/api/equipment/<int:eid>', methods=['GET', 'PUT', 'DELETE'])
+@jwt_required
+def eq_one_route(eid):
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    e = _eq_get(user, eid)
+    if not e:
+        return jsonify({'success': False, 'error': 'Equipment not found.'}), 404
+    if request.method == 'GET':
+        links = [x.inspection_id for x in EquipmentInspection.query.filter_by(equipment_id=e.id).all()]
+        ins = (Inspection.query.filter(Inspection.id.in_(links)).order_by(Inspection.started_at.desc()).limit(50).all()) if links else []
+        names = _in_names([i.inspector_id for i in ins] + [l.user_id for l in EquipmentLog.query.filter_by(equipment_id=e.id).all()])
+        log = EquipmentLog.query.filter_by(equipment_id=e.id).order_by(EquipmentLog.created_at.desc()).limit(100).all()
+        return jsonify({'success': True, 'data': {**_eq_dict(e, full=True),
+            'inspections': [{'id': i.id, 'title': i.title, 'status': i.status, 'inspector': names.get(i.inspector_id),
+                             'score': i.score, 'max_score': i.max_score, 'failed_count': i.failed_count, 'critical_failed': i.critical_failed,
+                             'started_at': _in_iso(i.started_at), 'completed_at': _in_iso(i.completed_at)} for i in ins],
+            'log': [{'kind': l.kind, 'text': l.text, 'by': names.get(l.user_id), 'at': _in_iso(l.created_at), 'inspection_id': l.inspection_id} for l in log]},
+            'can_manage': bool(_rc_staff(user))}), 200
+    deny = _eq_staff_403(user)
+    if deny:
+        return deny
+    if request.method == 'DELETE':
+        if EquipmentInspection.query.filter_by(equipment_id=e.id).first():
+            return jsonify({'success': False, 'error': 'This equipment has inspection records. Retire it instead of deleting it.'}), 409
+        db.session.delete(e)
+        db.session.commit()
+        return jsonify({'success': True}), 200
+    data = _in_body()
+    before = (e.cert_due, e.location)
+    try:
+        _eq_apply(e, data, user)
+    except ValueError as ex:
+        db.session.rollback()
+        return jsonify({'success': False, 'error': str(ex)}), 400
+    if e.cert_due != before[0]:
+        _eq_log(e, 'certificate', f'{e.cert_name or "Certificate"} due date set to {e.cert_due.isoformat() if e.cert_due else "none"}', user.id)
+    if e.location != before[1]:
+        _eq_log(e, 'edit', f'Moved to {e.location or "no location"}', user.id)
+    db.session.commit()
+    return jsonify({'success': True, 'data': _eq_dict(e, full=True)}), 200
+
+
+@app.route('/api/equipment/<int:eid>/status', methods=['POST'])
+@jwt_required
+def eq_status_route(eid):
+    """Take out of service (anyone in the company can stop unsafe equipment), return to service or retire (supervisors)."""
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    e = _eq_get(user, eid)
+    if not e:
+        return jsonify({'success': False, 'error': 'Equipment not found.'}), 404
+    data = _in_body()
+    to = str(data.get('status') or '')
+    reason = _rc_text(data.get('reason'), 500)
+    if to not in ('in_service', 'out_of_service', 'retired'):
+        return jsonify({'success': False, 'error': 'Unknown status.'}), 400
+    if to != 'out_of_service':
+        deny = _eq_staff_403(user)
+        if deny:
+            return deny
+    if len(reason) < 3:
+        return jsonify({'success': False, 'error': 'Say why (at least a few words).'}), 400
+    if to == e.status:
+        return jsonify({'success': False, 'error': 'The equipment already has this status.'}), 409
+    e.status, e.status_reason = to, reason
+    text = {'in_service': 'Returned to service', 'out_of_service': 'Taken out of service', 'retired': 'Retired'}[to]
+    _eq_log(e, 'status', f'{text}: {reason}', user.id)
+    db.session.commit()
+    if to == 'out_of_service':
+        _in_notify([(u.id, getattr(u, 'email', None)) for u in _rc_staff_users(e.company_id, user.id)],
+                   f'Out of service: {e.tag_no} {e.name}'[:200], f'{reason}' + (f' ({e.location})' if e.location else ''),
+                   f'/inspections?tab=equipment&eq={e.id}', 'high')
+    return jsonify({'success': True, 'data': _eq_dict(e, full=True)}), 200
+
+
+@app.route('/api/equipment/<int:eid>/inspect', methods=['POST'])
+@jwt_required
+def eq_inspect_route(eid):
+    """Start an inspection of this equipment with its checklist. Anyone in the company may inspect."""
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    e = _eq_get(user, eid)
+    if not e:
+        return jsonify({'success': False, 'error': 'Equipment not found.'}), 404
+    if e.status == 'retired':
+        return jsonify({'success': False, 'error': 'This equipment is retired.'}), 409
+    ref = _in_body().get('ref') or e.checklist_ref
+    try:
+        t, key, chk = _in_resolve_ref(user, ref)
+    except ValueError:
+        return jsonify({'success': False, 'error': 'No checklist set for this equipment. Choose one.', 'code': 'NO_CHECKLIST'}), 400
+    mine = (db.session.query(Inspection.id).join(EquipmentInspection, EquipmentInspection.inspection_id == Inspection.id)
+            .filter(EquipmentInspection.equipment_id == e.id, Inspection.inspector_id == user.id, Inspection.status == 'in_progress').first())
+    if mine:
+        return jsonify({'success': True, 'data': {'id': mine[0], 'resumed': True}}), 200
+    ins = Inspection(company_id=user.company_id, template_id=t.id if t else None, library_key=key, title=f'{chk["name"]}: {e.tag_no} {e.name}'[:200],
+                     site=e.location, inspector_id=user.id, status='in_progress', items=json.dumps(chk['items']), answers='{}')
+    db.session.add(ins)
+    db.session.flush()
+    db.session.add(EquipmentInspection(inspection_id=ins.id, equipment_id=e.id, company_id=e.company_id))
+    db.session.commit()
+    return jsonify({'success': True, 'data': {'id': ins.id, 'resumed': False}}), 201
+
+
+def _eq_after_inspection(ins, user):
+    """Called when an inspection is completed: update the equipment it belongs to (if any)."""
+    link = db.session.get(EquipmentInspection, ins.id)
+    if not link:
+        return
+    e = db.session.get(EquipmentItem, link.equipment_id)
+    if not e or e.company_id != ins.company_id:
+        return
+    today = datetime.utcnow().date()
+    result = 'critical' if ins.critical_failed else 'fail' if ins.failed_count else 'pass'
+    e.last_inspection_id, e.last_inspected_at, e.last_result = ins.id, ins.completed_at or datetime.utcnow(), result
+    if e.inspect_every_days:
+        e.next_due = today + timedelta(days=e.inspect_every_days)
+    _eq_log(e, 'inspection', f'Inspection {result}: {ins.score}/{ins.max_score} passed' +
+            (f', {ins.critical_failed} critical' if ins.critical_failed else ''), user.id, ins.id)
+    if result == 'critical' and e.status == 'in_service':
+        e.status, e.status_reason = 'out_of_service', f'Critical item failed in inspection #{ins.id}'
+        _eq_log(e, 'status', f'Taken out of service automatically: critical item failed in inspection #{ins.id}', user.id, ins.id)
+    elif result == 'pass' and e.status == 'out_of_service' and _rc_staff(user):
+        e.status, e.status_reason = 'in_service', f'Passed inspection #{ins.id}'
+        _eq_log(e, 'status', f'Returned to service after passing inspection #{ins.id}', user.id, ins.id)
+    db.session.commit()
+    if result == 'critical':
+        _in_notify([(u.id, getattr(u, 'email', None)) for u in _rc_staff_users(e.company_id, user.id)],
+                   f'DO NOT USE: {e.tag_no} {e.name}'[:200], f'A critical item failed in its inspection. The tag now shows DO NOT USE.',
+                   f'/inspections?tab=equipment&eq={e.id}', 'critical', email=True)
+
+
+@app.route('/api/equipment/tags.pdf', methods=['GET'])
+@jwt_required
+def eq_tags_pdf_route():
+    """Printable QR safety tags (8 per A4 page). ?ids=1,2,3 (default: every item in service)."""
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    q = EquipmentItem.query.filter(EquipmentItem.company_id == user.company_id)
+    ids = [int(x) for x in str(request.args.get('ids') or '').split(',') if x.strip().isdigit()][:400]
+    q = q.filter(EquipmentItem.id.in_(ids)) if ids else q.filter(EquipmentItem.status != 'retired')
+    rows = q.order_by(EquipmentItem.tag_no).limit(400).all()
+    if not rows:
+        return jsonify({'success': False, 'error': 'No equipment to print.'}), 404
+    import fitz as _fz
+    doc = _fz.open()
+    W, H = 595, 842                                                           # A4 points
+    cw, ch, mx, my = 270, 190, 20, 30
+    for i, e in enumerate(rows):
+        if i % 8 == 0:
+            page = doc.new_page(width=W, height=H)
+        col, row = (i % 8) % 2, (i % 8) // 2
+        x0, y0 = mx + col * (cw + 15), my + row * (ch + 10)
+        r = _fz.Rect(x0, y0, x0 + cw, y0 + ch)
+        page.draw_rect(r, color=(0, 0, 0), width=1.2)
+        page.draw_rect(_fz.Rect(x0, y0, x0 + cw, y0 + 28), color=(0.85, 0.1, 0.1), fill=(0.85, 0.1, 0.1))
+        page.insert_textbox(_fz.Rect(x0 + 6, y0 + 6, x0 + cw - 6, y0 + 26), 'SAFETY TAG - SCAN BEFORE USE', fontsize=11, fontname='hebo',
+                            color=(1, 1, 1), align=1)
+        png = _dcp_qr_png(f'{_wf_frontend_url()}/tag/{e.qr_token}', 6)
+        page.insert_image(_fz.Rect(x0 + cw - 118, y0 + 36, x0 + cw - 8, y0 + 146), stream=png)
+        lines = [(e.tag_no, 16, 'hebo'), (e.name[:60], 10, 'hebo'), (EQ_CATEGORIES.get(e.category, EQ_CATEGORIES['other'])[0][:48], 8, 'helv')]
+        if e.serial_no:
+            lines.append((f'Serial: {e.serial_no[:40]}', 8, 'helv'))
+        if e.location:
+            lines.append((f'Location: {e.location[:40]}', 8, 'helv'))
+        y = y0 + 50
+        for text, size, font in lines:
+            page.insert_textbox(_fz.Rect(x0 + 8, y, x0 + cw - 124, y + size * 2.6), text, fontsize=size, fontname=font)
+            y += size * 1.9 if size < 12 else 24
+        page.insert_textbox(_fz.Rect(x0 + 8, y0 + 152, x0 + cw - 8, y0 + ch - 4),
+                            'Scan the code with a phone camera to see if this equipment is safe to use and when it was last inspected. '
+                            'If the tag is damaged or missing, do not use the equipment.', fontsize=7, fontname='helv')
+    buf = doc.tobytes()
+    doc.close()
+    resp = send_file(io.BytesIO(buf), mimetype='application/pdf', as_attachment=True, download_name='equipment_safety_tags.pdf')
+    resp.headers['Cache-Control'] = 'private, no-store'
+    return resp
+
+
+@app.route('/api/equipment/scan/<token>', methods=['GET'])
+@jwt_required
+def eq_scan_route(token):
+    """A signed-in user scanned a tag: their own company's equipment opens in full."""
+    user = request.user
+    e = EquipmentItem.query.filter_by(qr_token=str(token)[:32]).first()
+    if not e or e.company_id != getattr(user, 'company_id', None):
+        return jsonify({'success': False, 'error': 'This tag does not belong to your company.'}), 404
+    return jsonify({'success': True, 'data': _eq_dict(e, full=True), 'can_manage': bool(_rc_staff(user))}), 200
+
+
+@app.route('/api/equipment/public/<token>', methods=['GET'])
+def eq_public_route(token):
+    """Anyone scanned a tag: the status only (no names, no company data), and only if the company allows it."""
+    e = EquipmentItem.query.filter_by(qr_token=str(token)[:32]).first() if re.fullmatch(r'[A-Za-z0-9_-]{10,32}', str(token)) else None
+    if not e:
+        return jsonify({'success': False, 'error': 'Unknown tag.'}), 404
+    if not _eq_settings(e.company_id).get('public_status'):
+        return jsonify({'success': False, 'login_required': True, 'error': 'Sign in with your company account to see this equipment.'}), 401
+    resp = jsonify({'success': True, 'data': _eq_public_dict(e)})
+    resp.headers['Cache-Control'] = 'no-store'
+    return resp, 200
+
+
+def _eq_reminders(today=None):
+    """Once a day per item: inspection overdue, or certificate due within 14 days / expired. To supervisors."""
+    today = today or datetime.utcnow().date()
+    soon = today + timedelta(days=14)
+    rows = (EquipmentItem.query.filter(EquipmentItem.status == 'in_service',
+                                       or_(EquipmentItem.notified_on.is_(None), EquipmentItem.notified_on < today),
+                                       or_(EquipmentItem.next_due < today, EquipmentItem.cert_due <= soon)).limit(5000).all())
+    by_company = {}
+    for e in rows:
+        claimed = (EquipmentItem.query.filter(EquipmentItem.id == e.id, or_(EquipmentItem.notified_on.is_(None), EquipmentItem.notified_on < today))
+                   .update({'notified_on': today}, synchronize_session=False))
+        db.session.commit()
+        if not claimed:
+            continue
+        if e.cert_due and e.cert_due < today:
+            msg, crit = f'{e.cert_name or "certificate"} expired {e.cert_due.isoformat()}', True
+        elif e.cert_due and e.cert_due <= soon:
+            msg, crit = f'{e.cert_name or "certificate"} due {e.cert_due.isoformat()}', False
+        else:
+            msg, crit = f'inspection overdue since {e.next_due.isoformat()}', False
+        by_company.setdefault(e.company_id, []).append((crit, f'{e.tag_no} {e.name}: {msg}'))
+    for cid, lines in by_company.items():
+        _in_notify([(u.id, getattr(u, 'email', None)) for u in _rc_staff_users(cid)], f'Equipment: {len(lines)} item(s) need attention',
+                   '; '.join(x for _, x in lines[:10]) + (' ...' if len(lines) > 10 else ''), '/inspections?tab=equipment', 'high',
+                   email=any(c for c, _ in lines))
+    return sum(len(v) for v in by_company.values())
+
+
+def _eq_watch_loop():
+    time.sleep(600)
+    while True:
+        try:
+            with app.app_context():
+                _eq_reminders()
+        except Exception as e:
+            logger.error(f'equipment reminder watcher: {e}')
+        finally:
+            try:
+                with app.app_context():
+                    db.session.remove()
+            except Exception:
+                pass
+        time.sleep(6 * 3600)
+
+
+if os.environ.get('READY_CHECK_WATCHER', '1') == '1':
+    threading.Thread(target=_eq_watch_loop, name='equipment-reminder-watcher', daemon=True).start()
+
+
+# ---------------------------------------------------------------- equipment checklists for the Inspections library
+IN_LIBRARY.update({
+    'lifting_gear': _in_lib('Lifting accessories pre-use check', 'Lifting', 'Slings, shackles, hooks, chain blocks: before each use. '
+                            'A thorough examination by a competent person is also required (commonly every 6 months).', [
+        ('Identification', [('Tag shows the ID and safe working load, and is readable', 'c'), 'Thorough examination is in date']),
+        ('Condition', [('Webbing / round slings: no cuts, burns, broken stitching or chemical damage', 'c'),
+                       ('Chains and wire ropes: no stretched, cracked or twisted links, no broken wires or kinks', 'c'),
+                       ('Hooks: safety latch fitted and closes; no opening of the throat or twisting', 'c'),
+                       'Shackles: correct pin, pin fully screwed in or secured', 'Chain block / hoist: brake holds, chain runs freely']),
+        ('Use', ['Accessories match the load and the lift plan (angle and number of legs considered)', ('Defects found', 't')]),
+    ]),
+    'crane': _in_lib('Mobile crane pre-use check', 'Lifting', 'Before the first lift of each shift.', [
+        ('Set-up', [('Outriggers fully extended on pads, on firm ground', 'c'), 'Crane is level', 'Exclusion zone is set up']),
+        ('Safety devices', [('Rated capacity indicator / load moment indicator works', 'c'), ('Anti-two-block / hoist limit works', 'c'),
+                            'Horn, lights and slew alarm work']),
+        ('Ropes and hook', [('Wire rope: no broken wires, kinks or crushing', 'c'), ('Hook safety latch works', 'c')]),
+        ('Paperwork', ['Thorough examination certificate in date', 'Operator is certified for this crane', 'A lift plan exists for the lift']),
+        ('Readings', [('Hour meter', 'n:0::h'), ('Defects found', 't')]),
+    ]),
+    'gas_detector': _in_lib('Gas detector bump test', 'Gas detection', 'Before each day\'s use, as most makers require.', [
+        ('Before use', ['Battery is charged', 'Unit is clean, case not cracked, filters clear', 'Zeroed in clean air']),
+        ('Bump test', [('Bump test passed: every sensor responded to the test gas and the alarms worked', 'c'),
+                       'Audible, visual and vibration alarms all work']),
+        ('Records', ['Calibration is in date (label or docking station record)', ('Calibration due date', 't')]),
+    ]),
+})
+
+
 # =====================================================================================================
 # AUTO MIGRATIONS (2026-11-23)
 # Railway's Data tab appends LIMIT to every query, so CREATE/ALTER statements fail there. Instead the
@@ -173197,7 +173779,7 @@ IN_LIBRARY.update({
 #   - a failing statement is logged and the file is retried on the next start
 # Set AUTO_MIGRATE=0 on Railway to switch this off.
 # =====================================================================================================
-AUTO_MIGRATIONS = ('DEPLOY_2026-11-23_FULL.sql', '2026-11-24_company_quotes.sql', '2026-11-25_ready_checks.sql', '2026-11-26_muster_contractors.sql', '2026-11-27_document_control_plus.sql', '2026-11-27_inspections.sql', '2026-11-27_chemical_safety.sql', '2026-11-27_chemical_waste.sql')
+AUTO_MIGRATIONS = ('DEPLOY_2026-11-23_FULL.sql', '2026-11-24_company_quotes.sql', '2026-11-25_ready_checks.sql', '2026-11-26_muster_contractors.sql', '2026-11-27_document_control_plus.sql', '2026-11-27_inspections.sql', '2026-11-27_chemical_safety.sql', '2026-11-27_chemical_waste.sql', '2026-11-27_equipment.sql')
 _MIGRATION_LOCK_KEY = 74230115
 
 
