@@ -96195,6 +96195,16 @@ def generate_professional_certificate_html(certificate_data: Dict[str, Any]) -> 
         certificate_id = f"CERT-{datetime.now().strftime('%Y%m%d%H%M%S')}"
     
     issue_date = certificate_data.get('issue_date', datetime.now().strftime('%Y-%m-%d'))
+    from html import escape as _ce
+    recipient_html = _ce(str(certificate_data.get('recipient_name') or 'Professional'))
+    credential_name = _ce(str(credential_name))
+    certificate_id = _ce(str(certificate_id))
+    issue_date = _ce(str(issue_date))
+    verify_url = certificate_data.get('verification_url') or _cert_verify_url(certificate_id)
+    verify_html = _ce(verify_url)
+    qr_uri = _cert_qr_data_uri(verify_url)
+    score = certificate_data.get('exam_score')
+    score_html = f'{float(score):g}%' if isinstance(score, (int, float)) else ''
     
     # Dr. Adam Fusheini - Artistic A with W flourish
     signature_director = '''<svg width="280" height="130" viewBox="0 0 300 150" xmlns="http://www.w3.org/2000/svg">
@@ -96239,11 +96249,20 @@ def generate_professional_certificate_html(certificate_data: Dict[str, Any]) -> 
         <circle cx="160" cy="102" r="2.5" fill="#1a2a40"/>
     </svg>'''
     
+    _sig_d, _sig_e = _cert_sig_img('director'), _cert_sig_img('examiner')
+    if _sig_d:
+        signature_director = f'<img class="sig-img" src="{_sig_d}" alt="Signature of Dr. Adam Fusheini"/>'
+    if _sig_e:
+        signature_examiner = f'<img class="sig-img" src="{_sig_e}" alt="Signature of Mr. Isaac Andoh"/>'
+    seal_html = (f'<img class="qr-img" src="{qr_uri}" alt="QR code: verify this certificate"/>' if qr_uri
+                 else '<div class="seal-container"><span class="seal-icon">STP</span></div>')
+
     html = f'''<!DOCTYPE html>
 <html>
 <head>
     <meta charset="UTF-8">
-    <title>Professional Certificate</title>
+    <meta name="stp-score" content="{score_html.rstrip('%')}">
+    <title>Certificate of completion</title>
     <style>
         * {{
             margin: 0;
@@ -96492,6 +96511,18 @@ def generate_professional_certificate_html(certificate_data: Dict[str, Any]) -> 
             max-height: 95px;
             width: auto;
         }}
+        .sig-img {{
+            max-height: 90px;
+            max-width: 260px;
+            width: auto;
+            height: auto;
+        }}
+        .qr-img {{
+            width: 108px;
+            height: 108px;
+            display: block;
+            margin: 0 auto 6px;
+        }}
         
         .signature-name {{
             font-weight: bold;
@@ -96550,14 +96581,14 @@ def generate_professional_certificate_html(certificate_data: Dict[str, Any]) -> 
                 <div class="header">
                     <div class="accreditation">SAFETRACK PRO GLOBAL</div>
                     <div class="iso-badge">PRACTICE EXAM - NOT AN ACCREDITED CERTIFICATION</div>
-                    <h1>🏆 CERTIFICATE OF COMPLETION 🏆</h1>
+                    <h1>CERTIFICATE OF COMPLETION</h1>
                     <div class="subtitle">Safety Professional Practice Exam (CSP-style)</div>
                 </div>
                 
                 <div class="main-content">
                     <div class="presented-text">This certificate of completion is presented to</div>
                     
-                    <div class="recipient-name">{certificate_data.get('recipient_name', 'Professional')}</div>
+                    <div class="recipient-name">{recipient_html}</div>
                     
                     <div class="for-text">for passing the practice exam</div>
                     
@@ -96573,6 +96604,7 @@ def generate_professional_certificate_html(certificate_data: Dict[str, Any]) -> 
                             <div class="col">
                                 <strong>Issue Date:</strong> {issue_date}
                             </div>
+                            {f'<div class="col"><strong>Score:</strong> {score_html}</div>' if score_html else ''}
                         </div>
                     </div>
                 </div>
@@ -96589,11 +96621,9 @@ def generate_professional_certificate_html(certificate_data: Dict[str, Any]) -> 
                         
                         <!-- CENTER: Official Digital Seal -->
                         <div class="signature-box seal-box">
-                            <div class="seal-container">
-                                <span class="seal-icon">🛡️</span>
-                            </div>
-                            <div class="signature-name">SafeTrack Pro Global</div>
-                            <div class="signature-title">Verifiable record</div>
+                            {seal_html}
+                            <div class="signature-name">Scan to verify</div>
+                            <div class="signature-title">SafeTrack Pro Global record</div>
                         </div>
                         
                         <!-- RIGHT: Mr. Isaac Andoh -->
@@ -96607,7 +96637,7 @@ def generate_professional_certificate_html(certificate_data: Dict[str, Any]) -> 
                     
                     <div class="verification">
                         This certificate of completion can be verified at
-                        <a href="{certificate_data.get('verification_url', '#')}">{certificate_data.get('verification_url', 'safetrackproglobal.com')}</a>
+                        <a href="{verify_html}">{verify_html}</a>
                         <br/>
                         This is a certificate of completion for a practice exam provided by SafeTrack Pro Global. It is not a professional certification, licence, accreditation or CEU award, and it is not affiliated with, endorsed by, or a substitute for the BCSP Certified Safety Professional (CSP®) examination.
                     </div>
@@ -96684,7 +96714,7 @@ def generate_professional_certificate_knowledge(session: Dict[str, Any],
             'correct_count': grading_result.get('correct_answers', 0),
             'total_count': grading_result.get('total_questions', 0),
             'certificate_type': 'Practice exam - certificate of completion',
-            'verification_url': f"{base_url}/verify/{credential_id}",
+            'verification_url': _cert_verify_url(credential_id),
             'signature1_url': signature1_url if signature1_exists else '',
             'signature2_url': signature2_url if signature2_exists else '',
             'signature_names': {
@@ -99737,7 +99767,7 @@ def generate_exam_certificate():
             'correct_count': grading_result.get('correct_answers', 0),
             'total_count': grading_result.get('total_questions', 0),
             'certificate_type': 'Practice exam - certificate of completion',
-            'verification_url': f"{base_url}/verify/{certificate_id}",
+            'verification_url': _cert_verify_url(certificate_id),
             'signature1_url': signature1_url_local,
             'signature2_url': signature2_url_local,
             'signature_names': {
@@ -99871,7 +99901,7 @@ def verify_certificate(certificate_id):
                 'timestamp': datetime.now().isoformat()
             }), 404
         
-        # Check if certificate is expired
+        # A certificate of completion records a practice exam result on a date: it does not expire.
         is_expired = False
         expiry_date = None
         credential_level = 'Certified'
@@ -99884,24 +99914,6 @@ def verify_certificate(certificate_id):
                 level_match = re.search(r'credential-badge.*?>(.*?)LEVEL', cert_record.certificate_html, re.DOTALL)
                 credential_level = level_match.group(1).strip() if level_match else 'Completed'
                 
-                # Set expiry based on credential level
-                if 'Platinum' in credential_level:
-                    validity_months = 24
-                elif 'Gold' in credential_level:
-                    validity_months = 18
-                elif 'Silver' in credential_level:
-                    validity_months = 12
-                elif 'Bronze' in credential_level:
-                    validity_months = 12
-                elif 'Competent' in credential_level:
-                    validity_months = 12
-                else:
-                    validity_months = 12
-                
-                # Parse completion date
-                completion_date = datetime.strptime(cert_record.completion_date, '%Y-%m-%d') if cert_record.completion_date else datetime.now()
-                expiry_date = completion_date + timedelta(days=validity_months * 30)
-                is_expired = datetime.now() > expiry_date
         except Exception as e:
             print(f"⚠️ Error parsing certificate data: {e}")
             is_expired = False
@@ -99911,7 +99923,8 @@ def verify_certificate(certificate_id):
         try:
             if cert_record.certificate_html:
                 import re
-                score_match = re.search(r'(\d+(?:\.\d+)?)%', cert_record.certificate_html)
+                # only the score written into the certificate (older certificates have none: a CSS width is not a score)
+                score_match = re.search(r'<meta name="stp-score" content="(\d+(?:\.\d+)?)"', cert_record.certificate_html)
                 if score_match:
                     exam_score = float(score_match.group(1))
         except:
@@ -99936,12 +99949,12 @@ def verify_certificate(certificate_id):
             'issue_date': cert_record.completion_date,
             'expiry_date': expiry_date.strftime('%Y-%m-%d') if expiry_date else None,
             'is_expired': is_expired,
-            'status': 'expired' if is_expired else 'active',
+            'status': 'valid',
             'exam_score': exam_score,
             'credential_level': credential_level,
             'certificate_type': 'Practice exam - certificate of completion',
             'disclaimer': _EXAM_PRACTICE_DISCLAIMER,
-            'verification_url': f"{request.host_url.rstrip('/')}/verify/{certificate_id}",
+            'verification_url': _cert_verify_url(cert_record.certificate_id),
             'verified_at': datetime.now().isoformat()
         }
         
@@ -180088,6 +180101,132 @@ def ap_make_route():
                      download_name=f'audit_pack_{s.isoformat()}_{e.isoformat()}.{fmt}')
     resp.headers['Cache-Control'] = 'private, no-store'
     return resp
+# ============================================================================
+# EXAM CERTIFICATE: REAL SIGNATURES + VERIFICATION QR (2026-11-28)
+#   The two signatures are uploaded once by the platform owner and stored privately on the volume
+#   (uploads/cert_signatures, not served by any route). They are embedded in the certificate as data URIs,
+#   so they show in the PDF and in the browser. Until they are uploaded the drawn marks are used.
+#   The QR code on the certificate opens the public verification page <frontend>/verify/<certificate id>.
+# ============================================================================
+import base64 as _cert_b64
+
+CERT_SIG_ROLES = {'director': ('Dr. Adam Fusheini', 'dr_adam_fusheini.png'), 'examiner': ('Mr. Isaac Andoh', 'mr_isaac_andoh.png')}
+CERT_SIG_MAX_BYTES = 5 * 1024 * 1024
+_CERT_SIG_CACHE = {}
+
+
+def _cert_sig_dir():
+    return os.path.join(os.getcwd(), 'uploads', 'cert_signatures')
+
+
+def _cert_sig_clean(raw):
+    """Scanned or photographed signature -> trimmed PNG with a transparent background, at most 700 x 240 px."""
+    from PIL import Image as _PImg
+    with _PImg.open(io.BytesIO(raw)) as im:
+        if im.width * im.height > 40_000_000:
+            raise ValueError('The image is too large.')
+        im.load()
+        im = im.convert('RGBA')
+    px = im.getdata()
+    # paper background (near white) becomes transparent; ink stays
+    im.putdata([(r, g, b, 0) if (r > 225 and g > 225 and b > 225) else (r, g, b, a) for r, g, b, a in px])
+    box = im.getchannel('A').point(lambda v: 255 if v > 24 else 0).getbbox()
+    if not box:
+        raise ValueError('No signature found in the image (it looks empty or white).')
+    pad = 8
+    im = im.crop((max(0, box[0] - pad), max(0, box[1] - pad), min(im.width, box[2] + pad), min(im.height, box[3] + pad)))
+    im.thumbnail((700, 240))
+    out = io.BytesIO()
+    im.save(out, 'PNG', optimize=True)
+    return out.getvalue()
+
+
+def _cert_sig_img(role):
+    """data: URI of the stored signature, or None. Cached by file time."""
+    name = CERT_SIG_ROLES.get(role)
+    if not name:
+        return None
+    for p in (os.path.join(_cert_sig_dir(), f'{role}.png'), os.path.join(os.getcwd(), 'uploads', 'signatures', name[1])):
+        try:
+            if not os.path.isfile(p):
+                continue
+            key = (p, os.path.getmtime(p))
+            if key not in _CERT_SIG_CACHE:
+                with open(p, 'rb') as f:
+                    raw = f.read(CERT_SIG_MAX_BYTES + 1)
+                data = raw if p.startswith(_cert_sig_dir()) else _cert_sig_clean(raw)
+                _CERT_SIG_CACHE[key] = 'data:image/png;base64,' + _cert_b64.b64encode(data).decode()
+            return _CERT_SIG_CACHE[key]
+        except Exception as e:
+            logger.warning(f'certificate signature {role}: {e}')
+    return None
+
+
+def _cert_qr_data_uri(url):
+    if not url or qrcode is None:
+        return None
+    try:
+        img = qrcode.make(url, box_size=6, border=1)
+        buf = io.BytesIO()
+        img.save(buf, format='PNG')
+        return 'data:image/png;base64,' + _cert_b64.b64encode(buf.getvalue()).decode()
+    except Exception as e:
+        logger.warning(f'certificate qr: {e}')
+        return None
+
+
+def _cert_verify_url(certificate_id):
+    return f'{_wf_frontend_url()}/verify/{certificate_id}'
+
+
+@app.route('/api/admin/certificate-signatures', methods=['GET'])
+@jwt_required
+def cert_sig_list():
+    if not _sec_require_platform():
+        return jsonify({'success': False, 'error': 'Access denied'}), 403
+    return jsonify({'success': True, 'data': [{'role': r, 'name': n, 'image': _cert_sig_img(r),
+                                               'uploaded': os.path.isfile(os.path.join(_cert_sig_dir(), f'{r}.png'))}
+                                              for r, (n, _) in CERT_SIG_ROLES.items()]}), 200
+
+
+@app.route('/api/admin/certificate-signatures/<role>', methods=['POST', 'DELETE'])
+@jwt_required
+def cert_sig_one(role):
+    if not _sec_require_platform():
+        return jsonify({'success': False, 'error': 'Access denied'}), 403
+    if role not in CERT_SIG_ROLES:
+        return jsonify({'success': False, 'error': 'Unknown signature.'}), 404
+    path = os.path.join(_cert_sig_dir(), f'{role}.png')
+    if request.method == 'DELETE':
+        if os.path.isfile(path):
+            os.remove(path)
+        _CERT_SIG_CACHE.clear()
+        return jsonify({'success': True}), 200
+    up = request.files.get('file')
+    if not up:
+        return jsonify({'success': False, 'error': 'Choose the signature image (PNG or JPG).'}), 400
+    raw = up.read(CERT_SIG_MAX_BYTES + 1)
+    if len(raw) > CERT_SIG_MAX_BYTES:
+        return jsonify({'success': False, 'error': 'The image must be 5 MB or less.'}), 400
+    if not (raw.startswith(b'\x89PNG\r\n\x1a\n') or raw.startswith(b'\xff\xd8\xff')):
+        return jsonify({'success': False, 'error': 'Only PNG or JPG images.'}), 400
+    try:
+        png = _cert_sig_clean(raw)
+    except ValueError as e:
+        return jsonify({'success': False, 'error': str(e)}), 400
+    except Exception:
+        return jsonify({'success': False, 'error': 'The image could not be read.'}), 400
+    os.makedirs(_cert_sig_dir(), exist_ok=True)
+    tmp = path + '.tmp'
+    with open(tmp, 'wb') as f:
+        f.write(png)
+    os.replace(tmp, path)
+    _CERT_SIG_CACHE.clear()
+    try:
+        _sec_record('certificate_signature_upload', 'info', f'Certificate signature replaced: {role}', user_id=request.user.id)
+    except Exception:
+        pass
+    return jsonify({'success': True, 'data': {'role': role, 'image': _cert_sig_img(role)}}), 200
 # =====================================================================================================
 # AUTO MIGRATIONS (2026-11-23)
 # Railway's Data tab appends LIMIT to every query, so CREATE/ALTER statements fail there. Instead the
