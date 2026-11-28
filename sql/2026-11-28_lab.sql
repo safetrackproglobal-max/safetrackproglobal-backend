@@ -1,0 +1,58 @@
+-- Hospital lab safety (2026-11-28): exposures, biological agents
+CREATE TABLE IF NOT EXISTS lab_exposures (
+	id SERIAL NOT NULL, 
+	company_id INTEGER NOT NULL, 
+	user_id INTEGER, 
+	person VARCHAR(120) NOT NULL, 
+	department VARCHAR(120) NOT NULL, 
+	work_area VARCHAR(160), 
+	occurred_at TIMESTAMP WITHOUT TIME ZONE NOT NULL, 
+	reported_at TIMESTAMP WITHOUT TIME ZONE NOT NULL, 
+	kind VARCHAR(12) NOT NULL, 
+	body_part VARCHAR(60), 
+	device_type VARCHAR(120), 
+	device_brand VARCHAR(160), 
+	safety_feature VARCHAR(8), 
+	feature_activated VARCHAR(8), 
+	during VARCHAR(12), 
+	how TEXT NOT NULL, 
+	first_aid BOOLEAN NOT NULL, 
+	source_tested VARCHAR(12) NOT NULL, 
+	pep VARCHAR(14) NOT NULL, 
+	pep_at TIMESTAMP WITHOUT TIME ZONE, 
+	pep_reminded BOOLEAN NOT NULL, 
+	hbv_immune VARCHAR(8) NOT NULL, 
+	followups TEXT, 
+	status VARCHAR(8) NOT NULL, 
+	close_note TEXT, 
+	closed_by INTEGER, 
+	closed_at TIMESTAMP WITHOUT TIME ZONE, 
+	reported_by INTEGER, 
+	notified_on DATE, 
+	PRIMARY KEY (id), 
+	FOREIGN KEY(company_id) REFERENCES companies (id) ON DELETE CASCADE, 
+	FOREIGN KEY(user_id) REFERENCES users (id) ON DELETE SET NULL, 
+	FOREIGN KEY(closed_by) REFERENCES users (id) ON DELETE SET NULL, 
+	FOREIGN KEY(reported_by) REFERENCES users (id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS ix_lab_exposures_user_id ON lab_exposures (user_id);
+CREATE INDEX IF NOT EXISTS ix_lab_exposures_company_id ON lab_exposures (company_id);
+CREATE TABLE IF NOT EXISTS lab_agents (
+	id SERIAL NOT NULL, 
+	company_id INTEGER NOT NULL, 
+	name VARCHAR(160) NOT NULL, 
+	risk_group INTEGER NOT NULL, 
+	lab VARCHAR(160) NOT NULL, 
+	lab_bsl INTEGER NOT NULL, 
+	aerosol BOOLEAN NOT NULL, 
+	sharps BOOLEAN NOT NULL, 
+	vaccine VARCHAR(8) NOT NULL, 
+	notes TEXT, 
+	active BOOLEAN NOT NULL, 
+	created_by INTEGER, 
+	created_at TIMESTAMP WITHOUT TIME ZONE NOT NULL, 
+	PRIMARY KEY (id), 
+	FOREIGN KEY(company_id) REFERENCES companies (id) ON DELETE CASCADE, 
+	FOREIGN KEY(created_by) REFERENCES users (id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS ix_lab_agents_company_id ON lab_agents (company_id);

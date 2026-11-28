@@ -179872,6 +179872,31 @@ def _ap_modules():
                   [('Date', lambda r, n: _ap_dt(r.created_at)), ('Title', lambda r, n: r.title), ('Location', lambda r, n: r.location), ('Kind', lambda r, n: r.kind),
                    ('Findings', lambda r, n: len(_tbt_json(r.findings, [])))],
                   summary=lambda rows: [('Reports', len(rows)), ('Findings', sum(len(_tbt_json(r.findings, [])) for r in rows))]),
+        # hospital laboratory
+        _APModule('lab_exposures', 'Sharps and blood exposure log', 'Hospital laboratory', LabExposure, 'occurred_at',
+                  [('Date', lambda r, n: _ap_dt(r.occurred_at)), ('What', lambda r, n: LAB_KINDS.get(r.kind, r.kind)), ('Device', lambda r, n: r.device_type),
+                   ('Brand', lambda r, n: r.device_brand), ('Department / area', lambda r, n: f'{r.department}{" / " + r.work_area if r.work_area else ""}'),
+                   ('How', lambda r, n: _rc_text(r.how, 160)), ('Safety feature', lambda r, n: r.safety_feature), ('PEP decision', lambda r, n: r.pep),
+                   ('Status', lambda r, n: r.status)], staff_only=True,
+                  summary=lambda rows: [('Exposures', len(rows)), ('Sharps', sum(1 for r in rows if r.kind in LAB_SHARPS)),
+                                        ('Device without a safety feature', sum(1 for r in rows if r.safety_feature == 'no')),
+                                        ('Reported more than 2 h late', sum(1 for r in rows if r.reported_at and (r.reported_at - r.occurred_at) > timedelta(hours=2)))]),
+        _APModule('lab_agents', 'Biological agent register', 'Hospital laboratory', LabAgent, 'created_at',
+                  [('Agent', lambda r, n: r.name), ('Risk group', lambda r, n: r.risk_group), ('Lab', lambda r, n: r.lab), ('Lab BSL', lambda r, n: r.lab_bsl),
+                   ('Aerosols', lambda r, n: 'yes' if r.aerosol else 'no'), ('Vaccine', lambda r, n: r.vaccine)], snapshot=True,
+                  extra=lambda q: q.filter(LabAgent.active.is_(True)),
+                  summary=lambda rows: [('Agents', len(rows)), ('Risk group above the lab BSL', sum(1 for r in rows if r.risk_group > r.lab_bsl))]),
+        # construction
+        _APModule('cn_excavations', 'Excavations', 'Construction', CnExcavation, 'created_at',
+                  [('Ref', lambda r, n: r.ref), ('Location', lambda r, n: r.location), ('Depth m', lambda r, n: r.depth_m), ('Soil', lambda r, n: CN_SOILS.get(r.soil, r.soil)),
+                   ('Protection', lambda r, n: CN_PROTECT.get(r.protection, r.protection)), ('Utilities located', lambda r, n: 'yes' if r.utilities_located else 'NO'),
+                   ('Design issues', lambda r, n: _ap_join(_cn_design_issues(r), 200)), ('Status', lambda r, n: r.status)],
+                  summary=lambda rows: [('Excavations', len(rows)), ('With design issues', sum(1 for r in rows if _cn_design_issues(r)))]),
+        _APModule('cn_excavation_checks', 'Excavation daily checks', 'Construction', CnExcavationCheck, 'checked_at',
+                  [('Checked', lambda r, n: _ap_dt(r.checked_at)), ('Excavation', lambda r, n: getattr(db.session.get(CnExcavation, r.excavation_id), 'ref', r.excavation_id)),
+                   ('By', lambda r, n: n.get(r.checked_by)), ('Result', lambda r, n: r.result), ('O2 %', lambda r, n: r.o2), ('LEL %', lambda r, n: r.lel),
+                   ('Note', lambda r, n: r.note)],
+                  summary=lambda rows: [('Checks', len(rows)), ('Failed', _ap_count(rows, 'result', ('fail',)))]),
     ]
 
 
@@ -180227,6 +180252,870 @@ def cert_sig_one(role):
     except Exception:
         pass
     return jsonify({'success': True, 'data': {'role': role, 'image': _cert_sig_img(role)}}), 200
+# ============================================================================
+# HOSPITAL LAB SAFETY + CONSTRUCTION SITE TOOLS (2026-11-28)
+#   Lab:  sharps / blood exposure log (OSHA 29 CFR 1910.1030(h)(5) fields) with the post-exposure clock and follow-up
+#         tests set by occupational health; device analysis (which devices injure, with or without a safety feature);
+#         biological agent register (WHO risk groups) checked against the lab and its biosafety cabinets;
+#         lab readiness board from the equipment register (biosafety cabinets, fume hoods, autoclaves, eyewash).
+#   Site: scaffold tag board on the equipment register (checked before each shift, OSHA 1926.451(f)(3), or every
+#         7 days); excavation register with the OSHA Subpart P rules (protective system at 1.5 m / 5 ft, engineer
+#         design over 6.1 m / 20 ft, way out within 7.6 m / 25 ft at 1.2 m / 4 ft, utilities located, atmosphere test)
+#         and a daily competent-person check before anyone enters.
+# ============================================================================
+
+# ---------------------------------------------------------------- lab equipment in the register
+EQ_CATEGORIES.update({
+    'biosafety_cabinet': ('Biological safety cabinet', 'lib:bsc', 30, 'Certification (NSF/ANSI 49)', 12),
+    'fume_hood': ('Chemical fume hood', 'lib:fume_hood', 30, 'Performance test', None),
+    'autoclave': ('Autoclave / steam sterilizer', 'lib:autoclave', 7, None, None),
+    'eyewash': ('Eyewash station / safety shower', 'lib:eyewash', 7, 'Annual inspection (ANSI/ISEA Z358.1)', 12),
+})
+IN_LIBRARY.update({
+    'eyewash': _in_lib('Eyewash / safety shower weekly activation', 'Laboratory',
+                       'ANSI/ISEA Z358.1: activate plumbed units weekly; inspect all units yearly.', [
+        ('Weekly activation', [('Activated until clear water flows; fluid is available', 'c'), 'Water is tepid (not hot, not ice cold)',
+                               'Caps / covers come off when the unit is activated', 'Unit is reached in about 10 seconds with nothing in the way']),
+        ('Station', ['Sign is visible', 'Area around the unit is lit and clear', ('Notes', 't')]),
+    ]),
+    'bsc': _in_lib('Biological safety cabinet check', 'Laboratory',
+                   'Routine user check between certifications. Certify at least yearly and after a move or filter change (NSF/ANSI 49).', [
+        ('Cabinet', [('Certification label is in date', 'c'), ('Airflow alarm / gauge reads normal', 'c'), 'Sash is at the marked working height',
+                     'Front and rear grilles are not blocked', 'Work surface is clean and disinfected', 'No open flame inside the cabinet']),
+        ('Notes', [('Comments', 't')]),
+    ]),
+    'fume_hood': _in_lib('Chemical fume hood check', 'Laboratory', 'Routine user check between performance tests.', [
+        ('Hood', [('Airflow monitor reads normal / alarm not sounding', 'c'), 'Sash is at or below the marked height',
+                  'Baffles and slots are not blocked', 'Not used for chemical storage', 'Test label is in date']),
+        ('Notes', [('Comments', 't')]),
+    ]),
+    'autoclave': _in_lib('Autoclave weekly biological indicator test', 'Laboratory',
+                         'CDC guideline: monitor sterilizers at least weekly with a biological indicator.', [
+        ('Spore test', [('Biological indicator run this week', 'c'), ('Result negative (no growth); control positive', 'c'),
+                        ('Load / lot number', 't')]),
+        ('Unit', ['Chemical indicators changed colour', 'Door seal and gasket are intact', 'Printout / cycle record kept']),
+    ]),
+    'lab_safety': _in_lib('Laboratory safety inspection', 'Laboratory', 'Monthly walk-round of a laboratory.', [
+        ('Access and signs', ['Biohazard sign with the biosafety level and contact is on the door', 'Door is closed; access is restricted',
+                              'Emergency numbers and spill procedure are posted']),
+        ('People and PPE', ['Lab coats, gloves and eye protection worn', 'No food, drink or cosmetics in the lab', 'Hands washed before leaving']),
+        ('Sharps and waste', [('Sharps containers are not over the fill line', 'c'), 'Sharps containers are close to where sharps are used',
+                              'Biohazard waste is bagged, labelled and collected']),
+        ('Equipment', [('Eyewash and safety shower are reachable and tested this week', 'c'), 'Biosafety cabinet certification in date',
+                       'Centrifuge uses sealed rotors / safety cups for infectious samples', 'Spill kit is complete']),
+        ('Chemicals', ['Containers labelled; safety data sheets reachable', 'Incompatible chemicals stored apart', 'Flammables in a flammable cabinet']),
+        ('Notes', [('Other findings', 't')]),
+    ]),
+})
+
+LAB_KINDS = {'needlestick': 'Needlestick', 'cut': 'Cut by a sharp', 'mucous': 'Splash to eyes, nose or mouth', 'skin': 'Splash to broken skin',
+             'bite': 'Human bite', 'other': 'Other exposure'}
+LAB_SHARPS = ('needlestick', 'cut')
+LAB_DURING = {'before_use': 'Before use', 'during_use': 'During use', 'after_use': 'After use, before disposal', 'disposal': 'During or after disposal', 'other': 'Other'}
+LAB_FIRST_STEPS = [
+    'Wash the wound or skin with soap and water; flush eyes, nose or mouth with plenty of water.',
+    'Report it now to your supervisor and occupational health: do not wait for the end of the shift.',
+    'Occupational health decides about HIV post-exposure prophylaxis (PEP): CDC advises starting as soon as possible, up to 72 hours after exposure.',
+    'Ask for the source patient to be tested (with consent) and record your hepatitis B vaccination status.',
+]
+LAB_FOLLOWUP_NOTE = ('Follow-up tests and their dates are set by the clinician from current guidance '
+                     '(US PHS / CDC guidance on occupational exposures was updated in 2025).')
+
+
+class LabExposure(db.Model):
+    __tablename__ = 'lab_exposures'
+    __table_args__ = {'extend_existing': True}
+    id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id', ondelete='CASCADE'), nullable=False, index=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True, index=True)
+    person = db.Column(db.String(120), nullable=False)
+    department = db.Column(db.String(120), nullable=False)
+    work_area = db.Column(db.String(160))
+    occurred_at = db.Column(db.DateTime, nullable=False)
+    reported_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    kind = db.Column(db.String(12), nullable=False)
+    body_part = db.Column(db.String(60))
+    device_type = db.Column(db.String(120))
+    device_brand = db.Column(db.String(160))
+    safety_feature = db.Column(db.String(8))                                  # yes | no | unknown
+    feature_activated = db.Column(db.String(8))                               # yes | no | partly | na
+    during = db.Column(db.String(12))
+    how = db.Column(db.Text, nullable=False)
+    first_aid = db.Column(db.Boolean, nullable=False, default=False)
+    source_tested = db.Column(db.String(12), nullable=False, default='unknown')   # unknown | requested | done | not_possible
+    pep = db.Column(db.String(14), nullable=False, default='pending')            # pending | started | declined | not_indicated
+    pep_at = db.Column(db.DateTime)
+    pep_reminded = db.Column(db.Boolean, nullable=False, default=False)
+    hbv_immune = db.Column(db.String(8), nullable=False, default='unknown')
+    followups = db.Column(db.Text)                                            # JSON [{label, due, done_at, by}]
+    status = db.Column(db.String(8), nullable=False, default='open')
+    close_note = db.Column(db.Text)
+    closed_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    closed_at = db.Column(db.DateTime)
+    reported_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    notified_on = db.Column(db.Date)
+
+
+class LabAgent(db.Model):
+    __tablename__ = 'lab_agents'
+    __table_args__ = {'extend_existing': True}
+    id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id', ondelete='CASCADE'), nullable=False, index=True)
+    name = db.Column(db.String(160), nullable=False)
+    risk_group = db.Column(db.Integer, nullable=False)
+    lab = db.Column(db.String(160), nullable=False)
+    lab_bsl = db.Column(db.Integer, nullable=False)
+    aerosol = db.Column(db.Boolean, nullable=False, default=False)
+    sharps = db.Column(db.Boolean, nullable=False, default=False)
+    vaccine = db.Column(db.String(8), nullable=False, default='na')            # yes | no | na
+    notes = db.Column(db.Text)
+    active = db.Column(db.Boolean, nullable=False, default=True)
+    created_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+
+def _lab_loc(v):
+    return re.sub(r'[^a-z0-9]+', ' ', (v or '').lower()).strip()
+
+
+def _lab_parse_dt(v):
+    try:
+        d = datetime.fromisoformat(str(v).replace('Z', '+00:00'))
+        return d.replace(tzinfo=None) if d.tzinfo else d
+    except (TypeError, ValueError):
+        return None
+
+
+def _lab_followups(x):
+    return _tbt_json(x.followups, [])
+
+
+def _lab_dict(x, names, now, full=True):
+    hours = round((now - x.occurred_at).total_seconds() / 3600, 1)
+    fu = _lab_followups(x)
+    today = now.date().isoformat()
+    d = {'id': x.id, 'person': x.person, 'user_id': x.user_id, 'department': x.department, 'work_area': x.work_area,
+         'occurred_at': _in_iso(x.occurred_at), 'reported_at': _in_iso(x.reported_at), 'kind': x.kind, 'kind_name': LAB_KINDS.get(x.kind, x.kind),
+         'device_type': x.device_type, 'device_brand': x.device_brand, 'safety_feature': x.safety_feature, 'feature_activated': x.feature_activated,
+         'during': x.during, 'how': x.how, 'body_part': x.body_part, 'first_aid': x.first_aid, 'source_tested': x.source_tested, 'pep': x.pep,
+         'pep_at': _in_iso(x.pep_at), 'hbv_immune': x.hbv_immune, 'followups': fu, 'status': x.status, 'close_note': x.close_note,
+         'closed_at': _in_iso(x.closed_at), 'closed_by': names.get(x.closed_by), 'reported_by': names.get(x.reported_by),
+         'hours_since': hours, 'pep_window_left_h': max(0.0, round(72 - hours, 1)) if x.pep == 'pending' else None,
+         'followups_overdue': sum(1 for f in fu if not f.get('done_at') and f.get('due') and f['due'] < today),
+         'report_delay_h': round((x.reported_at - x.occurred_at).total_seconds() / 3600, 1) if x.reported_at and x.occurred_at else None}
+    return d
+
+
+@app.route('/api/lab/exposures', methods=['GET', 'POST'])
+@jwt_required
+def lab_exposures_route():
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    cid, staff, now = user.company_id, _rc_staff(user), datetime.utcnow()
+    if request.method == 'GET':
+        q = LabExposure.query.filter(LabExposure.company_id == cid)
+        if not staff:
+            q = q.filter(or_(LabExposure.user_id == user.id, LabExposure.reported_by == user.id))
+        rows = q.order_by(LabExposure.occurred_at.desc()).limit(2000).all()
+        names = _in_names([r.closed_by for r in rows] + [r.reported_by for r in rows])
+        out = {'success': True, 'can_manage': staff, 'me': user.id, 'data': [_lab_dict(r, names, now) for r in rows],
+               'kinds': LAB_KINDS, 'during': LAB_DURING, 'first_steps': LAB_FIRST_STEPS, 'followup_note': LAB_FOLLOWUP_NOTE}
+        if staff:
+            year = [r for r in rows if r.occurred_at >= now - timedelta(days=365)]
+            dev = {}
+            for r in year:
+                if r.kind not in LAB_SHARPS:
+                    continue
+                k = (r.device_type or 'Unknown device', r.device_brand or 'brand not known')
+                g = dev.setdefault(k, {'device': k[0], 'brand': k[1], 'count': 0, 'no_feature': 0, 'not_activated': 0, 'during': {}})
+                g['count'] += 1
+                g['no_feature'] += r.safety_feature == 'no'
+                g['not_activated'] += r.safety_feature == 'yes' and r.feature_activated in ('no', 'partly')
+                g['during'][r.during or 'other'] = g['during'].get(r.during or 'other', 0) + 1
+            sharps = [r for r in year if r.kind in LAB_SHARPS]
+            out['analysis'] = {
+                'last_12_months': len(year), 'sharps': len(sharps),
+                'without_feature_pct': round(100 * sum(r.safety_feature == 'no' for r in sharps) / len(sharps)) if sharps else None,
+                'after_use_pct': round(100 * sum(r.during in ('after_use', 'disposal') for r in sharps) / len(sharps)) if sharps else None,
+                'late_reports': sum(1 for r in year if r.reported_at and (r.reported_at - r.occurred_at) > timedelta(hours=2)),
+                'devices': sorted(dev.values(), key=lambda g: -g['count'])[:15],
+                'by_department': sorted(({'department': d, 'count': n} for d, n in
+                                         __import__('collections').Counter(r.department for r in year).items()), key=lambda x: -x['count'])[:10]}
+        return jsonify(out), 200
+    data = _in_body()
+    kind = data.get('kind') if data.get('kind') in LAB_KINDS else None
+    if not kind:
+        return jsonify({'success': False, 'error': 'Choose what happened (needlestick, cut, splash...).'}), 400
+    occurred = _lab_parse_dt(data.get('occurred_at')) or now
+    if occurred > now + timedelta(minutes=5) or occurred < now - timedelta(days=365):
+        return jsonify({'success': False, 'error': 'Give when it happened (within the last year).'}), 400
+    uid, person = None, _rc_text(data.get('person'), 120)
+    if data.get('self'):
+        uid, person = user.id, _in_names([user.id]).get(user.id) or person
+    elif data.get('user_id'):
+        try:
+            uid = _in_user_in_company(cid, data.get('user_id'))
+        except ValueError as e:
+            return jsonify({'success': False, 'error': str(e)}), 400
+        person = _in_names([uid]).get(uid) or person
+    if len(person) < 2:
+        return jsonify({'success': False, 'error': 'Who was exposed?'}), 400
+    dept, how = _rc_text(data.get('department'), 120), _capa_long(data.get('how'), 3000)
+    if len(dept) < 2 or len(how) < 10:
+        return jsonify({'success': False, 'error': 'The sharps injury log needs the department or work area and how it happened (OSHA 1910.1030(h)(5)).'}), 400
+    dtype, brand = _rc_text(data.get('device_type'), 120), _rc_text(data.get('device_brand'), 160)
+    if kind in LAB_SHARPS and (len(dtype) < 2 or len(brand) < 2):
+        return jsonify({'success': False, 'code': 'DEVICE_NEEDED',
+                        'error': 'For a sharps injury give the device type and brand (maker and product), or write "not known".'}), 400
+    x = LabExposure(company_id=cid, user_id=uid, person=person, department=dept, work_area=_rc_text(data.get('work_area'), 160) or None,
+                    occurred_at=occurred, reported_at=now, kind=kind, body_part=_rc_text(data.get('body_part'), 60) or None,
+                    device_type=dtype or None, device_brand=brand or None,
+                    safety_feature=data.get('safety_feature') if data.get('safety_feature') in ('yes', 'no', 'unknown') else ('unknown' if kind in LAB_SHARPS else None),
+                    feature_activated=data.get('feature_activated') if data.get('feature_activated') in ('yes', 'no', 'partly', 'na') else None,
+                    during=data.get('during') if data.get('during') in LAB_DURING else None, how=how, first_aid=bool(data.get('first_aid')),
+                    hbv_immune=data.get('hbv_immune') if data.get('hbv_immune') in ('yes', 'no', 'unknown') else 'unknown',
+                    followups='[]', reported_by=user.id)
+    db.session.add(x)
+    db.session.commit()
+    hours = (now - occurred).total_seconds() / 3600
+    _in_notify([(u.id, getattr(u, 'email', None)) for u in _rc_staff_users(cid, exclude=user.id)],
+               f'Blood / body fluid exposure: {LAB_KINDS[kind]} in {dept}'[:200],
+               f'Reported {round(hours, 1)} h after it happened. Decide on post-exposure treatment now: the PEP window closes 72 h after exposure.',
+               '/hospital-management?tab=lab-safety&lab=exposures', 'critical', email=True)
+    return jsonify({'success': True, 'data': _lab_dict(x, {}, now), 'first_steps': LAB_FIRST_STEPS}), 201
+
+
+@app.route('/api/lab/exposures/<int:xid>', methods=['PUT'])
+@jwt_required
+def lab_exposure_one(xid):
+    """Occupational health (staff): pep {pep, pep_at} | source {source_tested} | hbv {hbv_immune} | followup_add {label, due} |
+    followup_done {index, note} | close {note}."""
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    if not _rc_staff(user):
+        return jsonify({'success': False, 'error': 'Only occupational health / supervisors manage exposure follow-up.'}), 403
+    x = db.session.get(LabExposure, xid)
+    if not x or x.company_id != user.company_id:
+        return jsonify({'success': False, 'error': 'Not found.'}), 404
+    data, now = _in_body(), datetime.utcnow()
+    action = data.get('action')
+    if x.status == 'closed' and action != 'reopen':
+        return jsonify({'success': False, 'error': 'This exposure is closed.'}), 409
+    fu = _lab_followups(x)
+    if action == 'pep':
+        if data.get('pep') not in ('started', 'declined', 'not_indicated', 'pending'):
+            return jsonify({'success': False, 'error': 'Choose the PEP decision.'}), 400
+        x.pep = data['pep']
+        x.pep_at = (_lab_parse_dt(data.get('pep_at')) or now) if x.pep == 'started' else None
+    elif action == 'source':
+        if data.get('source_tested') not in ('unknown', 'requested', 'done', 'not_possible'):
+            return jsonify({'success': False, 'error': 'Choose the source testing status.'}), 400
+        x.source_tested = data['source_tested']                                 # results stay in the medical record, not here
+    elif action == 'hbv':
+        if data.get('hbv_immune') not in ('yes', 'no', 'unknown'):
+            return jsonify({'success': False, 'error': 'Choose the hepatitis B status.'}), 400
+        x.hbv_immune = data['hbv_immune']
+    elif action == 'followup_add':
+        label = _rc_text(data.get('label'), 120)
+        try:
+            due = datetime.strptime(str(data.get('due'))[:10], '%Y-%m-%d').date()
+        except (TypeError, ValueError):
+            return jsonify({'success': False, 'error': 'Give the follow-up a date.'}), 400
+        if len(label) < 3:
+            return jsonify({'success': False, 'error': 'Say what the follow-up is (e.g. HIV test).'}), 400
+        if len(fu) >= 20:
+            return jsonify({'success': False, 'error': 'Too many follow-ups.'}), 400
+        fu.append({'label': label, 'due': due.isoformat(), 'done_at': None, 'by': None})
+        fu.sort(key=lambda f: f['due'])
+    elif action == 'followup_done':
+        i = data.get('index')
+        if not isinstance(i, int) or not 0 <= i < len(fu):
+            return jsonify({'success': False, 'error': 'Choose the follow-up.'}), 400
+        fu[i].update({'done_at': now.date().isoformat(), 'by': user.id, 'note': _rc_text(data.get('note'), 200) or None})
+    elif action == 'close':
+        note = _capa_long(data.get('note'), 2000)
+        open_fu = [f for f in fu if not f.get('done_at')]
+        if x.pep == 'pending':
+            return jsonify({'success': False, 'error': 'Record the PEP decision before closing.'}), 409
+        if open_fu and len(note) < 10:
+            return jsonify({'success': False, 'error': f'{len(open_fu)} follow-up(s) are not done: say why you are closing anyway.'}), 409
+        if len(note) < 10:
+            return jsonify({'success': False, 'error': 'Add a closing note: outcome and what will stop it happening again.'}), 400
+        x.status, x.close_note, x.closed_by, x.closed_at = 'closed', note, user.id, now
+    elif action == 'reopen':
+        x.status = 'open'
+    else:
+        return jsonify({'success': False, 'error': 'Unknown action.'}), 400
+    x.followups = json.dumps(fu)
+    db.session.commit()
+    return jsonify({'success': True, 'data': _lab_dict(x, _in_names([x.closed_by, x.reported_by]), now)}), 200
+
+
+@app.route('/api/lab/sharps-log.csv', methods=['GET'])
+@jwt_required
+def lab_sharps_log():
+    """The sharps injury log as OSHA asks for it: no names (1910.1030(h)(5)(i): confidentiality of the injured employee)."""
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    if not _rc_staff(user):
+        return jsonify({'success': False, 'error': 'Supervisors and admins only.'}), 403
+    year = request.args.get('year')
+    q = LabExposure.query.filter(LabExposure.company_id == user.company_id, LabExposure.kind.in_(LAB_SHARPS))
+    if year and str(year).isdigit():
+        q = q.filter(LabExposure.occurred_at >= datetime(int(year), 1, 1), LabExposure.occurred_at < datetime(int(year) + 1, 1, 1))
+    sio = io.StringIO()
+    w = _capa_csv.writer(sio)
+    w.writerow(['Date', 'Type of device', 'Brand (maker and product)', 'Department / work area', 'How it happened',
+                'Safety feature', 'Feature activated', 'When'])
+    safe = lambda v: ("'" + v) if isinstance(v, str) and v[:1] in ('=', '+', '-', '@') else v
+    for r in q.order_by(LabExposure.occurred_at).all():
+        w.writerow([safe(v) for v in (r.occurred_at.strftime('%Y-%m-%d'), r.device_type or 'not known', r.device_brand or 'not known',
+                                      f'{r.department}{" / " + r.work_area if r.work_area else ""}', r.how, r.safety_feature or '', r.feature_activated or '',
+                                      LAB_DURING.get(r.during, ''))])
+    resp = send_file(io.BytesIO(('﻿' + sio.getvalue()).encode('utf-8')), mimetype='text/csv', as_attachment=True,
+                     download_name=f'sharps_injury_log{"_" + year if year else ""}.csv')
+    resp.headers['Cache-Control'] = 'private, no-store'
+    return resp
+
+
+# ---------------------------------------------------------------- biological agents
+def _lab_bscs(cid):
+    return [e for e in EquipmentItem.query.filter(EquipmentItem.company_id == cid, EquipmentItem.category == 'biosafety_cabinet',
+                                                    EquipmentItem.status != 'retired').all()]
+
+
+def _lab_agent_issues(a, bscs, today):
+    out = []
+    if a.risk_group > a.lab_bsl:
+        out.append(('high', f'Risk group {a.risk_group} agent in a BSL-{a.lab_bsl} lab: needs a documented biosafety risk assessment '
+                            '(risk group and biosafety level are not the same thing, but a higher-risk agent needs the controls justified).'))
+    if a.risk_group >= 2 and a.aerosol:
+        here = [e for e in bscs if _lab_loc(e.location) and (_lab_loc(e.location) in _lab_loc(a.lab) or _lab_loc(a.lab) in _lab_loc(e.location))]
+        good = [e for e in here if _eq_state(e, today)[0] == 'ok']
+        if not here:
+            out.append(('high', f'Aerosol-generating work with a risk group {a.risk_group} agent, but no biological safety cabinet is registered at {a.lab}.'))
+        elif not good:
+            out.append(('high', f'The biological safety cabinet(s) at {a.lab} are not safe to use: {", ".join(e.tag_no + " " + _eq_state(e, today)[1] for e in here)}.'))
+    if a.vaccine == 'yes':
+        out.append(('info', 'A vaccine exists: check staff vaccination before work starts.'))
+    return [{'level': l, 'text': t} for l, t in out]
+
+
+def _lab_agent_dict(a, bscs, today):
+    return {'id': a.id, 'name': a.name, 'risk_group': a.risk_group, 'lab': a.lab, 'lab_bsl': a.lab_bsl, 'aerosol': a.aerosol, 'sharps': a.sharps,
+            'vaccine': a.vaccine, 'notes': a.notes, 'active': a.active, 'issues': _lab_agent_issues(a, bscs, today)}
+
+
+def _lab_agent_apply(a, data):
+    name, lab = _rc_text(data.get('name'), 160), _rc_text(data.get('lab'), 160)
+    try:
+        rg, bsl = int(data.get('risk_group')), int(data.get('lab_bsl'))
+    except (TypeError, ValueError):
+        raise ValueError('Give the risk group (1-4) and the lab biosafety level (1-4).')
+    if len(name) < 2 or len(lab) < 2 or rg not in (1, 2, 3, 4) or bsl not in (1, 2, 3, 4):
+        raise ValueError('Give the agent, the lab, the risk group (1-4) and the lab biosafety level (1-4).')
+    a.name, a.lab, a.risk_group, a.lab_bsl = name, lab, rg, bsl
+    a.aerosol, a.sharps = bool(data.get('aerosol')), bool(data.get('sharps'))
+    a.vaccine = data.get('vaccine') if data.get('vaccine') in ('yes', 'no', 'na') else 'na'
+    a.notes = _capa_long(data.get('notes'), 2000) or None
+
+
+@app.route('/api/lab/agents', methods=['GET', 'POST'])
+@jwt_required
+def lab_agents_route():
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    today = datetime.utcnow().date()
+    if request.method == 'GET':
+        bscs = _lab_bscs(user.company_id)
+        rows = LabAgent.query.filter(LabAgent.company_id == user.company_id, LabAgent.active.is_(True)).order_by(LabAgent.lab, LabAgent.name).all()
+        return jsonify({'success': True, 'can_manage': _rc_staff(user), 'data': [_lab_agent_dict(a, bscs, today) for a in rows],
+                        'note': 'WHO risk groups 1-4 (Laboratory Biosafety Manual). Your national list decides the group of each agent.'}), 200
+    if not _rc_staff(user):
+        return jsonify({'success': False, 'error': 'Only supervisors and the biosafety officer edit the register.'}), 403
+    a = LabAgent(company_id=user.company_id, created_by=user.id)
+    try:
+        _lab_agent_apply(a, _in_body())
+    except ValueError as e:
+        return jsonify({'success': False, 'error': str(e)}), 400
+    db.session.add(a)
+    db.session.commit()
+    return jsonify({'success': True, 'data': _lab_agent_dict(a, _lab_bscs(user.company_id), today)}), 201
+
+
+@app.route('/api/lab/agents/<int:aid>', methods=['PUT', 'DELETE'])
+@jwt_required
+def lab_agent_one(aid):
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    if not _rc_staff(user):
+        return jsonify({'success': False, 'error': 'Only supervisors and the biosafety officer edit the register.'}), 403
+    a = db.session.get(LabAgent, aid)
+    if not a or a.company_id != user.company_id:
+        return jsonify({'success': False, 'error': 'Not found.'}), 404
+    if request.method == 'DELETE':
+        a.active = False
+        db.session.commit()
+        return jsonify({'success': True}), 200
+    try:
+        _lab_agent_apply(a, _in_body())
+    except ValueError as e:
+        return jsonify({'success': False, 'error': str(e)}), 400
+    db.session.commit()
+    return jsonify({'success': True, 'data': _lab_agent_dict(a, _lab_bscs(user.company_id), datetime.utcnow().date())}), 200
+
+
+LAB_SPILL = [
+    ('now', 'Warn people nearby. If the spill may have made aerosols (dropped tube, centrifuge failure), everyone leaves the room and the door is closed.'),
+    ('now', 'Remove contaminated clothing; wash skin; follow the exposure steps if anyone was splashed or cut.'),
+    ('now', 'Put a sign on the door and tell the lab supervisor / biosafety officer.'),
+    ('clean', 'Wait the time your lab procedure sets for aerosols to settle before going back in.'),
+    ('clean', 'Wear gloves, a gown and eye / face protection; add respiratory protection if your procedure for this agent asks for it.'),
+    ('clean', 'Cover the spill with absorbent material, pour the lab\'s approved disinfectant from the edges inwards, and leave it for the contact time on its label.'),
+    ('clean', 'Pick up broken glass with tongs or a scoop, never with hands; put it in a sharps container.'),
+    ('clean', 'Collect everything as biohazard waste, wipe the area again with disinfectant, then wash hands.'),
+    ('after', 'Record the spill and any exposure; check whether the work method or equipment needs to change.'),
+]
+
+
+@app.route('/api/lab/spill-guide', methods=['GET'])
+@jwt_required
+def lab_spill_guide():
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    a = None
+    if str(request.args.get('agent_id') or '').isdigit():
+        a = db.session.get(LabAgent, int(request.args['agent_id']))
+        if not a or a.company_id != user.company_id:
+            return jsonify({'success': False, 'error': 'Not found.'}), 404
+    steps = [{'phase': p, 'text': t} for p, t in LAB_SPILL]
+    if a and a.risk_group >= 3:
+        steps.insert(0, {'phase': 'now', 'text': f'{a.name} is risk group {a.risk_group}: only staff trained for this agent clean it up; follow your lab\'s specific procedure.'})
+    if a and a.notes:
+        steps.append({'phase': 'after', 'text': f'Notes for {a.name}: {a.notes}'})
+    return jsonify({'success': True, 'data': {'agent': a.name if a else None, 'risk_group': a.risk_group if a else None, 'steps': steps,
+                                              'note': 'General steps. Your lab\'s written spill procedure and the disinfectant label take priority.'}}), 200
+
+
+# ---------------------------------------------------------------- lab readiness board
+LAB_EQ = ('biosafety_cabinet', 'fume_hood', 'autoclave', 'eyewash')
+
+
+@app.route('/api/lab/board', methods=['GET'])
+@jwt_required
+def lab_board():
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    cid, today, now = user.company_id, datetime.utcnow().date(), datetime.utcnow()
+    eqs = EquipmentItem.query.filter(EquipmentItem.company_id == cid, EquipmentItem.category.in_(LAB_EQ), EquipmentItem.status != 'retired').all()
+    agents = LabAgent.query.filter(LabAgent.company_id == cid, LabAgent.active.is_(True)).all()
+    bscs = [e for e in eqs if e.category == 'biosafety_cabinet']
+    labs = {}
+
+    def lab(name):
+        k = _lab_loc(name) or 'no location'
+        return labs.setdefault(k, {'lab': name or 'No location given', 'items': [], 'red': [], 'amber': [], 'agents': 0, 'max_rg': 0})
+    for e in eqs:
+        L = lab(e.location)
+        code, label, level = _eq_state(e, today)
+        L['items'].append({'id': e.id, 'tag_no': e.tag_no, 'name': e.name, 'category': e.category, 'state': code, 'label': label, 'level': level})
+        if level == 'red':
+            L['red'].append(f'{e.tag_no} {e.name}: {label}')
+        elif level == 'orange':
+            L['amber'].append(f'{e.tag_no} {e.name}: {label}')
+    for a in agents:
+        L = lab(a.lab)
+        L['agents'] += 1
+        L['max_rg'] = max(L['max_rg'], a.risk_group)
+        for i in _lab_agent_issues(a, bscs, today):
+            if i['level'] == 'high':
+                L['red'].append(f'{a.name}: {i["text"]}')
+    for L in labs.values():
+        cats = {i['category'] for i in L['items']}
+        if L['agents'] and 'eyewash' not in cats:
+            L['amber'].append('No eyewash station is registered for this lab.')
+        if L['max_rg'] >= 2 and 'autoclave' not in cats:
+            L['amber'].append('No autoclave registered here: say where this lab\'s biohazard waste is sterilized (or register it).')
+        L['level'] = 'red' if L['red'] else 'amber' if L['amber'] else 'green'
+    rows = sorted(labs.values(), key=lambda L: ({'red': 0, 'amber': 1, 'green': 2}[L['level']], L['lab']))
+    staff = _rc_staff(user)
+    ex = LabExposure.query.filter(LabExposure.company_id == cid, LabExposure.status == 'open').all() if staff else []
+    pending = [x for x in ex if x.pep == 'pending']
+    return jsonify({'success': True, 'data': rows, 'can_manage': staff,
+                    'exposures': {'open': len(ex), 'pep_pending': len(pending),
+                                  'pep_window_closing': sum(1 for x in pending if (now - x.occurred_at) > timedelta(hours=48)),
+                                  'followups_overdue': sum(_lab_dict(x, {}, now)['followups_overdue'] for x in ex)} if staff else None,
+                    'note': 'Built from the equipment register (biological safety cabinets, fume hoods, autoclaves, eyewash) and the agent register. '
+                            'Register lab equipment in Inspections > Equipment with the lab name as its location.'}), 200
+
+
+def _lab_reminders(now=None):
+    """PEP still undecided 1 hour after the report: tell supervisors once. Overdue follow-ups: once a day."""
+    now = now or datetime.utcnow()
+    today = now.date()
+    n = 0
+    for x in LabExposure.query.filter(LabExposure.status == 'open', LabExposure.pep == 'pending', LabExposure.pep_reminded.is_(False),
+                                      LabExposure.reported_at < now - timedelta(hours=1)).limit(500).all():
+        if LabExposure.query.filter(LabExposure.id == x.id, LabExposure.pep_reminded.is_(False)).update({'pep_reminded': True}, synchronize_session=False):
+            db.session.commit()
+            n += 1
+            left = max(0, round(72 - (now - x.occurred_at).total_seconds() / 3600))
+            _in_notify([(u.id, getattr(u, 'email', None)) for u in _rc_staff_users(x.company_id)],
+                       f'PEP decision still open for an exposure in {x.department}'[:200],
+                       f'About {left} h left in the 72-hour PEP window. Record the decision.', '/hospital-management?tab=lab-safety&lab=exposures', 'critical', email=True)
+    for x in LabExposure.query.filter(LabExposure.status == 'open', or_(LabExposure.notified_on.is_(None), LabExposure.notified_on < today)).limit(2000).all():
+        due = [f for f in _lab_followups(x) if not f.get('done_at') and f.get('due') and f['due'] < today.isoformat()]
+        if not due:
+            continue
+        if LabExposure.query.filter(LabExposure.id == x.id, or_(LabExposure.notified_on.is_(None), LabExposure.notified_on < today)).update(
+                {'notified_on': today}, synchronize_session=False):
+            db.session.commit()
+            n += 1
+            _in_notify([(u.id, getattr(u, 'email', None)) for u in _rc_staff_users(x.company_id)],
+                       f'Exposure follow-up overdue ({x.department})'[:200], '; '.join(f'{f["label"]} due {f["due"]}' for f in due)[:400],
+                       '/hospital-management?tab=lab-safety&lab=exposures', 'high')
+    return n
+
+
+# ---------------------------------------------------------------- construction: scaffold tag board
+CN_DEFAULTS = {'scaffold_rule': 'shift', 'shift_hours': 12}
+
+
+def _cn_settings(cid):
+    s = _dm_setting_get('cn_settings', cid, CN_DEFAULTS)
+    return {**CN_DEFAULTS, **(s or {})}
+
+
+def _cn_scaffold_tag(e, st, now):
+    code, label, level = _eq_state(e, now.date())
+    if level == 'red' or e.last_result == 'fail':
+        return 'red', label if level == 'red' else 'Failed its last inspection: DO NOT USE'
+    if not e.last_inspected_at:
+        return 'amber', 'Not inspected yet: no one goes on it'
+    if st['scaffold_rule'] == 'shift' and e.last_inspected_at < now - timedelta(hours=int(st.get('shift_hours') or 12)):
+        return 'amber', 'Not inspected this shift: a competent person checks it before use (OSHA 1926.451(f)(3))'
+    if level == 'orange':
+        return 'amber', label
+    return 'green', 'Inspected: safe to use'
+
+
+@app.route('/api/cn/scaffolds', methods=['GET', 'PUT'])
+@jwt_required
+def cn_scaffolds():
+    """GET: every scaffold in the equipment register with its tag colour. PUT (staff): rule shift | days, shift_hours."""
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    cid, now = user.company_id, datetime.utcnow()
+    if request.method == 'PUT':
+        if not _rc_staff(user):
+            return jsonify({'success': False, 'error': 'Supervisors and admins only.'}), 403
+        data = _in_body()
+        rule = data.get('scaffold_rule') if data.get('scaffold_rule') in ('shift', 'days') else 'shift'
+        try:
+            hours = max(4, min(24, int(data.get('shift_hours') or 12)))
+        except (TypeError, ValueError):
+            return jsonify({'success': False, 'error': 'Shift length must be a number of hours.'}), 400
+        _dm_setting_put('cn_settings', cid, {'scaffold_rule': rule, 'shift_hours': hours}, user.id)
+        db.session.commit()
+    st = _cn_settings(cid)
+    rows = EquipmentItem.query.filter(EquipmentItem.company_id == cid, EquipmentItem.category == 'scaffold', EquipmentItem.status != 'retired').all()
+    out = []
+    for e in rows:
+        tag, why = _cn_scaffold_tag(e, st, now)
+        out.append({**_eq_dict(e), 'tag': tag, 'tag_reason': why,
+                    'hours_since_check': round((now - e.last_inspected_at).total_seconds() / 3600, 1) if e.last_inspected_at else None})
+    out.sort(key=lambda r: ({'red': 0, 'amber': 1, 'green': 2}[r['tag']], r['tag_no']))
+    return jsonify({'success': True, 'can_manage': _rc_staff(user), 'settings': st, 'data': out,
+                    'counts': {k: sum(1 for r in out if r['tag'] == k) for k in ('green', 'amber', 'red')},
+                    'rules': {'shift': 'OSHA 1926.451(f)(3): a competent person inspects before each work shift and after anything that could affect it.',
+                              'days': 'UK Work at Height Regulations 2005, Schedule 7: before first use, after changes or bad weather, and at least every 7 days.'}}), 200
+
+
+# ---------------------------------------------------------------- construction: excavations
+CN_SOILS = {'stable_rock': 'Stable rock', 'type_a': 'Type A', 'type_b': 'Type B', 'type_c': 'Type C', 'unknown': 'Not classified'}
+CN_PROTECT = {'none': 'None', 'sloping': 'Sloping', 'benching': 'Benching', 'shoring': 'Shoring', 'shield': 'Trench box / shield'}
+CN_EGRESS = {'ladder': 'Ladder', 'ramp': 'Ramp', 'stairway': 'Stairway', 'none': 'None'}
+CN_CHECK_ITEMS = [
+    ('walls', 'No cracks, bulges, sloughing or water seepage in the walls'),
+    ('protection', 'Protective system (slope, bench, shoring, box) is in place and undamaged'),
+    ('spoil', 'Spoil and materials are at least 0.6 m (2 ft) back from the edge (1926.651(j)(2))'),
+    ('water', 'No water build-up, or it is controlled'),
+    ('egress', 'Ladder / ramp / stairs in place within 7.6 m (25 ft) of every worker'),
+    ('edges', 'Edges barricaded; vehicles and plant kept back'),
+    ('utilities', 'Located utilities are marked and protected'),
+]
+
+
+class CnExcavation(db.Model):
+    __tablename__ = 'cn_excavations'
+    __table_args__ = {'extend_existing': True}
+    id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id', ondelete='CASCADE'), nullable=False, index=True)
+    ref = db.Column(db.String(40), nullable=False)
+    location = db.Column(db.String(200), nullable=False)
+    purpose = db.Column(db.String(200))
+    depth_m = db.Column(db.Float, nullable=False)
+    width_m = db.Column(db.Float)
+    soil = db.Column(db.String(12), nullable=False, default='unknown')
+    protection = db.Column(db.String(10), nullable=False, default='none')
+    pe_design = db.Column(db.Boolean, nullable=False, default=False)
+    pe_ref = db.Column(db.String(160))
+    utilities_located = db.Column(db.Boolean, nullable=False, default=False)
+    utilities_ref = db.Column(db.String(160))
+    egress = db.Column(db.String(10), nullable=False, default='none')
+    egress_within_25ft = db.Column(db.Boolean, nullable=False, default=False)
+    atmosphere_risk = db.Column(db.Boolean, nullable=False, default=False)
+    status = db.Column(db.String(8), nullable=False, default='open')
+    hazard_event_at = db.Column(db.DateTime)                                  # rain / vibration / collapse sign: new check needed
+    hazard_event_note = db.Column(db.String(300))
+    closed_at = db.Column(db.DateTime)
+    closed_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    created_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+
+class CnExcavationCheck(db.Model):
+    __tablename__ = 'cn_excavation_checks'
+    __table_args__ = {'extend_existing': True}
+    id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id', ondelete='CASCADE'), nullable=False, index=True)
+    excavation_id = db.Column(db.Integer, db.ForeignKey('cn_excavations.id', ondelete='CASCADE'), nullable=False, index=True)
+    checked_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    checked_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    answers = db.Column(db.Text, nullable=False)                              # JSON {key: yes|no}
+    o2 = db.Column(db.Float)
+    lel = db.Column(db.Float)
+    result = db.Column(db.String(6), nullable=False)
+    note = db.Column(db.String(1000))
+
+
+def _cn_design_issues(x):
+    """Rules that block entry because of how the excavation is set up."""
+    out = []
+    if not x.utilities_located:
+        out.append('Underground utilities have not been located (OSHA 1926.651(b)).')
+    if x.depth_m >= 1.5 and x.soil != 'stable_rock' and x.protection == 'none':
+        out.append('1.5 m (5 ft) or deeper needs a protective system (sloping, benching, shoring or a shield) unless it is entirely in stable rock (1926.652(a)(1)).')
+    if x.depth_m > 6.1 and x.protection != 'none' and not x.pe_design:
+        out.append('Deeper than 6.1 m (20 ft): the protective system must be designed by a registered professional engineer, '
+                   'or used within the maker\'s tabulated data (1926.652(b)-(c)). Record the design reference.')
+    if x.depth_m >= 1.2 and (x.egress == 'none' or not x.egress_within_25ft):
+        out.append('1.2 m (4 ft) or deeper needs a ladder, ramp or stairway so no one walks more than 7.6 m (25 ft) to get out (1926.651(c)(2)).')
+    return out
+
+
+def _cn_state(x, last, now):
+    issues = _cn_design_issues(x)
+    if x.status != 'open':
+        return 'closed', ['Closed / backfilled.'], issues
+    why = list(issues)
+    today_start = datetime(now.year, now.month, now.day)
+    if not last or last.checked_at < today_start:
+        why.append('No competent-person check today: check it before anyone enters (1926.651(k)).')
+    elif last.result != 'pass':
+        why.append('Today\'s check failed: fix it and check again before entry.')
+    elif x.hazard_event_at and x.hazard_event_at > last.checked_at:
+        why.append(f'Since the last check: {x.hazard_event_note or "a hazard event"}. Check it again before entry.')
+    elif x.atmosphere_risk and x.depth_m > 1.2 and (last.o2 is None or last.o2 < 19.5):
+        why.append('A hazardous atmosphere could exist: test the air before entry (oxygen at least 19.5 %, 1926.651(g)).')
+    return ('no_entry' if why else 'entry_ok'), why, issues
+
+
+def _cn_exc_dict(x, last, names, now):
+    state, why, issues = _cn_state(x, last, now)
+    return {'id': x.id, 'ref': x.ref, 'location': x.location, 'purpose': x.purpose, 'depth_m': x.depth_m, 'width_m': x.width_m,
+            'soil': x.soil, 'protection': x.protection, 'pe_design': x.pe_design, 'pe_ref': x.pe_ref, 'utilities_located': x.utilities_located,
+            'utilities_ref': x.utilities_ref, 'egress': x.egress, 'egress_within_25ft': x.egress_within_25ft, 'atmosphere_risk': x.atmosphere_risk,
+            'status': x.status, 'state': state, 'reasons': why, 'design_issues': issues,
+            'hazard_event_at': _in_iso(x.hazard_event_at), 'hazard_event_note': x.hazard_event_note,
+            'last_check': ({'at': _in_iso(last.checked_at), 'by': names.get(last.checked_by), 'result': last.result, 'o2': last.o2, 'lel': last.lel,
+                            'note': last.note, 'failed': [k for k, v in _tbt_json(last.answers, {}).items() if v == 'no']} if last else None),
+            'created_at': _in_iso(x.created_at)}
+
+
+def _cn_exc_apply(x, data):
+    loc = _rc_text(data.get('location'), 200)
+    try:
+        depth = float(data.get('depth_m'))
+        width = float(data['width_m']) if data.get('width_m') not in (None, '') else None
+    except (TypeError, ValueError):
+        raise ValueError('Give the depth in metres.')
+    if len(loc) < 2 or not 0 < depth <= 60:
+        raise ValueError('Give the location and the depth in metres.')
+    x.location, x.depth_m, x.width_m = loc, round(depth, 2), width
+    x.purpose = _rc_text(data.get('purpose'), 200) or None
+    x.soil = data.get('soil') if data.get('soil') in CN_SOILS else 'unknown'
+    x.protection = data.get('protection') if data.get('protection') in CN_PROTECT else 'none'
+    x.pe_ref = _rc_text(data.get('pe_ref'), 160) or None
+    x.pe_design = bool(data.get('pe_design')) and bool(x.pe_ref)
+    x.utilities_ref = _rc_text(data.get('utilities_ref'), 160) or None
+    x.utilities_located = bool(data.get('utilities_located'))
+    x.egress = data.get('egress') if data.get('egress') in CN_EGRESS else 'none'
+    x.egress_within_25ft = bool(data.get('egress_within_25ft')) and x.egress != 'none'
+    x.atmosphere_risk = bool(data.get('atmosphere_risk'))
+
+
+def _cn_last_checks(ids):
+    out = {}
+    for c in CnExcavationCheck.query.filter(CnExcavationCheck.excavation_id.in_(ids or [0])).order_by(CnExcavationCheck.checked_at).all():
+        out[c.excavation_id] = c
+    return out
+
+
+@app.route('/api/cn/excavations', methods=['GET', 'POST'])
+@jwt_required
+def cn_excavations():
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    cid, now = user.company_id, datetime.utcnow()
+    if request.method == 'GET':
+        q = CnExcavation.query.filter(CnExcavation.company_id == cid)
+        if request.args.get('all') != '1':
+            q = q.filter(CnExcavation.status == 'open')
+        rows = q.order_by(CnExcavation.created_at.desc()).limit(500).all()
+        last = _cn_last_checks([x.id for x in rows])
+        names = _in_names([c.checked_by for c in last.values()])
+        return jsonify({'success': True, 'can_manage': _rc_staff(user), 'data': [_cn_exc_dict(x, last.get(x.id), names, now) for x in rows],
+                        'soils': CN_SOILS, 'protections': CN_PROTECT, 'egress': CN_EGRESS, 'check_items': [{'key': k, 'text': t} for k, t in CN_CHECK_ITEMS],
+                        'note': 'Rules from OSHA 29 CFR 1926 Subpart P. Soil types are classified by a competent person (Appendix A).'}), 200
+    if not _rc_staff(user):
+        return jsonify({'success': False, 'error': 'Supervisors and admins open excavations.'}), 403
+    x = CnExcavation(company_id=cid, created_by=user.id, status='open',
+                     ref=f'EXC-{CnExcavation.query.filter(CnExcavation.company_id == cid).count() + 1:04d}')
+    try:
+        _cn_exc_apply(x, _in_body())
+    except ValueError as e:
+        return jsonify({'success': False, 'error': str(e)}), 400
+    db.session.add(x)
+    db.session.commit()
+    return jsonify({'success': True, 'data': _cn_exc_dict(x, None, {}, now)}), 201
+
+
+@app.route('/api/cn/excavations/<int:xid>', methods=['PUT'])
+@jwt_required
+def cn_excavation_one(xid):
+    """action: edit {...} (staff) | event {note} (anyone: rain, vibration, crack seen) | close {} (staff)."""
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    x = db.session.get(CnExcavation, xid)
+    if not x or x.company_id != user.company_id:
+        return jsonify({'success': False, 'error': 'Not found.'}), 404
+    data, now = _in_body(), datetime.utcnow()
+    action = data.get('action')
+    if x.status != 'open':
+        return jsonify({'success': False, 'error': 'This excavation is closed.'}), 409
+    if action == 'event':
+        note = _rc_text(data.get('note'), 300)
+        if len(note) < 3:
+            return jsonify({'success': False, 'error': 'Say what happened (rain, vibration, crack, water...).'}), 400
+        x.hazard_event_at, x.hazard_event_note = now, note
+        db.session.commit()
+        _in_notify([(u.id, getattr(u, 'email', None)) for u in _rc_staff_users(x.company_id, exclude=user.id)],
+                   f'Excavation {x.ref}: re-check before entry'[:200], f'{note} at {x.location}.', '/hse-management/industry/construction?tab=excavations', 'high')
+    elif action in ('edit', 'close'):
+        if not _rc_staff(user):
+            return jsonify({'success': False, 'error': 'Supervisors and admins only.'}), 403
+        if action == 'close':
+            x.status, x.closed_at, x.closed_by = 'closed', now, user.id
+        else:
+            try:
+                _cn_exc_apply(x, data)
+            except ValueError as e:
+                return jsonify({'success': False, 'error': str(e)}), 400
+        db.session.commit()
+    else:
+        return jsonify({'success': False, 'error': 'Unknown action.'}), 400
+    last = _cn_last_checks([x.id]).get(x.id)
+    return jsonify({'success': True, 'data': _cn_exc_dict(x, last, _in_names([last.checked_by] if last else []), now)}), 200
+
+
+@app.route('/api/cn/excavations/<int:xid>/checks', methods=['GET', 'POST'])
+@jwt_required
+def cn_excavation_checks(xid):
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    x = db.session.get(CnExcavation, xid)
+    if not x or x.company_id != user.company_id:
+        return jsonify({'success': False, 'error': 'Not found.'}), 404
+    now = datetime.utcnow()
+    if request.method == 'GET':
+        rows = CnExcavationCheck.query.filter(CnExcavationCheck.excavation_id == x.id).order_by(CnExcavationCheck.checked_at.desc()).limit(200).all()
+        names = _in_names([c.checked_by for c in rows])
+        return jsonify({'success': True, 'data': [{'id': c.id, 'at': _in_iso(c.checked_at), 'by': names.get(c.checked_by), 'result': c.result,
+                                                    'o2': c.o2, 'lel': c.lel, 'note': c.note, 'answers': _tbt_json(c.answers, {})} for c in rows]}), 200
+    if not _rc_staff(user):
+        return jsonify({'success': False, 'error': 'The daily check is done by the competent person (supervisor).'}), 403
+    if x.status != 'open':
+        return jsonify({'success': False, 'error': 'This excavation is closed.'}), 409
+    data = _in_body()
+    ans = data.get('answers') or {}
+    answers = {k: ans.get(k) for k, _ in CN_CHECK_ITEMS}
+    if any(v not in ('yes', 'no') for v in answers.values()):
+        return jsonify({'success': False, 'error': 'Answer every item yes or no.'}), 400
+    o2 = lel = None
+    try:
+        o2 = float(data['o2']) if data.get('o2') not in (None, '') else None
+        lel = float(data['lel']) if data.get('lel') not in (None, '') else None
+    except (TypeError, ValueError):
+        return jsonify({'success': False, 'error': 'Gas readings must be numbers.'}), 400
+    if x.atmosphere_risk and x.depth_m > 1.2 and o2 is None:
+        return jsonify({'success': False, 'code': 'GAS_TEST', 'error': 'This excavation needs an air test before entry: record the oxygen reading.'}), 400
+    failed = [k for k, v in answers.items() if v == 'no']
+    gas_bad = (o2 is not None and o2 < 19.5) or (lel is not None and lel > 20)   # 1926.651(g)(1)(iii): over 20 % LEL
+    note = _rc_text(data.get('note'), 1000)
+    if (failed or gas_bad) and len(note) < 5:
+        return jsonify({'success': False, 'error': 'Something failed: say what was found and what was done.'}), 400
+    c = CnExcavationCheck(company_id=x.company_id, excavation_id=x.id, checked_by=user.id, answers=json.dumps(answers), o2=o2, lel=lel,
+                          result='fail' if (failed or gas_bad) else 'pass', note=note or None)
+    db.session.add(c)
+    db.session.commit()
+    if c.result == 'fail':
+        _in_notify([(u.id, getattr(u, 'email', None)) for u in _rc_staff_users(x.company_id, exclude=user.id)],
+                   f'Excavation {x.ref} failed its check: no entry'[:200], note[:400], '/hse-management/industry/construction?tab=excavations', 'critical')
+    return jsonify({'success': True, 'data': _cn_exc_dict(x, c, _in_names([user.id]), now)}), 201
+
+
+def _lab_watch_loop():
+    time.sleep(600)
+    while True:
+        try:
+            with app.app_context():
+                _lab_reminders()
+        except Exception as e:
+            logger.error(f'lab watcher: {e}')
+        finally:
+            try:
+                with app.app_context():
+                    db.session.remove()
+            except Exception:
+                pass
+        time.sleep(900)
+
+
+if os.environ.get('READY_CHECK_WATCHER', '1') == '1':
+    threading.Thread(target=_lab_watch_loop, daemon=True, name='lab-watcher').start()
 # =====================================================================================================
 # AUTO MIGRATIONS (2026-11-23)
 # Railway's Data tab appends LIMIT to every query, so CREATE/ALTER statements fail there. Instead the
@@ -180237,7 +181126,7 @@ def cert_sig_one(role):
 #   - a failing statement is logged and the file is retried on the next start
 # Set AUTO_MIGRATE=0 on Railway to switch this off.
 # =====================================================================================================
-AUTO_MIGRATIONS = ('DEPLOY_2026-11-23_FULL.sql', '2026-11-24_company_quotes.sql', '2026-11-25_ready_checks.sql', '2026-11-26_muster_contractors.sql', '2026-11-27_document_control_plus.sql', '2026-11-27_inspections.sql', '2026-11-27_chemical_safety.sql', '2026-11-27_chemical_waste.sql', '2026-11-27_equipment.sql', '2026-11-27_incident_outcomes.sql', '2026-11-27_oil_gas.sql', '2026-11-27_vision_reports.sql', '2026-11-27_mining.sql', '2026-11-27_mfg_wh.sql', '2026-11-27_og_part2.sql', '2026-11-27_mining_part2.sql', '2026-11-27_chemical_part3.sql', '2026-11-28_capa.sql')
+AUTO_MIGRATIONS = ('DEPLOY_2026-11-23_FULL.sql', '2026-11-24_company_quotes.sql', '2026-11-25_ready_checks.sql', '2026-11-26_muster_contractors.sql', '2026-11-27_document_control_plus.sql', '2026-11-27_inspections.sql', '2026-11-27_chemical_safety.sql', '2026-11-27_chemical_waste.sql', '2026-11-27_equipment.sql', '2026-11-27_incident_outcomes.sql', '2026-11-27_oil_gas.sql', '2026-11-27_vision_reports.sql', '2026-11-27_mining.sql', '2026-11-27_mfg_wh.sql', '2026-11-27_og_part2.sql', '2026-11-27_mining_part2.sql', '2026-11-27_chemical_part3.sql', '2026-11-28_capa.sql', '2026-11-28_lab.sql', '2026-11-28_construction.sql')
 _MIGRATION_LOCK_KEY = 74230115
 
 
