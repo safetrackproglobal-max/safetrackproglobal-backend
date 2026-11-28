@@ -66058,53 +66058,20 @@ def health_yolov_check():
 
 @app.route('/api/camera/system/health', methods=['GET'])
 def system_yolov_health():
+    """Detector status only. Camera counts and server load are not measured here, so none are reported
+    (the old reply carried fixed numbers: "4 of 4 cameras online", CPU 32%, 240 h uptime)."""
     try:
-        # ✅ FIX: Removed detect_available_cameras() to prevent freezing
-        # We return a static count of the virtual cameras the backend expects.
-        available_cameras_count = 4 
-        online_cameras = 4
-        
-        # Get detector info (Fast, memory-resident)
         detector = get_safety_detector()
         detector_status = 'available' if detector and detector.model else 'unavailable'
-        
-        return jsonify({
-            "success": True,
-            "health": {
-                "overall_status": "healthy",
-                "ai_model_status": detector_status,
-                "cameras_online": online_cameras,
-                "cameras_total": available_cameras_count,
-                "yolov8_detector": detector_status,
-                "confidence_threshold": detector.confidence_threshold if detector else None,
-                "color_system": True,
-                "storage_usage_percent": 45,
-                "cpu_usage_percent": 32,
-                "memory_usage_percent": 58,
-                "network_usage": "stable",
-                "last_maintenance": (datetime.now() - timedelta(days=1)).isoformat(),
-                "uptime_hours": 240,
-                "checked_at": datetime.now().isoformat()
-            }
-        })
+        return jsonify({'success': True, 'health': {
+            'overall_status': 'healthy' if detector_status == 'available' else 'degraded',
+            'ai_model_status': detector_status, 'yolov8_detector': detector_status,
+            'confidence_threshold': detector.confidence_threshold if detector else None,
+            'checked_at': datetime.now().isoformat()}})
     except Exception as e:
         logger.error(f"System health error: {str(e)}")
-        # Even on error, return a valid response so the frontend doesn't hang
-        return jsonify({
-            "success": True,
-            "health": {
-                "overall_status": "degraded",
-                "cameras_online": 0,
-                "cameras_total": 0,
-                "storage_usage_percent": 0,
-                "cpu_usage_percent": 0,
-                "memory_usage_percent": 0,
-                "network_usage": "unknown",
-                "last_maintenance": (datetime.now() - timedelta(days=1)).isoformat(),
-                "uptime_hours": 0,
-                "checked_at": datetime.now().isoformat()
-            }
-        }), 200
+        return jsonify({'success': True, 'health': {'overall_status': 'degraded', 'ai_model_status': 'unavailable',
+                                                    'checked_at': datetime.now().isoformat()}}), 200
 
 @app.route('/api/camera/status', methods=['GET'])
 @jwt_required  
@@ -83177,61 +83144,25 @@ def add_chemical_to_inventory():
 @app.route('/api/chemical/compliance/status', methods=['GET'])
 @jwt_required
 def get_chemical_compliance_status():
-    try:
-        # 4. Real compliance calculation based on inventory risks
-        if request.user.company_id:
-            critical_count = Chemical.query.filter_by(company_id=request.user.company_id, risk_level='Critical').count()
-        else:
-            critical_count = Chemical.query.filter_by(user_id=request.user.id, risk_level='Critical').count()
-            
-        osha_score = max(0, 100 - (critical_count * 10))
-        
-        return jsonify({
-            "success": True,
-            "data": {
-                "osha": {"score": osha_score, "status": "Compliant" if osha_score > 80 else "Needs Improvement", "lastAudit": datetime.utcnow().strftime('%Y-%m-%d')},
-                "epa": {"score": 92, "status": "Compliant", "lastAudit": datetime.utcnow().strftime('%Y-%m-%d')},
-                "nfpa": {"score": 95, "status": "Compliant", "lastAudit": datetime.utcnow().strftime('%Y-%m-%d')},
-                "reach": {"score": 88, "status": "Partially Compliant", "lastAudit": datetime.utcnow().strftime('%Y-%m-%d')}
-            }
-        }), 200
-    except Exception as e:
-        logger.error(f"Chemical compliance error: {str(e)}")
-        return jsonify({"success": False, "error": "Failed to load compliance"}), 500
+    """The old chemical page (no longer routed) showed fixed scores here; the real data is in HSE > Chemical."""
+    return jsonify({'success': False, 'code': 'MODULE_RETIRED',
+                    'error': 'Chemical safety moved to HSE > Chemical (register, compatibility, major-hazard thresholds).'}), 410
 
 
 @app.route('/api/chemical/system/health', methods=['GET'])
 @jwt_required
 def get_chemical_system_health():
-    # This is just a system status ping
-    return jsonify({
-        "success": True, 
-        "health": {
-            "overall_status": "healthy", 
-            "ai_model_status": "available", 
-            "cpu_usage_percent": 45,
-            "memory_usage_percent": 60
-        }
-    }), 200
+    """The old chemical page (no longer routed) showed fixed scores here; the real data is in HSE > Chemical."""
+    return jsonify({'success': False, 'code': 'MODULE_RETIRED',
+                    'error': 'Chemical safety moved to HSE > Chemical (register, compatibility, major-hazard thresholds).'}), 410
 
 
 @app.route('/api/chemical/performance/metrics', methods=['GET'])
 @jwt_required
 def get_chemical_performance_metrics():
-    # This feeds the Safety Performance Indicators (SPIs) panel
-    return jsonify({
-        "success": True, 
-        "data": {
-            "spis": [
-                {"name": 'Process Safety Incidents', "current": 0.08, "target": 0.10, "trend": 'improving', "unit": 'per 100k hours'},
-                {"name": 'Chemical Releases', "current": 0.12, "target": 0.15, "trend": 'stable', "unit": 'per year'}
-            ], 
-            "spas": [
-                {"name": 'PSM Training Completion', "value": 95, "target": 90, "status": 'exceeded'},
-                {"name": 'Safety System Tests', "value": 88, "target": 85, "status": 'met'}
-            ]
-        }
-    }), 200
+    """The old chemical page (no longer routed) showed fixed scores here; the real data is in HSE > Chemical."""
+    return jsonify({'success': False, 'code': 'MODULE_RETIRED',
+                    'error': 'Chemical safety moved to HSE > Chemical (register, compatibility, major-hazard thresholds).'}), 410
 
 
 @app.route('/api/chemical/documents', methods=['GET'])
