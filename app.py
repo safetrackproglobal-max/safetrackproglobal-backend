@@ -179008,6 +179008,1086 @@ def cs_spills(sid=None):
     return jsonify({'success': True, 'data': {'id': s.id, 'status': s.status}}), 200
 
 
+# ============================================================================
+# CAPA + AUDIT READY (2026-11-28)
+#   Action tracker:  every open action in the platform in one list (CAPA records, inspection actions, dropped
+#                    objects, chemical spills, bypasses past their end, failed critical-control checks, rack damage)
+#   CAPA cycle:      problem -> containment -> 5 whys / root cause -> corrective + preventive action -> done with
+#                    evidence -> effectiveness check after N days by a different person -> closed, or reopened
+#   Repeat problems: the same failure coming back (same checklist item, same incident type at the same place,
+#                    dropped objects / spills in the same area, the same failed critical control) without an open CAPA,
+#                    and problems that came back after a CAPA was closed as effective
+#   Audit ready:     choose modules and a period -> one PDF audit pack (cover, readiness gaps, each module) or a ZIP of CSVs
+#   Built on corrective_actions (models.CorrectiveAction); the CAPA-only fields live in capa_details.
+# ============================================================================
+import csv as _capa_csv
+import zipfile as _capa_zip
+# models already imported above: CorrectiveAction, WorkPermit, Incident, SafetyTraining
+_CapaCA, _CapaPermit, _CapaIncident, _CapaTraining = _TbtCAPA, _TbtPermit, _TbtIncident, _OvTraining
+
+CAPA_CHECK_DAYS = 30
+CAPA_ROOT_CATS = ('people', 'method', 'equipment', 'material', 'environment', 'management', 'design')
+CAPA_OPEN = ('open', 'pending', 'in_progress', 'reopened')
+CAPA_PRIORITIES = ('critical', 'high', 'medium', 'low')
+CAPA_RECUR_DAYS = 90
+
+
+class CapaDetail(db.Model):
+    __tablename__ = 'capa_details'
+    __table_args__ = {'extend_existing': True}
+    capa_id = db.Column(db.Integer, db.ForeignKey('corrective_actions.id', ondelete='CASCADE'), primary_key=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id', ondelete='CASCADE'), nullable=False, index=True)
+    source_key = db.Column(db.String(160), index=True)                    # repeat-problem key, e.g. insp:12:i3
+    problem = db.Column(db.Text)
+    containment = db.Column(db.Text)
+    why_chain = db.Column(db.Text)                                         # JSON [str]
+    root_cause = db.Column(db.Text)
+    root_cause_category = db.Column(db.String(20))
+    preventive_action = db.Column(db.Text)
+    check_criteria = db.Column(db.Text)                                    # how we will know it worked
+    check_after_days = db.Column(db.Integer, nullable=False, default=CAPA_CHECK_DAYS)
+    done_note = db.Column(db.Text)
+    done_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    done_at = db.Column(db.DateTime)
+    check_due = db.Column(db.Date)
+    check_result = db.Column(db.String(16))                                # effective | not_effective
+    check_note = db.Column(db.Text)
+    checked_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    checked_at = db.Column(db.DateTime)
+    cycles = db.Column(db.Integer, nullable=False, default=1)
+    history = db.Column(db.Text)                                           # JSON [{at, by, what}]
+    notified_on = db.Column(db.Date)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+
+def _capa_long(v, limit):
+    """Multi-line text: strip tags, keep line breaks."""
+    s = re.sub(r'<[^>]*>', '', str(v if v is not None else ''))
+    s = '\n'.join(re.sub(r'[ \t]+', ' ', ln).strip() for ln in s.replace('\r', '').split('\n'))
+    return re.sub(r'\n{3,}', '\n\n', s).strip()[:limit]
+
+
+def _capa_d(v):
+    if not v:
+        return None
+    return v.date().isoformat() if isinstance(v, datetime) else v.isoformat()
+
+
+def _capa_detail(ca, create=True):
+    d = db.session.get(CapaDetail, ca.id)
+    if d is None and create:
+        d = CapaDetail(capa_id=ca.id, company_id=ca.company_id, problem=ca.description, history='[]')
+        db.session.add(d)
+        db.session.flush()
+    return d
+
+
+def _capa_log(d, by, what):
+    h = _tbt_json(d.history, [])
+    h.append({'at': datetime.utcnow().isoformat(timespec='seconds'), 'by': by, 'what': what[:300]})
+    d.history = json.dumps(h[-100:])
+
+
+def _capa_get(user, cid_):
+    ca = db.session.get(_CapaCA, cid_)
+    if not ca or ca.company_id != user.company_id:
+        return None
+    if ca.source_type == 'workplace_voice' and not _rc_staff(user) and ca.assigned_to != user.id:
+        return None                                                        # worker reports stay with the HSE team
+    return ca
+
+
+def _capa_link(ca):
+    st, sid = ca.source_type or '', ca.source_id
+    return {'incident': f'/investigation-workspace/{sid}', 'workplace_voice': f'/workplace-voice?report={sid}',
+            'inspection_action': '/inspections?tab=actions'}.get(st, f'/capa?open={ca.id}')
+
+
+CAPA_SOURCE_NAMES = {'incident': 'Incident', 'workplace_voice': 'Worker report', 'inspection_action': 'Inspection',
+                     'inspection_repeat': 'Repeat inspection failure', 'incident_repeat': 'Repeat incidents', 'drops': 'Dropped objects',
+                     'spill': 'Chemical spill', 'bypass': 'Bypassed device', 'verification': 'Critical control check',
+                     'rack': 'Racking damage', 'audit': 'Audit finding', 'management_review': 'Management review',
+                     'observation': 'Observation', 'complaint': 'Complaint', 'other': 'Other'}
+
+
+def _capa_state(ca, d, today):
+    if ca.status == 'verified':
+        return 'closed'
+    if ca.status == 'cancelled':
+        return 'cancelled'
+    if ca.status == 'completed':
+        return 'check_due' if d and d.check_due and d.check_due <= today else 'awaiting_check'
+    due = ca.due_date.date() if isinstance(ca.due_date, datetime) else ca.due_date
+    return 'overdue' if due and due < today else 'open'
+
+
+def _capa_dict(ca, d, names, today, full=False):
+    due = _capa_d(ca.due_date)
+    out = {'id': ca.id, 'number': ca.action_number, 'title': ca.title, 'priority': ca.priority or 'medium',
+           'type': ca.action_type or 'corrective', 'status': ca.status, 'state': _capa_state(ca, d, today),
+           'source_type': ca.source_type, 'source': CAPA_SOURCE_NAMES.get(ca.source_type or '', (ca.source_type or 'Other').replace('_', ' ').capitalize()),
+           'source_id': ca.source_id, 'link': _capa_link(ca), 'owner_id': ca.assigned_to, 'owner': names.get(ca.assigned_to),
+           'due_date': due, 'created_at': _in_iso(ca.created_at), 'cycles': d.cycles if d else 1,
+           'has_root_cause': bool(d and d.root_cause), 'check_due': _capa_d(d.check_due) if d else None}
+    if full:
+        out.update({'description': ca.description, 'problem': d.problem if d else ca.description, 'containment': d.containment if d else None,
+                    'why_chain': _tbt_json(d.why_chain, []) if d else [], 'root_cause': d.root_cause if d else None,
+                    'root_cause_category': d.root_cause_category if d else None, 'preventive_action': d.preventive_action if d else None,
+                    'check_criteria': d.check_criteria if d else None, 'check_after_days': d.check_after_days if d else CAPA_CHECK_DAYS,
+                    'done_note': d.done_note if d else None, 'done_by': names.get(d.done_by) if d else None, 'done_at': _in_iso(d.done_at) if d else None,
+                    'check_result': d.check_result if d else None, 'check_note': d.check_note if d else None,
+                    'checked_by': names.get(d.checked_by) if d else None, 'checked_at': _in_iso(d.checked_at) if d else None,
+                    'history': [{**x, 'by': names.get(x.get('by'), x.get('by'))} for x in (_tbt_json(d.history, []) if d else [])],
+                    'source_key': d.source_key if d else None, 'created_by': names.get(ca.created_by)})
+    return out
+
+
+def _capa_names_for(rows, details):
+    ids = []
+    for ca in rows:
+        ids += [ca.assigned_to, ca.created_by]
+    for d in details.values():
+        ids += [d.done_by, d.checked_by] + [x.get('by') for x in _tbt_json(d.history, []) if isinstance(x.get('by'), int)]
+    return _in_names(ids)
+
+
+def _capa_visible_q(user):
+    q = _CapaCA.query.filter(_CapaCA.company_id == user.company_id)
+    if not _rc_staff(user):
+        q = q.filter(or_(_CapaCA.source_type.is_(None), _CapaCA.source_type != 'workplace_voice', _CapaCA.assigned_to == user.id))
+    return q
+
+
+# ---------------------------------------------------------------- one action tracker
+def _capa_tracker_items(user, today):
+    """Every open action with an owner or a due date, from every module, newest problems first."""
+    cid = user.company_id
+    staff = _rc_staff(user)
+    items = []
+    cas = _capa_visible_q(user).filter(_CapaCA.status.notin_(('verified', 'cancelled'))).limit(3000).all()
+    dets = {d.capa_id: d for d in CapaDetail.query.filter(CapaDetail.capa_id.in_([c.id for c in cas] or [0])).all()}
+    ia = (InspectionAction.query.filter(InspectionAction.company_id == cid, InspectionAction.status != 'verified').limit(3000).all())
+    names = _in_names([c.assigned_to for c in cas] + [a.assignee_id for a in ia])
+    for ca in cas:
+        x = _capa_dict(ca, dets.get(ca.id), names, today)
+        items.append({'key': f'capa:{ca.id}', 'module': 'CAPA', 'kind': 'capa', 'id': ca.id, 'title': f'{ca.action_number}: {ca.title}',
+                      'owner': x['owner'], 'owner_id': ca.assigned_to, 'due': x['due_date'], 'priority': x['priority'],
+                      'state': x['state'], 'link': f'/capa?open={ca.id}', 'source': x['source'], 'can_raise': False})
+    raised = {(d.source_key or '') for d in CapaDetail.query.filter(CapaDetail.company_id == cid, CapaDetail.source_key.isnot(None)).all()}
+    for a in ia:
+        due = _capa_d(a.due_date)
+        state = 'awaiting_check' if a.status == 'done' else ('overdue' if a.due_date and a.due_date < today else 'open')
+        items.append({'key': f'inspection_action:{a.id}', 'module': 'Inspections', 'kind': 'inspection_action', 'id': a.id, 'title': a.title,
+                      'owner': names.get(a.assignee_id), 'owner_id': a.assignee_id, 'due': due, 'priority': a.priority, 'state': state,
+                      'link': '/inspections?tab=actions', 'source': 'Inspection', 'can_raise': f'inspection_action:{a.id}' not in raised})
+    for f in OgDropsFinding.query.filter(OgDropsFinding.company_id == cid, OgDropsFinding.status == 'open').limit(1000).all():
+        items.append({'key': f'drops:{f.id}', 'module': 'Oil & Gas', 'kind': 'drops', 'id': f.id, 'title': f'Dropped-object risk: {f.item} ({f.area})',
+                      'owner': None, 'owner_id': None, 'due': None, 'priority': 'critical' if f.consequence == 'fatal' else 'high' if f.consequence == 'serious' else 'medium',
+                      'state': 'open', 'link': '/hse-management/industry/oil_gas?tab=drops', 'source': 'Dropped objects', 'can_raise': f'drops:{f.id}' not in raised})
+    for b in OgBypass.query.filter(OgBypass.company_id == cid, OgBypass.status == 'active', OgBypass.planned_end < datetime.utcnow()).limit(500).all():
+        items.append({'key': f'bypass:{b.id}', 'module': 'Oil & Gas', 'kind': 'bypass', 'id': b.id, 'title': f'Bypass past its planned end: {b.device_tag}',
+                      'owner': None, 'owner_id': None, 'due': _capa_d(b.planned_end), 'priority': 'high', 'state': 'overdue',
+                      'link': '/hse-management/industry/oil_gas?tab=bypass', 'source': 'Bypassed device', 'can_raise': f'bypass:{b.id}' not in raised})
+    for s in ChemSpill.query.filter(ChemSpill.company_id == cid, ChemSpill.status == 'open').limit(500).all():
+        items.append({'key': f'spill:{s.id}', 'module': 'Chemical', 'kind': 'spill', 'id': s.id, 'title': f'Spill not closed: {s.chemical} at {s.location}',
+                      'owner': None, 'owner_id': None, 'due': None, 'priority': 'high' if (s.reached_drain or s.injuries) else 'medium', 'state': 'open',
+                      'link': '/hse-management/industry/chemical?tab=spill', 'source': 'Chemical spill', 'can_raise': f'spill:{s.id}' not in raised})
+    for v in MnVerification.query.filter(MnVerification.company_id == cid, MnVerification.result == 'failed', MnVerification.action_status == 'open').limit(500).all():
+        items.append({'key': f'verification:{v.id}', 'module': 'Mining', 'kind': 'verification', 'id': v.id, 'title': f'Failed critical-control check at {v.area}',
+                      'owner': None, 'owner_id': None, 'due': None, 'priority': 'critical', 'state': 'open',
+                      'link': '/hse-management/industry/mining?tab=controls', 'source': 'Critical control check', 'can_raise': f'verification:{v.id}' not in raised})
+    for r in WhRackReport.query.filter(WhRackReport.company_id == cid, WhRackReport.status.notin_(('repaired', 'closed')), WhRackReport.level != 'green').limit(500).all():
+        items.append({'key': f'rack:{r.id}', 'module': 'Manufacturing & warehouse', 'kind': 'rack', 'id': r.id, 'title': f'Racking damage: {r.location} ({r.component})',
+                      'owner': None, 'owner_id': None, 'due': _capa_d(r.due_on), 'priority': 'critical' if r.level == 'red' else 'high' if r.level == 'amber' else 'medium',
+                      'state': 'overdue' if r.due_on and r.due_on < today else 'open', 'link': '/hse-management/industry/general?tab=racking',
+                      'source': 'Racking damage', 'can_raise': f'rack:{r.id}' not in raised})
+    if not staff:
+        items = [i for i in items if i['owner_id'] == user.id or i['kind'] in ('drops', 'spill', 'bypass', 'verification', 'rack', 'inspection_action')]
+    rank = {'overdue': 0, 'check_due': 1, 'open': 2, 'awaiting_check': 3}
+    prank = {'critical': 0, 'high': 1, 'medium': 2, 'low': 3}
+    items.sort(key=lambda i: (rank.get(i['state'], 4), prank.get(i['priority'], 2), i['due'] or '9999'))
+    return items
+
+
+@app.route('/api/capa/tracker', methods=['GET'])
+@jwt_required
+def capa_tracker_route():
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    today = datetime.utcnow().date()
+    items = _capa_tracker_items(user, today)
+    if request.args.get('mine') == '1':
+        items = [i for i in items if i['owner_id'] == user.id]
+    by_owner, by_module = {}, {}
+    for i in items:
+        by_module[i['module']] = by_module.get(i['module'], 0) + 1
+        if i['owner']:
+            o = by_owner.setdefault(i['owner'], {'owner': i['owner'], 'open': 0, 'overdue': 0})
+            o['open'] += 1
+            o['overdue'] += i['state'] == 'overdue'
+    week = (today + timedelta(days=7)).isoformat()
+    return jsonify({'success': True, 'can_manage': _rc_staff(user), 'me': user.id, 'data': items[:2000],
+                    'summary': {'open': len(items), 'overdue': sum(i['state'] == 'overdue' for i in items),
+                                'due_week': sum(1 for i in items if i['due'] and today.isoformat() <= i['due'] <= week and i['state'] != 'overdue'),
+                                'checks_due': sum(i['state'] == 'check_due' for i in items), 'no_owner': sum(1 for i in items if not i['owner_id']),
+                                'by_module': by_module, 'by_owner': sorted(by_owner.values(), key=lambda o: (-o['overdue'], -o['open']))[:15]}}), 200
+
+
+# ---------------------------------------------------------------- CAPA records
+def _capa_new(user, title, owner_id, due, priority, source_type, source_id=None, problem=None, source_key=None, action_type='corrective'):
+    ca = _CapaCA(action_number=f'CAPA-{datetime.utcnow():%y%m%d}-{secrets.token_hex(3).upper()}', title=title[:255],
+                 description=(problem or '')[:4000] or None, source_type=source_type, source_id=source_id, assigned_to=owner_id,
+                 due_date=datetime.combine(due, datetime.min.time()), status='open', priority=priority, action_type=action_type,
+                 created_by=user.id, created_by_name=getattr(user, 'name', None), company_id=user.company_id)
+    db.session.add(ca)
+    db.session.flush()
+    d = CapaDetail(capa_id=ca.id, company_id=user.company_id, problem=problem, source_key=source_key, history='[]')
+    db.session.add(d)
+    _capa_log(d, user.id, 'Raised')
+    return ca, d
+
+
+def _capa_parse_new(user, data):
+    title = _rc_text(data.get('title'), 255)
+    if len(title) < 5:
+        raise ValueError('Give the action a short title (what needs fixing).')
+    owner = _in_user_in_company(user.company_id, data.get('owner_id'))
+    if not owner:
+        raise ValueError('Choose who owns this action.')
+    try:
+        due = datetime.strptime(str(data.get('due_date'))[:10], '%Y-%m-%d').date()
+    except (TypeError, ValueError):
+        raise ValueError('Give a due date.')
+    priority = data.get('priority') if data.get('priority') in CAPA_PRIORITIES else 'medium'
+    return title, owner, due, priority
+
+
+CAPA_RAISE_SOURCES = ('inspection_action', 'drops', 'spill', 'bypass', 'verification', 'rack', 'incident', 'inspection_repeat',
+                      'incident_repeat', 'drops_repeat', 'spill_repeat', 'verification_repeat')
+
+
+def _capa_source_text(user, kind, sid, key):
+    """Problem text and link id for a CAPA raised from another module; None if it is not this company's."""
+    cid = user.company_id
+    if kind == 'inspection_action':
+        a = db.session.get(InspectionAction, sid)
+        if not a or a.company_id != cid:
+            return None
+        ins = db.session.get(Inspection, a.inspection_id)
+        return f'Inspection "{ins.title if ins else ""}"{" at " + ins.site if ins and ins.site else ""}: {a.title}. {a.detail or ""}'.strip(), a.id
+    if kind == 'drops':
+        f = db.session.get(OgDropsFinding, sid)
+        return (f'Dropped-object risk at {f.area}: {f.item} ({f.issue}); {f.mass_kg} kg from {f.height_m} m.', f.id) if f and f.company_id == cid else None
+    if kind == 'spill':
+        s = db.session.get(ChemSpill, sid)
+        return (f'Spill of {s.chemical} at {s.location} ({s.size}). {s.description or ""}'.strip(), s.id) if s and s.company_id == cid else None
+    if kind == 'bypass':
+        b = db.session.get(OgBypass, sid)
+        return (f'Safety device {b.device_tag} bypassed past its planned end. Reason: {b.reason}', b.id) if b and b.company_id == cid else None
+    if kind == 'verification':
+        v = db.session.get(MnVerification, sid)
+        if not v or v.company_id != cid:
+            return None
+        risk = db.session.get(MnRisk, v.risk_id)
+        return f'Critical control check failed at {v.area} ({risk.name if risk else "fatal risk"}). Immediate action: {v.immediate_action or "none recorded"}', v.id
+    if kind == 'rack':
+        r = db.session.get(WhRackReport, sid)
+        return (f'Racking damage at {r.location}: {r.component}, {r.level}. {r.description or ""}'.strip(), r.id) if r and r.company_id == cid else None
+    if kind == 'incident':
+        i = db.session.get(_CapaIncident, sid)
+        return (f'Incident {i.incident_number or i.id}: {i.title}. {i.description or ""}'[:3000], i.id) if i and i.company_id == cid else None
+    if kind.endswith('_repeat'):
+        g = next((x for x in _capa_recurring(user)['groups'] if x['key'] == key), None)
+        return (f'{g["title"]}: {g["count"]} times in {CAPA_RECUR_DAYS} days. ' + '; '.join(g['examples'][:5]), None) if g else None
+    return None
+
+
+@app.route('/api/capa', methods=['GET', 'POST'])
+@jwt_required
+def capa_list_route():
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    today = datetime.utcnow().date()
+    if request.method == 'GET':
+        q = _capa_visible_q(user)
+        st = request.args.get('state')
+        if st == 'closed':
+            q = q.filter(_CapaCA.status == 'verified')
+        elif st != 'all':
+            q = q.filter(_CapaCA.status.notin_(('verified', 'cancelled')))
+        rows = q.order_by(_CapaCA.created_at.desc()).limit(1000).all()
+        dets = {d.capa_id: d for d in CapaDetail.query.filter(CapaDetail.capa_id.in_([c.id for c in rows] or [0])).all()}
+        names = _capa_names_for(rows, dets)
+        closed = _CapaCA.query.filter(_CapaCA.company_id == user.company_id, _CapaCA.status == 'verified').count()
+        cdets = CapaDetail.query.filter(CapaDetail.company_id == user.company_id, CapaDetail.check_result.isnot(None)).all()
+        eff = sum(1 for d in cdets if d.check_result == 'effective')
+        return jsonify({'success': True, 'can_manage': _rc_staff(user), 'me': user.id,
+                        'data': [_capa_dict(c, dets.get(c.id), names, today) for c in rows],
+                        'stats': {'closed': closed, 'checked': len(cdets), 'effective': eff,
+                                  'effective_pct': round(100 * eff / len(cdets)) if cdets else None,
+                                  'reopened': sum(1 for d in cdets if (d.cycles or 1) > 1)},
+                        'sources': CAPA_SOURCE_NAMES, 'root_categories': CAPA_ROOT_CATS}), 200
+    if not _rc_staff(user):
+        return jsonify({'success': False, 'error': 'Only supervisors and admins raise CAPAs. Report the problem, or ask your supervisor.'}), 403
+    data = _in_body()
+    try:
+        title, owner, due, priority = _capa_parse_new(user, data)
+    except ValueError as e:
+        return jsonify({'success': False, 'error': str(e)}), 400
+    kind = data.get('source_type') if data.get('source_type') in CAPA_RAISE_SOURCES else None
+    sid = int(data['source_id']) if str(data.get('source_id') or '').isdigit() else None
+    key = _rc_text(data.get('source_key'), 160) or None
+    problem = _capa_long(data.get('problem'), 4000)
+    if kind:
+        found = _capa_source_text(user, kind, sid, key)
+        if not found:
+            return jsonify({'success': False, 'error': 'The record this CAPA comes from was not found.'}), 404
+        problem = problem or found[0]
+        sid = found[1]
+        key = key if kind.endswith('_repeat') else f'{kind}:{sid}'
+        if CapaDetail.query.join(_CapaCA, _CapaCA.id == CapaDetail.capa_id).filter(
+                CapaDetail.company_id == user.company_id, CapaDetail.source_key == key, _CapaCA.status.notin_(('verified', 'cancelled'))).first():
+            return jsonify({'success': False, 'code': 'ALREADY_RAISED', 'error': 'An open CAPA already covers this. Open it from the CAPA list.'}), 409
+    else:
+        kind = data.get('source_type') if data.get('source_type') in ('audit', 'management_review', 'observation', 'complaint', 'other') else 'other'
+    if len(problem) < 10:
+        return jsonify({'success': False, 'error': 'Describe the problem: what happened or was found, where and when.'}), 400
+    ca, d = _capa_new(user, title, owner, due, priority, kind, sid, problem, key,
+                      'preventive' if data.get('action_type') == 'preventive' else 'corrective')
+    d.containment = _capa_long(data.get('containment'), 2000) or None
+    db.session.commit()
+    if owner != user.id:
+        u = db.session.get(_TbtUser, owner)
+        _in_notify([(owner, getattr(u, 'email', None))], f'CAPA assigned: {title}'[:200], f'Due {due.isoformat()}. Find the root cause before fixing.',
+                   f'/capa?open={ca.id}', 'high' if priority in ('critical', 'high') else 'medium', email=priority == 'critical')
+    return jsonify({'success': True, 'data': _capa_dict(ca, d, _in_names([owner, user.id]), datetime.utcnow().date(), full=True)}), 201
+
+
+@app.route('/api/capa/<int:cid_>', methods=['GET', 'PUT'])
+@jwt_required
+def capa_one_route(cid_):
+    """PUT action: plan {problem, containment, why_chain, root_cause, root_cause_category, preventive_action, check_criteria,
+    check_after_days, owner_id, due_date, priority} | start | done {note} | check {result, note} | cancel {note}."""
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    ca = _capa_get(user, cid_)
+    if not ca:
+        return jsonify({'success': False, 'error': 'CAPA not found.'}), 404
+    today = datetime.utcnow().date()
+    staff = _rc_staff(user)
+    if request.method == 'GET':
+        d = _capa_detail(ca)
+        db.session.commit()
+        return jsonify({'success': True, 'can_manage': staff, 'me': user.id,
+                        'data': _capa_dict(ca, d, _capa_names_for([ca], {ca.id: d}), today, full=True)}), 200
+    data = _in_body()
+    action = data.get('action')
+    d = _capa_detail(ca)
+    owner_or_staff = staff or ca.assigned_to == user.id
+    if ca.status in ('verified', 'cancelled'):
+        return jsonify({'success': False, 'error': 'This CAPA is closed.'}), 409
+    if action == 'plan':
+        if not owner_or_staff:
+            return jsonify({'success': False, 'error': 'Only the owner or a supervisor can change this CAPA.'}), 403
+        if ca.status == 'completed':
+            return jsonify({'success': False, 'error': 'The work is done and waiting for its effectiveness check.'}), 409
+        for k, n in (('problem', 4000), ('containment', 2000), ('root_cause', 3000), ('preventive_action', 3000), ('check_criteria', 1000)):
+            if k in data:
+                setattr(d, k, _capa_long(data.get(k), n) or None)
+        if 'why_chain' in data:
+            chain = [_rc_text(w, 400) for w in (data.get('why_chain') or []) if _rc_text(w, 400)][:7]
+            d.why_chain = json.dumps(chain)
+        if data.get('root_cause_category') in CAPA_ROOT_CATS:
+            d.root_cause_category = data['root_cause_category']
+        if 'check_after_days' in data:
+            try:
+                d.check_after_days = max(0, min(365, int(data['check_after_days'])))
+            except (TypeError, ValueError):
+                return jsonify({'success': False, 'error': 'Days before the effectiveness check must be a number.'}), 400
+        if staff:
+            try:
+                if data.get('owner_id'):
+                    ca.assigned_to = _in_user_in_company(user.company_id, data['owner_id']) or ca.assigned_to
+                if data.get('due_date'):
+                    ca.due_date = datetime.strptime(str(data['due_date'])[:10], '%Y-%m-%d')
+            except ValueError as e:
+                return jsonify({'success': False, 'error': str(e) if 'person' in str(e) else 'Give the due date as a date.'}), 400
+            if data.get('priority') in CAPA_PRIORITIES:
+                ca.priority = data['priority']
+        _capa_log(d, user.id, 'Plan updated' + (f' (root cause: {d.root_cause_category})' if d.root_cause_category else ''))
+    elif action == 'start':
+        if not owner_or_staff:
+            return jsonify({'success': False, 'error': 'Only the owner or a supervisor can start this CAPA.'}), 403
+        ca.status, ca.started_at = 'in_progress', ca.started_at or datetime.utcnow()
+        _capa_log(d, user.id, 'Work started')
+    elif action == 'done':
+        if not owner_or_staff:
+            return jsonify({'success': False, 'error': 'Only the owner or a supervisor can mark this done.'}), 403
+        if ca.status == 'completed':
+            return jsonify({'success': False, 'error': 'Already marked done.'}), 409
+        missing = []
+        if not d.root_cause:
+            missing.append('the root cause')
+        if ca.priority in ('critical', 'high') and len(_tbt_json(d.why_chain, [])) < 3:
+            missing.append('at least 3 "why" steps (high and critical CAPAs)')
+        if not d.preventive_action:
+            missing.append('the preventive action (what stops it happening again)')
+        if not d.check_criteria:
+            missing.append('how the effectiveness will be checked')
+        if missing:
+            return jsonify({'success': False, 'code': 'PLAN_INCOMPLETE', 'error': 'Before marking done, add ' + ', '.join(missing) + '.'}), 409
+        note = _capa_long(data.get('note'), 2000)
+        if len(note) < 10:
+            return jsonify({'success': False, 'error': 'Say what was done and where the evidence is (photo, document, record).'}), 400
+        d.done_note, d.done_by, d.done_at = note, user.id, datetime.utcnow()
+        d.check_due = today + timedelta(days=d.check_after_days if d.check_after_days is not None else CAPA_CHECK_DAYS)
+        ca.status, ca.completion_date, ca.progress_percentage = 'completed', datetime.utcnow(), 100
+        _capa_log(d, user.id, f'Done; effectiveness check due {d.check_due.isoformat()}')
+        _in_notify([(u.id, getattr(u, 'email', None)) for u in _rc_staff_users(ca.company_id, exclude=user.id)],
+                   f'CAPA done, check due {d.check_due.isoformat()}: {ca.title}'[:200], note[:400], f'/capa?open={ca.id}', 'medium')
+    elif action == 'check':
+        if not staff:
+            return jsonify({'success': False, 'error': 'Only a supervisor or admin checks effectiveness.'}), 403
+        if ca.status != 'completed':
+            return jsonify({'success': False, 'error': 'Mark the work done before checking whether it worked.'}), 409
+        if user.id in (d.done_by, ca.assigned_to) and len(_rc_staff_users(ca.company_id, exclude=user.id)) > 0:
+            return jsonify({'success': False, 'code': 'SAME_PERSON', 'error': 'The effectiveness check must be done by someone other than the person who did the work.'}), 409
+        if d.check_due and today < d.check_due and not data.get('early_reason'):
+            return jsonify({'success': False, 'code': 'TOO_EARLY',
+                            'error': f'The check is due on {d.check_due.isoformat()}: give the fix time to prove itself, or say why you are checking early.'}), 409
+        result = data.get('result')
+        note = _capa_long(data.get('note'), 2000)
+        if result not in ('effective', 'not_effective') or len(note) < 10:
+            return jsonify({'success': False, 'error': 'Say whether it worked and what you checked (records, site visit, repeat events).'}), 400
+        if data.get('early_reason'):
+            note = f'{note}\nChecked early: {_rc_text(data.get("early_reason"), 300)}'
+        d.check_result, d.check_note, d.checked_by, d.checked_at = result, note, user.id, datetime.utcnow()
+        ca.verified_by, ca.verification_date, ca.verification_notes = user.id, datetime.utcnow(), note[:4000]
+        if result == 'effective':
+            ca.status, ca.effectiveness = 'verified', 'effective'
+            _capa_log(d, user.id, 'Checked: effective. Closed.')
+        else:
+            prev = f'Cycle {d.cycles}: root cause "{d.root_cause or ""}" did not work. {note}'
+            d.cycles = (d.cycles or 1) + 1
+            d.problem = f'{d.problem or ""}\n\n{prev}'.strip()[:4000]
+            d.root_cause = d.root_cause_category = d.preventive_action = None
+            d.why_chain, d.done_note, d.done_by, d.done_at, d.check_due = '[]', None, None, None, None
+            ca.status, ca.effectiveness, ca.progress_percentage = 'open', 'not_effective', 0
+            ca.due_date = datetime.combine(today + timedelta(days=14), datetime.min.time())
+            _capa_log(d, user.id, f'Checked: NOT effective. Reopened as cycle {d.cycles}: find the real root cause.')
+            u = db.session.get(_TbtUser, ca.assigned_to)
+            _in_notify([(ca.assigned_to, getattr(u, 'email', None))], f'CAPA reopened, the fix did not work: {ca.title}'[:200], note[:400],
+                       f'/capa?open={ca.id}', 'high', email=True)
+    elif action == 'cancel':
+        if not staff:
+            return jsonify({'success': False, 'error': 'Only a supervisor or admin can cancel a CAPA.'}), 403
+        note = _capa_long(data.get('note'), 1000)
+        if len(note) < 10:
+            return jsonify({'success': False, 'error': 'Say why it is cancelled (for the audit trail).'}), 400
+        ca.status, ca.notes = 'cancelled', note
+        _capa_log(d, user.id, f'Cancelled: {note[:200]}')
+    else:
+        return jsonify({'success': False, 'error': 'Unknown action.'}), 400
+    db.session.commit()
+    return jsonify({'success': True, 'data': _capa_dict(ca, d, _capa_names_for([ca], {ca.id: d}), today, full=True)}), 200
+
+
+# ---------------------------------------------------------------- repeat problems
+def _capa_norm(s):
+    return re.sub(r'[^a-z0-9]+', ' ', (s or '').lower()).strip()
+
+
+def _capa_recurring(user):
+    """Problems seen again and again in the last 90 days, and problems that came back after a CAPA was closed as effective."""
+    cid = user.company_id
+    since = datetime.utcnow() - timedelta(days=CAPA_RECUR_DAYS)
+    groups = {}
+
+    def add(key, kind, title, when, example, link):
+        g = groups.setdefault(key, {'key': key, 'kind': kind, 'title': title, 'count': 0, 'last': None, 'examples': [], 'dates': [], 'link': link})
+        g['count'] += 1
+        g['dates'].append(when)
+        if not g['last'] or when > g['last']:
+            g['last'] = when
+        if len(g['examples']) < 6 and example:
+            g['examples'].append(example)
+
+    ins = {i.id: i for i in Inspection.query.filter(Inspection.company_id == cid, Inspection.completed_at >= since).limit(5000).all()}
+    for a in InspectionAction.query.filter(InspectionAction.company_id == cid, InspectionAction.inspection_id.in_(list(ins) or [0])).all():
+        i = ins[a.inspection_id]
+        tkey = f'{i.template_id or i.library_key or _capa_norm(i.title)}:{a.item_id or _capa_norm(a.title)[:40]}'
+        add(f'inspection_repeat:{tkey}'[:160], 'inspection_repeat', f'Checklist item keeps failing: {a.title[:120]}', i.completed_at,
+            f'{i.completed_at:%d %b} {i.site or i.title}', '/inspections?tab=actions')
+    for inc in _CapaIncident.query.filter(_CapaIncident.company_id == cid, _CapaIncident.date_occurred >= since).limit(5000).all():
+        loc = _capa_norm(inc.location)[:40]
+        if not loc:
+            continue
+        typ = _capa_norm(inc.incident_type or 'incident')[:30]
+        add(f'incident_repeat:{typ}:{loc}'[:160], 'incident_repeat', f'Repeat {inc.incident_type or "incident"}s at {inc.location}', inc.date_occurred,
+            f'{inc.date_occurred:%d %b} {inc.title[:60]}', f'/investigation-workspace/{inc.id}')
+    for f in OgDropsFinding.query.filter(OgDropsFinding.company_id == cid, OgDropsFinding.found_at >= since).limit(5000).all():
+        add(f'drops_repeat:{_capa_norm(f.area)[:60]}', 'drops_repeat', f'Dropped-object risks keep being found at {f.area}', f.found_at,
+            f'{f.found_at:%d %b} {f.item}', '/hse-management/industry/oil_gas?tab=drops')
+    for s in ChemSpill.query.filter(ChemSpill.company_id == cid, ChemSpill.reported_at >= since).limit(5000).all():
+        add(f'spill_repeat:{_capa_norm(s.location)[:60]}', 'spill_repeat', f'Repeat chemical spills at {s.location}', s.reported_at,
+            f'{s.reported_at:%d %b} {s.chemical} ({s.size})', '/hse-management/industry/chemical?tab=spill')
+    risks = {r.id: r.name for r in MnRisk.query.filter(MnRisk.company_id == cid).all()}
+    for v in MnVerification.query.filter(MnVerification.company_id == cid, MnVerification.result == 'failed', MnVerification.created_at >= since).limit(5000).all():
+        add(f'verification_repeat:{v.risk_id}:{_capa_norm(v.area)[:50]}', 'verification_repeat',
+            f'Critical control keeps failing: {risks.get(v.risk_id, "fatal risk")} at {v.area}', v.created_at, f'{v.created_at:%d %b}',
+            '/hse-management/industry/mining?tab=controls')
+    need = {'inspection_repeat': 3, 'incident_repeat': 3, 'drops_repeat': 3, 'spill_repeat': 2, 'verification_repeat': 2}
+    dets = CapaDetail.query.filter(CapaDetail.company_id == cid, CapaDetail.source_key.isnot(None)).all()
+    cas = {c.id: c for c in _CapaCA.query.filter(_CapaCA.id.in_([d.capa_id for d in dets] or [0])).all()}
+    by_key = {}
+    for d in dets:
+        by_key.setdefault(d.source_key, []).append(d)
+    out = []
+    for g in groups.values():
+        linked = by_key.get(g['key'], [])
+        open_capa = next((cas[d.capa_id] for d in linked if d.capa_id in cas and cas[d.capa_id].status not in ('verified', 'cancelled')), None)
+        closed_ok = [d for d in linked if d.check_result == 'effective' and d.checked_at]
+        came_back = None
+        if closed_ok:
+            last_close = max(d.checked_at for d in closed_ok)
+            after = [t for t in g['dates'] if t and t > last_close]
+            if after:
+                came_back = {'capa_id': closed_ok[-1].capa_id, 'closed': _in_iso(last_close), 'since': len(after)}
+        if g['count'] < need[g['kind']] and not came_back:
+            continue
+        out.append({'key': g['key'], 'kind': g['kind'], 'title': g['title'], 'count': g['count'], 'last': _in_iso(g['last']),
+                    'examples': g['examples'], 'link': g['link'], 'open_capa': ({'id': open_capa.id, 'number': open_capa.action_number} if open_capa else None),
+                    'came_back': came_back})
+    out.sort(key=lambda g: (not g['came_back'], bool(g['open_capa']), -g['count']))
+    return {'groups': out, 'days': CAPA_RECUR_DAYS}
+
+
+@app.route('/api/capa/recurring', methods=['GET'])
+@jwt_required
+def capa_recurring_route():
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    return jsonify({'success': True, 'can_manage': _rc_staff(user), **_capa_recurring(user),
+                    'note': 'Counted from your own records: inspection actions, incidents (same type and place), dropped-object findings, '
+                            'spills and failed critical-control checks. A repeat means the cause was not removed.'}), 200
+
+
+def _capa_reminders(today=None):
+    """Once a day: overdue CAPAs to the owner (and supervisors when critical/high), effectiveness checks due to supervisors."""
+    today = today or datetime.utcnow().date()
+    n = 0
+    rows = _CapaCA.query.filter(_CapaCA.company_id.isnot(None), _CapaCA.status.notin_(('verified', 'cancelled'))).limit(5000).all()
+    dets = {d.capa_id: d for d in CapaDetail.query.filter(CapaDetail.capa_id.in_([c.id for c in rows] or [0])).all()}
+    for ca in rows:
+        d = dets.get(ca.id)
+        if d is None or (d.notified_on and d.notified_on >= today):
+            continue
+        due = ca.due_date.date() if isinstance(ca.due_date, datetime) else ca.due_date
+        check_due = ca.status == 'completed' and d.check_due and d.check_due <= today
+        overdue = ca.status != 'completed' and due and due < today
+        if not (check_due or overdue):
+            continue
+        if not CapaDetail.query.filter(CapaDetail.capa_id == ca.id, or_(CapaDetail.notified_on.is_(None), CapaDetail.notified_on < today)).update(
+                {'notified_on': today}, synchronize_session=False):
+            continue
+        db.session.commit()
+        n += 1
+        staff = [(u.id, getattr(u, 'email', None)) for u in _rc_staff_users(ca.company_id)]
+        if check_due:
+            _in_notify(staff, f'CAPA effectiveness check due: {ca.title}'[:200], 'Check whether the fix worked before closing it.', f'/capa?open={ca.id}', 'medium')
+        else:
+            u = db.session.get(_TbtUser, ca.assigned_to)
+            targets = [(ca.assigned_to, getattr(u, 'email', None))] + (staff if ca.priority in ('critical', 'high') else [])
+            _in_notify(targets, f'CAPA overdue since {due.isoformat()}: {ca.title}'[:200], f'{ca.action_number}, priority {ca.priority}.',
+                       f'/capa?open={ca.id}', 'high' if ca.priority in ('critical', 'high') else 'medium', email=ca.priority == 'critical')
+    return n
+
+
+def _capa_watch_loop():
+    time.sleep(900)
+    while True:
+        try:
+            with app.app_context():
+                _capa_reminders()
+        except Exception as e:
+            logger.error(f'capa watcher: {e}')
+        finally:
+            try:
+                with app.app_context():
+                    db.session.remove()
+            except Exception:
+                pass
+        time.sleep(3600)
+
+
+if os.environ.get('READY_CHECK_WATCHER', '1') == '1':
+    threading.Thread(target=_capa_watch_loop, daemon=True, name='capa-watcher').start()
+
+
+# ---------------------------------------------------------------- AUDIT READY
+def _ap_dt(v):
+    if not v:
+        return ''
+    if isinstance(v, datetime):
+        return v.strftime('%Y-%m-%d %H:%M')
+    return v.isoformat() if hasattr(v, 'isoformat') else str(v)
+
+
+def _ap_join(v, n=120):
+    if isinstance(v, (list, tuple)):
+        v = ', '.join(str(x) for x in v)
+    return _rc_text(v, n)
+
+
+class _APModule:
+    def __init__(self, key, label, group, model, date_col, cols, snapshot=False, summary=None, staff_only=False, order=None, extra=None):
+        self.key, self.label, self.group, self.model, self.date_col = key, label, group, model, date_col
+        self.cols, self.snapshot, self.summary, self.staff_only, self.order, self.extra = cols, snapshot, summary, staff_only, order, extra
+
+    def query(self, cid, start, end):
+        q = self.model.query.filter(self.model.company_id == cid)
+        if self.extra:
+            q = self.extra(q)
+        col = getattr(self.model, self.date_col) if self.date_col else None
+        if col is not None and not self.snapshot:
+            q = q.filter(col >= start, col < end)
+        if col is not None:
+            q = q.order_by(col.desc())
+        return q
+
+
+def _ap_count(rows, attr, values):
+    return sum(1 for r in rows if getattr(r, attr, None) in values)
+
+
+def _ap_modules():
+    N = '__names__'          # placeholder replaced with the name map at render time
+    return [
+        # core
+        _APModule('incidents', 'Incidents', 'Core safety', _CapaIncident, 'date_occurred',
+                  [('Number', lambda r, n: r.incident_number or r.id), ('Date', lambda r, n: _ap_dt(r.date_occurred)), ('Title', lambda r, n: r.title),
+                   ('Type', lambda r, n: r.incident_type), ('Severity', lambda r, n: r.severity), ('Location', lambda r, n: r.location),
+                   ('Status', lambda r, n: r.status), ('Root cause', lambda r, n: _rc_text(r.root_cause, 140))],
+                  summary=lambda rows: [('Incidents', len(rows)), ('Open', sum(1 for r in rows if (r.status or '').lower() not in ('closed', 'resolved'))),
+                                        ('With a root cause recorded', sum(1 for r in rows if r.root_cause))]),
+        _APModule('capa', 'Corrective and preventive actions (CAPA)', 'Core safety', _CapaCA, 'created_at',
+                  [('Number', lambda r, n: r.action_number), ('Raised', lambda r, n: _ap_dt(r.created_at)), ('Title', lambda r, n: r.title),
+                   ('Source', lambda r, n: CAPA_SOURCE_NAMES.get(r.source_type or '', r.source_type)), ('Priority', lambda r, n: r.priority),
+                   ('Owner', lambda r, n: n.get(r.assigned_to)), ('Due', lambda r, n: _ap_dt(r.due_date)), ('Status', lambda r, n: r.status),
+                   ('Effectiveness', lambda r, n: r.effectiveness)],
+                  summary=lambda rows: [('Raised', len(rows)), ('Closed as effective', _ap_count(rows, 'status', ('verified',))),
+                                        ('Overdue', sum(1 for r in rows if r.status not in ('verified', 'cancelled', 'completed') and r.due_date and r.due_date < datetime.utcnow())),
+                                        ('Found not effective at least once', _ap_count(rows, 'effectiveness', ('not_effective',)))]),
+        _APModule('permits', 'Permits to work', 'Core safety', _CapaPermit, 'created_at',
+                  [('Number', lambda r, n: r.permit_number), ('Type', lambda r, n: (r.permit_type or '').replace('_', ' ')), ('Title', lambda r, n: r.title),
+                   ('Location', lambda r, n: r.location), ('From', lambda r, n: _ap_dt(r.start_at)), ('To', lambda r, n: _ap_dt(r.end_at)),
+                   ('Status', lambda r, n: r.status), ('Closed', lambda r, n: _ap_dt(r.closed_at))],
+                  summary=lambda rows: [('Permits', len(rows)), ('Closed', _ap_count(rows, 'status', ('closed',))),
+                                        ('Active past their end time', sum(1 for r in rows if r.status == 'active' and r.end_at and r.end_at < datetime.utcnow()))]),
+        _APModule('toolbox', 'Toolbox talks', 'Core safety', ToolboxTalk, 'talk_date',
+                  [('Date', lambda r, n: _ap_dt(r.talk_date)), ('Topic', lambda r, n: r.title or r.topic), ('Presenter', lambda r, n: r.presenter),
+                   ('Location', lambda r, n: r.location), ('Attendees', lambda r, n: r.attendee_count), ('Status', lambda r, n: r.status)],
+                  summary=lambda rows: [('Talks', len(rows)), ('Delivered', _ap_count(rows, 'status', ('delivered',))),
+                                        ('People reached', sum(r.attendee_count or 0 for r in rows))]),
+        _APModule('ready_check', 'Ready Check (pre-task checks and stop work)', 'Core safety', ReadyCheck, 'created_at',
+                  [('Date', lambda r, n: _ap_dt(r.created_at)), ('Kind', lambda r, n: r.kind), ('Task', lambda r, n: r.task_name), ('Worker', lambda r, n: r.worker_name),
+                   ('Location', lambda r, n: r.location), ('Controls', lambda r, n: f'{r.controls_ok or 0}/{r.controls_total or 0}'), ('Result', lambda r, n: r.result),
+                   ('Status', lambda r, n: r.status)],
+                  summary=lambda rows: [('Checks', len(rows)), ('Work stopped', _ap_count(rows, 'result', ('stop',)))]),
+        _APModule('inspections', 'Inspections', 'Inspections and equipment', Inspection, 'started_at',
+                  [('Date', lambda r, n: _ap_dt(r.completed_at or r.started_at)), ('Checklist', lambda r, n: r.title), ('Site', lambda r, n: r.site),
+                   ('Inspector', lambda r, n: n.get(r.inspector_id)), ('Score', lambda r, n: f'{round(100 * r.score / r.max_score)}%' if r.max_score else ''),
+                   ('Failed', lambda r, n: f'{r.failed_count or 0} ({r.critical_failed or 0} critical)'), ('Status', lambda r, n: r.status)],
+                  summary=lambda rows: [('Inspections', len(rows)), ('Completed', _ap_count(rows, 'status', ('completed',))),
+                                        ('With critical failures', sum(1 for r in rows if r.critical_failed))]),
+        _APModule('inspection_actions', 'Inspection actions', 'Inspections and equipment', InspectionAction, 'created_at',
+                  [('Raised', lambda r, n: _ap_dt(r.created_at)), ('Action', lambda r, n: r.title), ('Priority', lambda r, n: r.priority),
+                   ('Owner', lambda r, n: n.get(r.assignee_id)), ('Due', lambda r, n: _ap_dt(r.due_date)), ('Status', lambda r, n: r.status),
+                   ('Done note', lambda r, n: _rc_text(r.done_note, 120))],
+                  summary=lambda rows: [('Actions', len(rows)), ('Verified', _ap_count(rows, 'status', ('verified',))),
+                                        ('Overdue', sum(1 for r in rows if r.status == 'open' and r.due_date and r.due_date < datetime.utcnow().date()))]),
+        _APModule('equipment', 'Equipment register (current state)', 'Inspections and equipment', EquipmentItem, 'created_at',
+                  [('Tag', lambda r, n: r.tag_no), ('Item', lambda r, n: r.name), ('Category', lambda r, n: r.category), ('Location', lambda r, n: r.location),
+                   ('Status', lambda r, n: r.status), ('Next inspection', lambda r, n: _ap_dt(r.next_due)), ('Certificate due', lambda r, n: _ap_dt(r.cert_due)),
+                   ('Last result', lambda r, n: r.last_result)], snapshot=True,
+                  summary=lambda rows: [('Items', len(rows)), ('Out of service', sum(1 for r in rows if r.status != 'in_service')),
+                                        ('Inspection overdue', sum(1 for r in rows if r.status == 'in_service' and r.next_due and r.next_due < datetime.utcnow().date())),
+                                        ('Certificate expired', sum(1 for r in rows if r.cert_due and r.cert_due < datetime.utcnow().date()))]),
+        _APModule('training', 'Training records', 'People and contractors', _CapaTraining, 'assigned_date',
+                  [('Person', lambda r, n: n.get(r.user_id)), ('Training', lambda r, n: r.title), ('Category', lambda r, n: r.category),
+                   ('Due', lambda r, n: _ap_dt(r.due_date)), ('Completed', lambda r, n: _ap_dt(r.completion_date)), ('Status', lambda r, n: r.status),
+                   ('Score', lambda r, n: r.score)], snapshot=True,
+                  summary=lambda rows: [('Assignments', len(rows)), ('Completed', sum(1 for r in rows if r.completion_date)),
+                                        ('Overdue', sum(1 for r in rows if not r.completion_date and r.due_date and r.due_date < datetime.utcnow()))]),
+        _APModule('contractors', 'Contractors (current state)', 'People and contractors', ContractorFirm, 'created_at',
+                  [('Company', lambda r, n: r.name), ('Trade', lambda r, n: r.trade), ('Status', lambda r, n: r.status), ('Approved', lambda r, n: _ap_dt(r.approved_at)),
+                   ('Gaps', lambda r, n: _ap_join(_ct_firm_issues(r, ContractorDoc.query.filter(ContractorDoc.firm_id == r.id).all(), datetime.utcnow().date()), 200))],
+                  snapshot=True, summary=lambda rows: [('Contractors', len(rows)), ('Approved', _ap_count(rows, 'status', ('approved',)))]),
+        _APModule('workplace_voice', 'Worker reports (Workplace Voice, no reporter details)', 'People and contractors', WorkplaceVoiceReport, 'created_at',
+                  [('Code', lambda r, n: r.tracking_code), ('Received', lambda r, n: _ap_dt(r.created_at)), ('Category', lambda r, n: (r.category or '').replace('_', ' ')),
+                   ('Risk', lambda r, n: r.risk_level), ('Summary', lambda r, n: _rc_text(r.summary or r.title, 160)), ('Status', lambda r, n: r.status),
+                   ('Closed', lambda r, n: _ap_dt(r.closed_at))], staff_only=True,
+                  summary=lambda rows: [('Reports', len(rows)), ('Closed', sum(1 for r in rows if r.closed_at)),
+                                        ('Led to a corrective action', sum(1 for r in rows if r.capa_id))]),
+        _APModule('doc_changes', 'Document change requests', 'Documents', DocChangeRequest, 'requested_at',
+                  [('Number', lambda r, n: r.number), ('Requested', lambda r, n: _ap_dt(r.requested_at)), ('Title', lambda r, n: r.title),
+                   ('Priority', lambda r, n: r.priority), ('Status', lambda r, n: r.status), ('Decided by', lambda r, n: n.get(r.decided_by)),
+                   ('Implemented', lambda r, n: _ap_dt(r.implemented_at))],
+                  summary=lambda rows: [('Requests', len(rows)), ('Implemented', sum(1 for r in rows if r.implemented_at))]),
+        _APModule('doc_reading', 'Read and acknowledge requests', 'Documents', DocReadRequest, 'created_at',
+                  [('Sent', lambda r, n: _ap_dt(r.created_at)), ('Document', lambda r, n: r.document_id), ('Version', lambda r, n: r.document_version),
+                   ('Due', lambda r, n: _ap_dt(r.due_date)), ('Status', lambda r, n: r.status),
+                   ('Acknowledged', lambda r, n: f'{DocReadAssignment.query.filter(DocReadAssignment.request_id == r.id, DocReadAssignment.status == "acknowledged").count()}'
+                                                 f'/{DocReadAssignment.query.filter(DocReadAssignment.request_id == r.id).count()}')],
+                  summary=lambda rows: [('Requests', len(rows))]),
+        # chemical
+        _APModule('chem_register', 'Chemical register (current state)', 'Chemical', ChemItem, 'created_at',
+                  [('Chemical', lambda r, n: r.name), ('CAS', lambda r, n: r.cas), ('Location', lambda r, n: r.location),
+                   ('Quantity', lambda r, n: f'{r.quantity or ""} {r.unit or ""}'.strip()), ('Status', lambda r, n: r.status),
+                   ('SDS on file', lambda r, n: 'yes' if r.sds_file else 'NO'), ('Expires', lambda r, n: _ap_dt(r.expires_on))], snapshot=True,
+                  extra=lambda q: q.filter(ChemItem.status != 'disposed'),
+                  summary=lambda rows: [('Chemicals', len(rows)), ('Without a safety data sheet', sum(1 for r in rows if not r.sds_file)),
+                                        ('Past expiry', sum(1 for r in rows if r.expires_on and r.expires_on < datetime.utcnow().date()))]),
+        _APModule('chem_requests', 'New chemical approvals', 'Chemical', ChemRequest, 'created_at',
+                  [('Requested', lambda r, n: _ap_dt(r.created_at)), ('Chemical', lambda r, n: r.name), ('Purpose', lambda r, n: r.purpose),
+                   ('Location', lambda r, n: r.location), ('Requested by', lambda r, n: n.get(r.requested_by)), ('Status', lambda r, n: r.status),
+                   ('Decided by', lambda r, n: n.get(r.decided_by))],
+                  summary=lambda rows: [('Requests', len(rows)), ('Approved', _ap_count(rows, 'status', ('approved', 'added'))),
+                                        ('Rejected', _ap_count(rows, 'status', ('rejected',)))]),
+        _APModule('chem_exposure', 'Chemical exposure monitoring', 'Chemical', ChemExposure, 'sampled_on',
+                  [('Date', lambda r, n: _ap_dt(r.sampled_on)), ('Person', lambda r, n: r.person), ('Group', lambda r, n: r.seg), ('Substance', lambda r, n: r.substance),
+                   ('Kind', lambda r, n: r.kind), ('Result', lambda r, n: f'{r.value} {r.unit or ""}'), ('Limit', lambda r, n: r.limit),
+                   ('% of limit', lambda r, n: round(100 * r.ratio) if r.ratio is not None else ''), ('Outcome', lambda r, n: r.result)], staff_only=True,
+                  summary=lambda rows: [('Samples', len(rows)), ('Over the limit', _ap_count(rows, 'result', ('over',))),
+                                        ('At or above the action level', _ap_count(rows, 'result', ('action',)))]),
+        _APModule('chem_spills', 'Chemical spills', 'Chemical', ChemSpill, 'reported_at',
+                  [('Reported', lambda r, n: _ap_dt(r.reported_at)), ('Chemical', lambda r, n: r.chemical), ('Location', lambda r, n: r.location),
+                   ('Size', lambda r, n: r.size), ('Reached a drain', lambda r, n: 'yes' if r.reached_drain else 'no'), ('Injuries', lambda r, n: 'yes' if r.injuries else 'no'),
+                   ('Status', lambda r, n: r.status), ('Clean-up and prevention', lambda r, n: _rc_text(r.close_note, 160))],
+                  summary=lambda rows: [('Spills', len(rows)), ('Reached a drain', sum(1 for r in rows if r.reached_drain)),
+                                        ('Not closed', _ap_count(rows, 'status', ('open',)))]),
+        _APModule('chem_waste', 'Hazardous waste', 'Chemical', ChemWaste, 'started_on',
+                  [('Started', lambda r, n: _ap_dt(r.started_on)), ('Waste', lambda r, n: r.name), ('Category', lambda r, n: r.category),
+                   ('Quantity', lambda r, n: f'{r.quantity or ""} {r.unit or ""}'.strip()), ('Location', lambda r, n: r.location), ('Status', lambda r, n: r.status),
+                   ('Collected', lambda r, n: _ap_dt(r.collected_on)), ('Manifest', lambda r, n: r.manifest_no)],
+                  summary=lambda rows: [('Containers', len(rows)), ('Collected', sum(1 for r in rows if r.collected_on)),
+                                        ('Collected without a manifest number', sum(1 for r in rows if r.collected_on and not r.manifest_no))]),
+        # oil & gas
+        _APModule('og_isolations', 'Isolations', 'Oil & Gas', OgIsolation, 'isolated_at',
+                  [('Isolated', lambda r, n: _ap_dt(r.isolated_at)), ('Point', lambda r, n: r.point_tag), ('Equipment', lambda r, n: r.equipment),
+                   ('Energy', lambda r, n: r.energy_type), ('Method', lambda r, n: r.method), ('Isolated by', lambda r, n: n.get(r.isolated_by)),
+                   ('Verified by', lambda r, n: n.get(r.verified_by)), ('Status', lambda r, n: r.status)],
+                  summary=lambda rows: [('Isolation points', len(rows)), ('Verified by a second person', sum(1 for r in rows if r.verified_by))]),
+        _APModule('og_gas_tests', 'Gas tests', 'Oil & Gas', OgGasTest, 'tested_at',
+                  [('Tested', lambda r, n: _ap_dt(r.tested_at)), ('Location', lambda r, n: r.location), ('O2 %', lambda r, n: r.o2), ('LEL %', lambda r, n: r.lel),
+                   ('H2S ppm', lambda r, n: r.h2s), ('CO ppm', lambda r, n: r.co), ('Result', lambda r, n: r.result), ('Tester', lambda r, n: n.get(r.tested_by))],
+                  summary=lambda rows: [('Tests', len(rows)), ('Failed', _ap_count(rows, 'result', ('fail',)))]),
+        _APModule('og_detectors', 'Gas detector bump tests and calibrations', 'Oil & Gas', OgDetectorCheck, 'checked_at',
+                  [('Checked', lambda r, n: _ap_dt(r.checked_at)), ('Detector', lambda r, n: getattr(db.session.get(EquipmentItem, r.instrument_id), 'tag_no', r.instrument_id)),
+                   ('Kind', lambda r, n: r.kind), ('Result', lambda r, n: r.result), ('By', lambda r, n: n.get(r.checked_by)), ('Reasons', lambda r, n: _ap_join(_tbt_json(r.reasons, [])))],
+                  summary=lambda rows: [('Checks', len(rows)), ('Failed', _ap_count(rows, 'result', ('fail',)))]),
+        _APModule('og_moc', 'Management of change', 'Oil & Gas', OgMoc, 'created_at',
+                  [('Number', lambda r, n: r.number), ('Title', lambda r, n: r.title), ('Type', lambda r, n: r.change_type), ('Risk', lambda r, n: r.risk_level),
+                   ('Status', lambda r, n: r.status), ('Approved', lambda r, n: _ap_dt(r.approved_at)), ('Closed', lambda r, n: _ap_dt(r.closed_at))],
+                  summary=lambda rows: [('Changes', len(rows)), ('Closed', sum(1 for r in rows if r.closed_at))]),
+        _APModule('og_bypass', 'Bypassed safety devices', 'Oil & Gas', OgBypass, 'start_at',
+                  [('From', lambda r, n: _ap_dt(r.start_at)), ('Device', lambda r, n: r.device_tag), ('Type', lambda r, n: r.device_type), ('Location', lambda r, n: r.location),
+                   ('Reason', lambda r, n: r.reason), ('Planned end', lambda r, n: _ap_dt(r.planned_end)), ('Status', lambda r, n: r.status),
+                   ('Removed', lambda r, n: _ap_dt(r.removed_at))],
+                  summary=lambda rows: [('Bypasses', len(rows)), ('Still active past the planned end',
+                                                                  sum(1 for r in rows if r.status == 'active' and r.planned_end and r.planned_end < datetime.utcnow()))]),
+        _APModule('og_handover', 'Shift handovers', 'Oil & Gas', OgHandover, 'created_at',
+                  [('Started', lambda r, n: _ap_dt(r.created_at)), ('Area', lambda r, n: r.area), ('Shift', lambda r, n: r.shift_label),
+                   ('Outgoing', lambda r, n: n.get(r.outgoing_id)), ('Incoming', lambda r, n: n.get(r.incoming_id)), ('Status', lambda r, n: r.status),
+                   ('Accepted', lambda r, n: _ap_dt(r.accepted_at))],
+                  summary=lambda rows: [('Handovers', len(rows)), ('Accepted', sum(1 for r in rows if r.accepted_at))]),
+        _APModule('og_drops', 'Dropped-object findings', 'Oil & Gas', OgDropsFinding, 'found_at',
+                  [('Found', lambda r, n: _ap_dt(r.found_at)), ('Area', lambda r, n: r.area), ('Item', lambda r, n: r.item), ('Issue', lambda r, n: r.issue),
+                   ('Energy (J)', lambda r, n: r.energy_j), ('Consequence', lambda r, n: r.consequence), ('Status', lambda r, n: r.status),
+                   ('Fixed', lambda r, n: _ap_dt(r.fixed_at))],
+                  summary=lambda rows: [('Findings', len(rows)), ('Still open', _ap_count(rows, 'status', ('open',)))]),
+        # mining
+        _APModule('mn_verifications', 'Critical control checks', 'Mining', MnVerification, 'created_at',
+                  [('Date', lambda r, n: _ap_dt(r.created_at)), ('Area', lambda r, n: r.area), ('Result', lambda r, n: r.result),
+                   ('Controls failed', lambda r, n: r.failed or 0), ('Immediate action', lambda r, n: r.immediate_action),
+                   ('Action status', lambda r, n: r.action_status)],
+                  summary=lambda rows: [('Checks', len(rows)), ('Failed', _ap_count(rows, 'result', ('failed',)))]),
+        _APModule('mn_fatigue', 'Fit for shift (fatigue)', 'Mining', MnFatigue, 'created_at',
+                  [('Date', lambda r, n: _ap_dt(r.created_at)), ('Worker', lambda r, n: n.get(r.user_id)), ('Sleep 24 h', lambda r, n: r.sleep_24),
+                   ('Sleep 48 h', lambda r, n: r.sleep_48), ('Safety-critical', lambda r, n: 'yes' if r.safety_critical else 'no'), ('Result', lambda r, n: r.result)],
+                  staff_only=True, summary=lambda rows: [('Checks', len(rows)), ('At risk', _ap_count(rows, 'result', ('at_risk',))), ('Not fit', _ap_count(rows, 'result', ('not_fit',)))]),
+        _APModule('mn_blast', 'Blasting', 'Mining', MnBlast, 'planned_at',
+                  [('Planned', lambda r, n: _ap_dt(r.planned_at)), ('Ref', lambda r, n: r.ref), ('Location', lambda r, n: r.location), ('Exclusion m', lambda r, n: r.exclusion_m),
+                   ('Status', lambda r, n: r.status), ('Misfire', lambda r, n: 'yes' if r.misfire else 'no'), ('Re-entry', lambda r, n: _ap_dt(r.reentry_at))],
+                  summary=lambda rows: [('Blasts', len(rows)), ('Misfires', sum(1 for r in rows if r.misfire))]),
+        _APModule('mn_samples', 'Dust and silica samples', 'Mining', MnSample, 'sampled_on',
+                  [('Date', lambda r, n: _ap_dt(r.sampled_on)), ('Person', lambda r, n: r.person), ('Group', lambda r, n: r.seg), ('Agent', lambda r, n: r.agent),
+                   ('8-h average', lambda r, n: r.twa8), ('Limit', lambda r, n: r.limit_used), ('Result', lambda r, n: r.result)], staff_only=True,
+                  summary=lambda rows: [('Samples', len(rows)), ('Over the limit', _ap_count(rows, 'result', ('over',)))]),
+        _APModule('mn_emergencies', 'Underground emergencies and drills', 'Mining', MnEmergency, 'started_at',
+                  [('Started', lambda r, n: _ap_dt(r.started_at)), ('Kind', lambda r, n: r.kind), ('Area', lambda r, n: r.area), ('Status', lambda r, n: r.status),
+                   ('Closed', lambda r, n: _ap_dt(r.closed_at)), ('People', lambda r, n: len(_tbt_json(r.people, [])))],
+                  summary=lambda rows: [('Events', len(rows))]),
+        _APModule('mn_refuge_checks', 'Refuge chamber checks', 'Mining', MnRefugeCheck, 'checked_at',
+                  [('Checked', lambda r, n: _ap_dt(r.checked_at)), ('Refuge', lambda r, n: getattr(db.session.get(MnRefuge, r.refuge_id), 'name', r.refuge_id)),
+                   ('Result', lambda r, n: 'OK' if r.ok else 'Problems'), ('By', lambda r, n: n.get(r.checked_by)), ('Note', lambda r, n: r.note)],
+                  summary=lambda rows: [('Checks', len(rows)), ('With problems', sum(1 for r in rows if not r.ok))]),
+        # manufacturing
+        _APModule('mf_lockouts', 'Machine lockouts', 'Manufacturing and warehouse', MfLockout, 'started_at',
+                  [('Started', lambda r, n: _ap_dt(r.started_at)), ('Machine', lambda r, n: getattr(db.session.get(MfProcedure, r.procedure_id), 'machine', r.procedure_id)),
+                   ('Reason', lambda r, n: r.reason), ('Started by', lambda r, n: n.get(r.started_by)), ('Verified by', lambda r, n: n.get(r.verified_by)),
+                   ('Status', lambda r, n: r.status), ('Released', lambda r, n: _ap_dt(r.released_at))],
+                  summary=lambda rows: [('Lockouts', len(rows)), ('Zero energy verified', sum(1 for r in rows if r.verified_at))]),
+        _APModule('mf_guarding', 'Machine guarding assessments', 'Manufacturing and warehouse', MfGuarding, 'created_at',
+                  [('Date', lambda r, n: _ap_dt(r.created_at)), ('Machine', lambda r, n: r.machine), ('Location', lambda r, n: r.location),
+                   ('Result', lambda r, n: r.result), ('By', lambda r, n: n.get(r.assessed_by))],
+                  summary=lambda rows: [('Assessments', len(rows))]),
+        _APModule('wh_racking', 'Racking damage reports', 'Manufacturing and warehouse', WhRackReport, 'created_at',
+                  [('Reported', lambda r, n: _ap_dt(r.created_at)), ('Location', lambda r, n: r.location), ('Component', lambda r, n: r.component),
+                   ('Level', lambda r, n: r.level), ('Status', lambda r, n: r.status), ('Due', lambda r, n: _ap_dt(r.due_on)), ('Repaired', lambda r, n: _ap_dt(r.repaired_at))],
+                  summary=lambda rows: [('Reports', len(rows)), ('Repaired', sum(1 for r in rows if r.repaired_at))]),
+        # vision
+        _APModule('vision', 'Safety vision reports (photos and video)', 'AI vision', VisionReport, 'created_at',
+                  [('Date', lambda r, n: _ap_dt(r.created_at)), ('Title', lambda r, n: r.title), ('Location', lambda r, n: r.location), ('Kind', lambda r, n: r.kind),
+                   ('Findings', lambda r, n: len(_tbt_json(r.findings, [])))],
+                  summary=lambda rows: [('Reports', len(rows)), ('Findings', sum(len(_tbt_json(r.findings, [])) for r in rows))]),
+    ]
+
+
+AP_MAX_PDF_ROWS = 400
+AP_MAX_CSV_ROWS = 20000
+
+
+def _ap_name_ids(rows):
+    ids = []
+    for r in rows:
+        for a in ('assigned_to', 'assignee_id', 'inspector_id', 'requested_by', 'decided_by', 'isolated_by', 'verified_by', 'tested_by', 'checked_by',
+                  'outgoing_id', 'incoming_id', 'started_by', 'assessed_by', 'user_id'):
+            v = getattr(r, a, None)
+            if isinstance(v, int):
+                ids.append(v)
+    return ids
+
+
+def _ap_period(data):
+    today = datetime.utcnow().date()
+    try:
+        start = datetime.strptime(str(data.get('from'))[:10], '%Y-%m-%d').date()
+    except (TypeError, ValueError):
+        start = today - timedelta(days=365)
+    try:
+        end = datetime.strptime(str(data.get('to'))[:10], '%Y-%m-%d').date()
+    except (TypeError, ValueError):
+        end = today
+    if end < start:
+        start, end = end, start
+    if (end - start).days > 3 * 366:
+        start = end - timedelta(days=3 * 366)
+    return start, end
+
+
+def _ap_gaps(cid, today):
+    """What an auditor will ask about first: built only from records, nothing assumed."""
+    gaps = []
+
+    def add(n, text, link):
+        if n:
+            gaps.append({'count': n, 'text': text, 'link': link})
+    now = datetime.utcnow()
+    add(_CapaCA.query.filter(_CapaCA.company_id == cid, _CapaCA.status.in_(CAPA_OPEN), _CapaCA.due_date < now).count(), 'CAPAs past their due date', '/capa')
+    add(CapaDetail.query.join(_CapaCA, _CapaCA.id == CapaDetail.capa_id).filter(CapaDetail.company_id == cid, _CapaCA.status == 'completed',
+                                                                              CapaDetail.check_due < today).count(), 'CAPAs done but their effectiveness check is overdue', '/capa')
+    add(InspectionAction.query.filter(InspectionAction.company_id == cid, InspectionAction.status == 'open', InspectionAction.due_date < today).count(),
+        'inspection actions overdue', '/inspections?tab=actions')
+    add(EquipmentItem.query.filter(EquipmentItem.company_id == cid, EquipmentItem.status == 'in_service', EquipmentItem.next_due < today).count(),
+        'equipment items in service with an overdue inspection', '/inspections?tab=equipment')
+    add(EquipmentItem.query.filter(EquipmentItem.company_id == cid, EquipmentItem.status == 'in_service', EquipmentItem.cert_due < today).count(),
+        'equipment items in service with an expired certificate', '/inspections?tab=equipment')
+    add(ChemItem.query.filter(ChemItem.company_id == cid, ChemItem.status != 'disposed', or_(ChemItem.sds_file.is_(None), ChemItem.sds_file == '')).count(),
+        'chemicals without a safety data sheet on file', '/hse-management/industry/chemical?tab=register')
+    add(ChemSpill.query.filter(ChemSpill.company_id == cid, ChemSpill.status == 'open').count(), 'chemical spills not closed', '/hse-management/industry/chemical?tab=spill')
+    add(_CapaPermit.query.filter(_CapaPermit.company_id == cid, _CapaPermit.status == 'active', _CapaPermit.end_at < now).count(),
+        'permits still active after their end time', '/document-management?tab=ptw')
+    add(OgBypass.query.filter(OgBypass.company_id == cid, OgBypass.status == 'active', OgBypass.planned_end < now).count(),
+        'safety devices still bypassed past their planned end', '/hse-management/industry/oil_gas?tab=bypass')
+    add(OgDropsFinding.query.filter(OgDropsFinding.company_id == cid, OgDropsFinding.status == 'open').count(),
+        'dropped-object risks not fixed', '/hse-management/industry/oil_gas?tab=drops')
+    add(WhRackReport.query.filter(WhRackReport.company_id == cid, WhRackReport.status.notin_(('repaired', 'closed')), WhRackReport.due_on < today).count(),
+        'racking repairs past their due date', '/hse-management/industry/general?tab=racking')
+    add(_CapaTraining.query.filter(_CapaTraining.company_id == cid, _CapaTraining.completion_date.is_(None), _CapaTraining.due_date < now).count(),
+        'training assignments overdue', None)
+    firms = ContractorFirm.query.filter(ContractorFirm.company_id == cid, ContractorFirm.status == 'approved').limit(1000).all()
+    add(sum(1 for f in firms if _ct_firm_issues(f, ContractorDoc.query.filter(ContractorDoc.firm_id == f.id).all(), today)),
+        'approved contractors with missing or expired documents', '/contractors')
+    return gaps
+
+
+@app.route('/api/audit-pack/modules', methods=['GET'])
+@jwt_required
+def ap_modules_route():
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    if not _rc_staff(user):
+        return jsonify({'success': False, 'error': 'Audit packs are made by supervisors and admins.'}), 403
+    s, e = _ap_period(request.args)
+    start, end = datetime.combine(s, datetime.min.time()), datetime.combine(e + timedelta(days=1), datetime.min.time())
+    out = []
+    for m in _ap_modules():
+        try:
+            n = m.query(user.company_id, start, end).count()
+        except Exception as ex:
+            db.session.rollback()
+            logger.warning(f'audit pack count {m.key}: {ex}')
+            n = None
+        out.append({'key': m.key, 'label': m.label, 'group': m.group, 'count': n, 'snapshot': m.snapshot, 'personal': m.staff_only})
+    return jsonify({'success': True, 'data': out, 'from': s.isoformat(), 'to': e.isoformat(),
+                    'gaps': _ap_gaps(user.company_id, datetime.utcnow().date())}), 200
+
+
+def _ap_collect(user, keys, start, end, limit):
+    mods = [m for m in _ap_modules() if m.key in keys]
+    out = []
+    for m in mods:
+        try:
+            q = m.query(user.company_id, start, end)
+            total = q.count()
+            rows = q.limit(limit).all()
+            names = _in_names(_ap_name_ids(rows))
+            table = [[_rc_text(fn(r, names), 300) if fn(r, names) is not None else '' for _, fn in m.cols] for r in rows]
+            out.append({'m': m, 'total': total, 'rows': table, 'summary': m.summary(rows) if m.summary else [], 'cut': total > len(rows)})
+        except Exception as ex:
+            db.session.rollback()
+            logger.error(f'audit pack {m.key}: {ex}')
+            out.append({'m': m, 'total': 0, 'rows': [], 'summary': [], 'cut': False, 'error': True})
+    return out
+
+
+def _ap_pdf(user, sections, s, e, gaps):
+    import fitz as _fz
+    from html import escape as _e
+    comp = db.session.get(_TbtCompany, user.company_id)
+    now = datetime.utcnow()
+    h = [f'<h1>Audit pack</h1><p class="big">{_e(getattr(comp, "name", "") or "")}</p>',
+         f'<p>Period: {s.strftime("%d %b %Y")} to {e.strftime("%d %b %Y")}<br/>Prepared by {_e(getattr(user, "name", None) or user.email)} on {now:%d %b %Y %H:%M} UTC</p>',
+         '<p class="note">Every figure in this pack is counted from the records kept in SafeTrack Pro for this company. '
+         'Registers marked "current state" show how things stand today, not during the period.</p>',
+         '<h2>Contents</h2><table><tr><th>Section</th><th>Records</th></tr>']
+    for sec in sections:
+        h.append(f'<tr><td>{_e(sec["m"].group)}: {_e(sec["m"].label)}</td><td>{sec["total"]}</td></tr>')
+    h.append('</table>')
+    h.append('<h2>Readiness: open points an auditor will ask about</h2>')
+    if gaps:
+        h.append('<table><tr><th>Count</th><th>Open point</th></tr>' + ''.join(f'<tr><td class="bad">{g["count"]}</td><td>{_e(g["text"])}</td></tr>' for g in gaps) + '</table>')
+    else:
+        h.append('<p>No open points found in the records.</p>')
+    for sec in sections:
+        m = sec['m']
+        h.append(f'<h2 class="sec">{_e(m.group)}: {_e(m.label)}</h2>')
+        if sec.get('error'):
+            h.append('<p class="bad">This section could not be read.</p>')
+            continue
+        if sec['summary']:
+            h.append('<p>' + ' &nbsp;|&nbsp; '.join(f'{_e(k)}: <b>{v}</b>' for k, v in sec['summary']) + '</p>')
+        if not sec['rows']:
+            h.append('<p>No records.</p>')
+            continue
+        h.append('<table><tr>' + ''.join(f'<th>{_e(c)}</th>' for c, _ in m.cols) + '</tr>' +
+                 ''.join('<tr>' + ''.join(f'<td>{_e(str(v))}</td>' for v in row) + '</tr>' for row in sec['rows']) + '</table>')
+        if sec['cut']:
+            h.append(f'<p class="note">Showing the latest {len(sec["rows"])} of {sec["total"]}. The CSV export has all of them.</p>')
+    h.append('<p class="note">Generated by SafeTrack Pro. Times are UTC.</p>')
+    css = ('* { font-family: sans-serif; } body { font-size: 8pt; } h1 { color: #0b3d91; font-size: 20pt; margin-bottom: 2px; } '
+           '.big { font-size: 13pt; font-weight: bold; } h2 { color: #0b3d91; font-size: 11pt; margin-top: 14px; } '
+           'table { border-collapse: collapse; width: 100%; } td, th { border: 1px solid #d0d7e2; padding: 2px 3px; text-align: left; vertical-align: top; } '
+           'th { background: #eef3fb; } .note { color: #666; font-size: 7.5pt; } .bad { color: #b00000; font-weight: bold; }')
+    story = _fz.Story(html=''.join(h), user_css=css)
+    buf = io.BytesIO()
+    writer = _fz.DocumentWriter(buf)
+    box = _fz.paper_rect('a4')      # portrait: MuPDF 1.26 Story drops content after a page break on landscape pages
+    more = True
+    while more:
+        dev = writer.begin_page(box)
+        more, _ = story.place(box + (30, 30, -30, -36))
+        story.draw(dev)
+        writer.end_page()
+    writer.close()
+    doc = _fz.open(stream=buf.getvalue(), filetype='pdf')
+    text = re.sub(r'\s+', ' ', ''.join(pg.get_text(flags=_fz.TEXTFLAGS_TEXT & ~_fz.TEXT_PRESERVE_LIGATURES) for pg in doc))
+    lost = [sec['m'].label for sec in sections if re.sub(r'\s+', ' ', sec['m'].label) not in text]
+    if lost:
+        logger.error(f'audit pack pdf: sections missing after layout: {lost}')
+    for i, pg in enumerate(doc):
+        pg.insert_text((30, pg.rect.height - 18), f'{getattr(comp, "name", "") or ""} - audit pack {s:%d %b %Y} to {e:%d %b %Y} - page {i + 1} of {len(doc)}',
+                       fontsize=7, color=(0.4, 0.4, 0.4))
+    return doc.tobytes(garbage=3, deflate=True)
+
+
+def _ap_zip(sections, gaps, s, e):
+    buf = io.BytesIO()
+    with _capa_zip.ZipFile(buf, 'w', _capa_zip.ZIP_DEFLATED) as z:
+        for sec in sections:
+            sio = io.StringIO()
+            w = _capa_csv.writer(sio)
+            w.writerow([c for c, _ in sec['m'].cols])
+            for row in sec['rows']:
+                w.writerow([("'" + v) if isinstance(v, str) and v[:1] in ('=', '+', '-', '@') else v for v in row])   # no spreadsheet formulas
+            z.writestr(f'{sec["m"].key}.csv', '﻿' + sio.getvalue())
+        sio = io.StringIO()
+        w = _capa_csv.writer(sio)
+        w.writerow(['Open points', 'Count'])
+        for g in gaps:
+            w.writerow([g['text'], g['count']])
+        z.writestr('readiness_open_points.csv', '﻿' + sio.getvalue())
+        z.writestr('README.txt', f'Audit pack export {s.isoformat()} to {e.isoformat()}, made {datetime.utcnow():%Y-%m-%d %H:%M} UTC from the records in SafeTrack Pro.\n'
+                                 'One CSV per module. Registers marked current state show today.\n')
+    return buf.getvalue()
+
+
+@app.route('/api/audit-pack', methods=['POST'])
+@jwt_required
+def ap_make_route():
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    if not _rc_staff(user):
+        return jsonify({'success': False, 'error': 'Audit packs are made by supervisors and admins.'}), 403
+    data = _in_body()
+    valid = {m.key for m in _ap_modules()}
+    keys = [k for k in (data.get('modules') or []) if k in valid]
+    if not keys:
+        return jsonify({'success': False, 'error': 'Choose at least one module.'}), 400
+    s, e = _ap_period(data)
+    start, end = datetime.combine(s, datetime.min.time()), datetime.combine(e + timedelta(days=1), datetime.min.time())
+    fmt = 'zip' if data.get('format') == 'zip' else 'pdf'
+    sections = _ap_collect(user, set(keys), start, end, AP_MAX_CSV_ROWS if fmt == 'zip' else AP_MAX_PDF_ROWS)
+    order = {k: i for i, k in enumerate(m.key for m in _ap_modules())}
+    sections.sort(key=lambda x: order[x['m'].key])
+    gaps = _ap_gaps(user.company_id, datetime.utcnow().date())
+    try:
+        blob = _ap_zip(sections, gaps, s, e) if fmt == 'zip' else _ap_pdf(user, sections, s, e, gaps)
+    except Exception as ex:
+        logger.error(f'audit pack build: {ex}')
+        return jsonify({'success': False, 'error': 'The audit pack could not be made.'}), 500
+    try:
+        _sec_record('audit_pack_export', 'info', f'Audit pack {fmt} {s.isoformat()} to {e.isoformat()}: {len(keys)} modules',
+                    extra={'modules': keys}, user_id=user.id)
+    except Exception:
+        pass
+    resp = send_file(io.BytesIO(blob), mimetype='application/zip' if fmt == 'zip' else 'application/pdf', as_attachment=True,
+                     download_name=f'audit_pack_{s.isoformat()}_{e.isoformat()}.{fmt}')
+    resp.headers['Cache-Control'] = 'private, no-store'
+    return resp
 # =====================================================================================================
 # AUTO MIGRATIONS (2026-11-23)
 # Railway's Data tab appends LIMIT to every query, so CREATE/ALTER statements fail there. Instead the
@@ -179018,7 +180098,7 @@ def cs_spills(sid=None):
 #   - a failing statement is logged and the file is retried on the next start
 # Set AUTO_MIGRATE=0 on Railway to switch this off.
 # =====================================================================================================
-AUTO_MIGRATIONS = ('DEPLOY_2026-11-23_FULL.sql', '2026-11-24_company_quotes.sql', '2026-11-25_ready_checks.sql', '2026-11-26_muster_contractors.sql', '2026-11-27_document_control_plus.sql', '2026-11-27_inspections.sql', '2026-11-27_chemical_safety.sql', '2026-11-27_chemical_waste.sql', '2026-11-27_equipment.sql', '2026-11-27_incident_outcomes.sql', '2026-11-27_oil_gas.sql', '2026-11-27_vision_reports.sql', '2026-11-27_mining.sql', '2026-11-27_mfg_wh.sql', '2026-11-27_og_part2.sql', '2026-11-27_mining_part2.sql', '2026-11-27_chemical_part3.sql')
+AUTO_MIGRATIONS = ('DEPLOY_2026-11-23_FULL.sql', '2026-11-24_company_quotes.sql', '2026-11-25_ready_checks.sql', '2026-11-26_muster_contractors.sql', '2026-11-27_document_control_plus.sql', '2026-11-27_inspections.sql', '2026-11-27_chemical_safety.sql', '2026-11-27_chemical_waste.sql', '2026-11-27_equipment.sql', '2026-11-27_incident_outcomes.sql', '2026-11-27_oil_gas.sql', '2026-11-27_vision_reports.sql', '2026-11-27_mining.sql', '2026-11-27_mfg_wh.sql', '2026-11-27_og_part2.sql', '2026-11-27_mining_part2.sql', '2026-11-27_chemical_part3.sql', '2026-11-28_capa.sql')
 _MIGRATION_LOCK_KEY = 74230115
 
 
