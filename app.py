@@ -143404,6 +143404,8 @@ def use_template(template_id):
         from models import DocumentTemplate
         
         template = DocumentTemplate.query.get(template_id)
+        if template and not is_super_admin and getattr(template, 'company_id', None)                 and template.company_id != getattr(current_user, 'company_id', None) and not getattr(template, 'is_public', False):
+            template = None
         if not template:
             return jsonify({
                 'success': False,
@@ -168614,6 +168616,16 @@ def hw_workspace_route(industry):
 
 
 @app.before_request
+def _sec_close_v1_ai_document_files():
+    """/api/v1/ai/documents/pdf/download and /convert read generated documents from disk by id without checking whose
+    they are (and matched any file name containing the id), so any user could open another company's documents.
+    The app does not use them; they stay closed. Generated documents are downloaded through the generator itself."""
+    if request.path.startswith('/api/v1/ai/documents/') and request.method != 'OPTIONS':
+        return jsonify({'success': False, 'code': 'MODULE_RETIRED', 'error': 'This download link was retired.'}), 410
+    return None
+
+
+@app.before_request
 def _hw_close_legacy_construction():
     """The old /api/construction/* routes did not separate companies (one company could read, change or delete another's
     incidents, equipment and training, and list every user). They stay closed until rebuilt with company separation.
@@ -168645,6 +168657,8 @@ def hw_chemical_item_route(chem_id):
     c = _hw_chem(user, chem_id)
     if not c:
         return jsonify({'success': False, 'error': 'Chemical not found.'}), 404
+    if c.user_id != user.id and not _rc_staff(user):
+        return jsonify({'success': False, 'error': 'Only the person who added this chemical, or a supervisor, can change or delete it.'}), 403
     if request.method == 'DELETE':
         db.session.delete(c)
         db.session.commit()
@@ -169075,7 +169089,7 @@ def _dm_intake_to_document(item, user, data):
         pass
     if fields.get('document_id'):
         existing = _DmDoc.query.get(fields['document_id'])
-        if existing:
+        if existing and existing.company_id == item.company_id:
             return existing
     root = os.path.abspath(_dm_upload_root())
     src = os.path.abspath(os.path.join(root, str(item.file_url or '')[len('/uploads/'):]))
@@ -174264,6 +174278,9 @@ def og_isolation_act(iid):
     elif action == 'remove':
         if i.status not in ('isolated', 'verified'):
             return jsonify({'success': False, 'error': f'This isolation is {i.status.replace("_", " ")}.'}), 409
+        if i.isolated_by != user.id and not _rc_staff(user):
+            return jsonify({'success': False, 'code': 'NOT_YOUR_ISOLATION',
+                            'error': 'Only the person who isolated this point, or a supervisor, can remove the isolation.'}), 403
         if p and p.status == 'active' and not data.get('work_stopped'):
             return jsonify({'success': False, 'code': 'WORK_ACTIVE',
                             'error': 'The permit is still active. Confirm the work has stopped and people are clear before removing the isolation.'}), 409
@@ -176393,6 +176410,9 @@ def mf_lockout_act(lid):
     elif action == 'release':
         if l.status != 'locked_out':
             return jsonify({'success': False, 'error': 'Zero energy was never verified; verify, or release with a supervisor.'}), 409
+        if l.started_by != user.id and not _rc_staff(user):
+            return jsonify({'success': False, 'code': 'NOT_YOUR_LOCKOUT',
+                            'error': 'Only the person who applied this lockout, or a supervisor, can release it (OSHA 1910.147(e)(3)).'}), 403
         note = _rc_text(data.get('note'), 500)
         if len(note) < 5 or not data.get('people_clear'):
             return jsonify({'success': False, 'error': 'Confirm tools removed, guards back on and everyone clear, and add a note.'}), 400
@@ -177739,6 +177759,10 @@ def mn_tag_act(pid):
         return jsonify({'success': False, 'error': 'Not found.'}), 404
     if p.status != 'in':
         return jsonify({'success': False, 'error': f'{p.person} is already out.'}), 409
+    if user.id not in (p.user_id, p.tagged_in_by) and not _rc_staff(user):
+        # a wrong tag-out removes a person who is still underground from the emergency roll call
+        return jsonify({'success': False, 'code': 'NOT_YOUR_TAG',
+                        'error': f'Only {p.person}, the person who tagged them in, or a supervisor can change this tag.'}), 403
     data = _in_body()
     now = datetime.utcnow()
     if data.get('action') == 'out':
