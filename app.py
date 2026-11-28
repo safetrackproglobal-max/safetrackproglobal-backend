@@ -179897,6 +179897,16 @@ def _ap_modules():
                    ('By', lambda r, n: n.get(r.checked_by)), ('Result', lambda r, n: r.result), ('O2 %', lambda r, n: r.o2), ('LEL %', lambda r, n: r.lel),
                    ('Note', lambda r, n: r.note)],
                   summary=lambda rows: [('Checks', len(rows)), ('Failed', _ap_count(rows, 'result', ('fail',)))]),
+        # maritime
+        _APModule('mar_entries', 'Enclosed space entries', 'Maritime', MarEntry, 'entered_at',
+                  [('Entered', lambda r, n: _ap_dt(r.entered_at)), ('Space', lambda r, n: (lambda s: f'{s.vessel}: {s.name}' if s else r.space_id)(db.session.get(MarSpace, r.space_id))),
+                   ('Purpose', lambda r, n: r.purpose), ('Entrants', lambda r, n: _ap_join(_tbt_json(r.entrants, []))), ('Attendant', lambda r, n: r.attendant),
+                   ('O2 %', lambda r, n: r.o2), ('LFL %', lambda r, n: r.lfl), ('Authorised by', lambda r, n: n.get(r.authorised_by)), ('Status', lambda r, n: r.status)],
+                  summary=lambda rows: [('Entries', len(rows)), ('Stopped', _ap_count(rows, 'status', ('aborted',)))]),
+        _APModule('mar_drills', 'Enclosed space entry and rescue drills', 'Maritime', MarDrill, 'held_on',
+                  [('Date', lambda r, n: _ap_dt(r.held_on)), ('Vessel', lambda r, n: r.vessel), ('Scenario', lambda r, n: r.scenario),
+                   ('Participants', lambda r, n: r.participants), ('Equipment checked', lambda r, n: 'yes' if r.equipment_checked else 'no'), ('Lessons', lambda r, n: _rc_text(r.lessons, 160))],
+                  summary=lambda rows: [('Drills', len(rows))]),
     ]
 
 
@@ -179908,7 +179918,7 @@ def _ap_name_ids(rows):
     ids = []
     for r in rows:
         for a in ('assigned_to', 'assignee_id', 'inspector_id', 'requested_by', 'decided_by', 'isolated_by', 'verified_by', 'tested_by', 'checked_by',
-                  'outgoing_id', 'incoming_id', 'started_by', 'assessed_by', 'user_id'):
+                  'outgoing_id', 'incoming_id', 'started_by', 'assessed_by', 'user_id', 'authorised_by'):
             v = getattr(r, a, None)
             if isinstance(v, int):
                 ids.append(v)
@@ -181116,6 +181126,382 @@ def _lab_watch_loop():
 
 if os.environ.get('READY_CHECK_WATCHER', '1') == '1':
     threading.Thread(target=_lab_watch_loop, daemon=True, name='lab-watcher').start()
+# ============================================================================
+# MARITIME: ENCLOSED SPACE ENTRY + RESCUE DRILLS (2026-11-28)
+#   Register of enclosed spaces per vessel; entry log that refuses entry unless the atmosphere test meets the company's
+#   own limits (from its SMS / IMO MSC.581(110), which replaced A.1050(27) in 2025), an attendant is named, rescue
+#   equipment is ready and the space is ventilated; people in / out; drill tracker per vessel (SOLAS III/19: at least
+#   every two months) with overdue alerts. Aviation: airside FOD walk checklist in the inspection library.
+# ============================================================================
+MAR_KINDS = {'tank': 'Cargo / ballast tank', 'void': 'Void space', 'hold': 'Cargo hold', 'pump_room': 'Pump room', 'cofferdam': 'Cofferdam',
+             'chain_locker': 'Chain locker', 'duct_keel': 'Duct keel', 'other': 'Other'}
+MAR_DEFAULTS = {'limits': {}, 'drill_interval_days': 61}
+MAR_LIMIT_KEYS = {'o2_min': 'Oxygen at least (% vol)', 'o2_max': 'Oxygen at most (% vol)', 'lfl_max': 'Flammable at most (% LFL)',
+                  'h2s_max': 'H2S at most (ppm)', 'co_max': 'CO at most (ppm)'}
+
+IN_LIBRARY.update({
+    'enclosed_space': _in_lib('Enclosed space entry check', 'Maritime', 'Before anyone enters an enclosed space (with the entry permit).', [
+        ('Before entry', [('Space ventilated and the atmosphere tested at different levels', 'c'), ('Attendant at the entrance with communications', 'c'),
+                          ('Rescue and resuscitation equipment ready at the entrance', 'c'), 'Lighting and access are safe', 'Officer of the watch informed']),
+        ('During entry', ['Atmosphere re-tested at the intervals in the permit', 'Agreed signals and communication checks working']),
+        ('Notes', [('Comments', 't')]),
+    ]),
+    'fod_walk': _in_lib('Airside FOD walk', 'Aviation', 'Walk of stands, taxiway edges and service roads for foreign object debris.', [
+        ('Area', [('Stand / apron free of debris (bolts, tags, plastic, stones)', 'c'), 'FOD bins in place and emptied', 'No loose ground equipment parts',
+                  'Surface damage that sheds debris reported', 'Service road edges clear']),
+        ('Findings', [('Items found and where', 't')]),
+    ]),
+})
+
+
+class MarSpace(db.Model):
+    __tablename__ = 'mar_spaces'
+    __table_args__ = {'extend_existing': True}
+    id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id', ondelete='CASCADE'), nullable=False, index=True)
+    vessel = db.Column(db.String(120), nullable=False)
+    name = db.Column(db.String(160), nullable=False)
+    kind = db.Column(db.String(16), nullable=False, default='other')
+    hazards = db.Column(db.Text)
+    active = db.Column(db.Boolean, nullable=False, default=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+
+class MarEntry(db.Model):
+    __tablename__ = 'mar_entries'
+    __table_args__ = {'extend_existing': True}
+    id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id', ondelete='CASCADE'), nullable=False, index=True)
+    space_id = db.Column(db.Integer, db.ForeignKey('mar_spaces.id', ondelete='CASCADE'), nullable=False, index=True)
+    purpose = db.Column(db.String(300), nullable=False)
+    entrants = db.Column(db.Text, nullable=False)                             # JSON [name]
+    attendant = db.Column(db.String(120), nullable=False)
+    comms = db.Column(db.String(120))
+    o2 = db.Column(db.Float)
+    lfl = db.Column(db.Float)
+    h2s = db.Column(db.Float)
+    co = db.Column(db.Float)
+    limits = db.Column(db.Text)                                               # JSON limits used
+    tested_by = db.Column(db.String(120))
+    tested_at = db.Column(db.DateTime)
+    ventilated = db.Column(db.Boolean, nullable=False, default=False)
+    rescue_ready = db.Column(db.Boolean, nullable=False, default=False)
+    status = db.Column(db.String(8), nullable=False, default='open')          # open | closed | aborted
+    entered_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    exited_at = db.Column(db.DateTime)
+    close_note = db.Column(db.String(500))
+    authorised_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    closed_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+
+
+class MarDrill(db.Model):
+    __tablename__ = 'mar_drills'
+    __table_args__ = {'extend_existing': True}
+    id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id', ondelete='CASCADE'), nullable=False, index=True)
+    vessel = db.Column(db.String(120), nullable=False)
+    held_on = db.Column(db.Date, nullable=False)
+    scenario = db.Column(db.String(300), nullable=False)
+    participants = db.Column(db.Integer, nullable=False)
+    equipment_checked = db.Column(db.Boolean, nullable=False, default=False)
+    lessons = db.Column(db.Text)
+    created_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+
+def _mar_settings(cid):
+    s = _dm_setting_get('mar_settings', cid, MAR_DEFAULTS) or {}
+    return {**MAR_DEFAULTS, **s, 'limits': dict((s or {}).get('limits') or {})}
+
+
+def _mar_vessel(v):
+    return re.sub(r'\s+', ' ', _rc_text(v, 120)).strip()
+
+
+def _mar_eval(readings, lim):
+    bad = []
+    if lim.get('o2_min') is not None and (readings.get('o2') is None or readings['o2'] < lim['o2_min']):
+        bad.append(f'Oxygen {readings.get("o2")} % is below {lim["o2_min"]} %')
+    if lim.get('o2_max') is not None and readings.get('o2') is not None and readings['o2'] > lim['o2_max']:
+        bad.append(f'Oxygen {readings["o2"]} % is above {lim["o2_max"]} %')
+    for k, name, unit in (('lfl', 'Flammable', '% LFL'), ('h2s', 'H2S', 'ppm'), ('co', 'CO', 'ppm')):
+        m = lim.get(f'{k}_max')
+        if m is not None:
+            if readings.get(k) is None:
+                bad.append(f'{name} not measured (your limit is {m} {unit})')
+            elif readings[k] > m:
+                bad.append(f'{name} {readings[k]} {unit} is above {m} {unit}')
+    return bad
+
+
+def _mar_drill_status(cid, st, today):
+    vessels = {_mar_vessel(s.vessel) for s in MarSpace.query.filter(MarSpace.company_id == cid, MarSpace.active.is_(True)).all()}
+    drills = MarDrill.query.filter(MarDrill.company_id == cid).order_by(MarDrill.held_on.desc()).all()
+    last = {}
+    for d in drills:
+        last.setdefault(_mar_vessel(d.vessel), d)
+        vessels.add(_mar_vessel(d.vessel))
+    out = []
+    n = int(st.get('drill_interval_days') or 61)
+    for v in sorted(vessels):
+        d = last.get(v)
+        due = d.held_on + timedelta(days=n) if d else None
+        out.append({'vessel': v, 'last': d.held_on.isoformat() if d else None, 'due': due.isoformat() if due else None,
+                    'overdue': (due is None) or due < today, 'days_left': (due - today).days if due else None})
+    return out
+
+
+@app.route('/api/maritime/settings', methods=['GET', 'PUT'])
+@jwt_required
+def mar_settings_route():
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    st = _mar_settings(user.company_id)
+    if request.method == 'PUT':
+        if not _rc_staff(user):
+            return jsonify({'success': False, 'error': 'Supervisors and admins only.'}), 403
+        data = _in_body()
+        lim = {}
+        for k in MAR_LIMIT_KEYS:
+            v = (data.get('limits') or {}).get(k)
+            if v in (None, ''):
+                continue
+            try:
+                lim[k] = float(v)
+            except (TypeError, ValueError):
+                return jsonify({'success': False, 'error': f'{MAR_LIMIT_KEYS[k]} must be a number.'}), 400
+        if 'o2_min' not in lim:
+            return jsonify({'success': False, 'error': 'Set at least the minimum oxygen level from your safety management system.'}), 400
+        try:
+            days = max(7, min(92, int(data.get('drill_interval_days') or 61)))
+        except (TypeError, ValueError):
+            return jsonify({'success': False, 'error': 'Drill interval must be a number of days.'}), 400
+        st = {'limits': lim, 'drill_interval_days': days}
+        _dm_setting_put('mar_settings', user.company_id, st, user.id)
+        db.session.commit()
+    return jsonify({'success': True, 'data': st, 'limit_names': MAR_LIMIT_KEYS, 'can_manage': _rc_staff(user),
+                    'note': 'Use the limits from your safety management system. IMO MSC.581(110) (2025) replaced A.1050(27); '
+                            'SOLAS III/19 requires enclosed space entry and rescue drills at least every two months.'}), 200
+
+
+@app.route('/api/maritime/spaces', methods=['GET', 'POST'])
+@jwt_required
+def mar_spaces_route():
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    cid, today, now = user.company_id, datetime.utcnow().date(), datetime.utcnow()
+    if request.method == 'GET':
+        spaces = MarSpace.query.filter(MarSpace.company_id == cid, MarSpace.active.is_(True)).order_by(MarSpace.vessel, MarSpace.name).all()
+        open_e = MarEntry.query.filter(MarEntry.company_id == cid, MarEntry.status == 'open').all()
+        names = _in_names([e.authorised_by for e in open_e])
+        by_space = {}
+        for e in open_e:
+            by_space.setdefault(e.space_id, []).append(e)
+        st = _mar_settings(cid)
+        return jsonify({'success': True, 'can_manage': _rc_staff(user), 'kinds': MAR_KINDS, 'limits_set': bool(st['limits']),
+                        'data': [{'id': s.id, 'vessel': s.vessel, 'name': s.name, 'kind': s.kind, 'hazards': s.hazards,
+                                  'open_entries': [{'id': e.id, 'purpose': e.purpose, 'entrants': _tbt_json(e.entrants, []), 'attendant': e.attendant,
+                                                    'entered_at': _in_iso(e.entered_at), 'minutes_in': int((now - e.entered_at).total_seconds() // 60),
+                                                    'authorised_by': names.get(e.authorised_by)} for e in by_space.get(s.id, [])]} for s in spaces],
+                        'drills': _mar_drill_status(cid, st, today)}), 200
+    if not _rc_staff(user):
+        return jsonify({'success': False, 'error': 'Officers / supervisors register enclosed spaces.'}), 403
+    data = _in_body()
+    vessel, name = _mar_vessel(data.get('vessel')), _rc_text(data.get('name'), 160)
+    if len(vessel) < 2 or len(name) < 2:
+        return jsonify({'success': False, 'error': 'Give the vessel and the space name.'}), 400
+    s = MarSpace(company_id=cid, vessel=vessel, name=name, kind=data.get('kind') if data.get('kind') in MAR_KINDS else 'other',
+                 hazards=_capa_long(data.get('hazards'), 2000) or None)
+    db.session.add(s)
+    db.session.commit()
+    return jsonify({'success': True, 'data': {'id': s.id}}), 201
+
+
+@app.route('/api/maritime/spaces/<int:sid>', methods=['DELETE'])
+@jwt_required
+def mar_space_one(sid):
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    if not _rc_staff(user):
+        return jsonify({'success': False, 'error': 'Supervisors and admins only.'}), 403
+    s = db.session.get(MarSpace, sid)
+    if not s or s.company_id != user.company_id:
+        return jsonify({'success': False, 'error': 'Not found.'}), 404
+    s.active = False
+    db.session.commit()
+    return jsonify({'success': True}), 200
+
+
+def _mar_entry_dict(e, names, space=None):
+    return {'id': e.id, 'space_id': e.space_id, 'space': f'{space.vessel}: {space.name}' if space else None, 'purpose': e.purpose,
+            'entrants': _tbt_json(e.entrants, []), 'attendant': e.attendant, 'comms': e.comms, 'o2': e.o2, 'lfl': e.lfl, 'h2s': e.h2s, 'co': e.co,
+            'tested_by': e.tested_by, 'tested_at': _in_iso(e.tested_at), 'ventilated': e.ventilated, 'rescue_ready': e.rescue_ready,
+            'status': e.status, 'entered_at': _in_iso(e.entered_at), 'exited_at': _in_iso(e.exited_at), 'close_note': e.close_note,
+            'authorised_by': names.get(e.authorised_by)}
+
+
+@app.route('/api/maritime/entries', methods=['GET', 'POST'])
+@jwt_required
+def mar_entries_route():
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    cid, now = user.company_id, datetime.utcnow()
+    if request.method == 'GET':
+        rows = MarEntry.query.filter(MarEntry.company_id == cid).order_by(MarEntry.entered_at.desc()).limit(300).all()
+        spaces = {s.id: s for s in MarSpace.query.filter(MarSpace.company_id == cid).all()}
+        names = _in_names([e.authorised_by for e in rows])
+        return jsonify({'success': True, 'data': [_mar_entry_dict(e, names, spaces.get(e.space_id)) for e in rows]}), 200
+    if not _rc_staff(user):
+        return jsonify({'success': False, 'error': 'Entry is authorised by a responsible officer / supervisor.'}), 403
+    data = _in_body()
+    s = db.session.get(MarSpace, int(data['space_id'])) if str(data.get('space_id') or '').isdigit() else None
+    if not s or s.company_id != cid or not s.active:
+        return jsonify({'success': False, 'error': 'Choose the enclosed space.'}), 400
+    st = _mar_settings(cid)
+    if not st['limits']:
+        return jsonify({'success': False, 'code': 'LIMITS_NOT_SET', 'error': 'Set your atmosphere limits first (Settings), from your safety management system.'}), 409
+    purpose, attendant = _rc_text(data.get('purpose'), 300), _rc_text(data.get('attendant'), 120)
+    entrants = [_rc_text(x, 120) for x in (data.get('entrants') or []) if _rc_text(x, 120)][:20]
+    if len(purpose) < 3 or not entrants:
+        return jsonify({'success': False, 'error': 'Give the purpose and who is going in.'}), 400
+    if len(attendant) < 2 or attendant.lower() in (x.lower() for x in entrants):
+        return jsonify({'success': False, 'code': 'NO_ATTENDANT', 'error': 'Name an attendant who stays at the entrance and does not go in.'}), 400
+    readings = {}
+    for k in ('o2', 'lfl', 'h2s', 'co'):
+        if data.get(k) not in (None, ''):
+            try:
+                readings[k] = float(data[k])
+            except (TypeError, ValueError):
+                return jsonify({'success': False, 'error': 'Gas readings must be numbers.'}), 400
+    blocks = _mar_eval(readings, st['limits'])
+    if not data.get('ventilated'):
+        blocks.append('The space has not been ventilated.')
+    if not data.get('rescue_ready'):
+        blocks.append('Rescue and resuscitation equipment is not ready at the entrance.')
+    if blocks:
+        return jsonify({'success': False, 'code': 'NO_ENTRY', 'error': 'No entry: ' + ' '.join(blocks), 'reasons': blocks}), 409
+    busy = MarEntry.query.filter(MarEntry.space_id == s.id, MarEntry.status == 'open').first()
+    if busy:
+        return jsonify({'success': False, 'error': 'There is already an open entry for this space: add people to it or close it first.'}), 409
+    e = MarEntry(company_id=cid, space_id=s.id, purpose=purpose, entrants=json.dumps(entrants), attendant=attendant,
+                 comms=_rc_text(data.get('comms'), 120) or None, limits=json.dumps(st['limits']), tested_by=_rc_text(data.get('tested_by'), 120) or None,
+                 tested_at=now, ventilated=True, rescue_ready=True, authorised_by=user.id, entered_at=now, **readings)
+    db.session.add(e)
+    db.session.commit()
+    return jsonify({'success': True, 'data': _mar_entry_dict(e, _in_names([user.id]), s)}), 201
+
+
+@app.route('/api/maritime/entries/<int:eid>', methods=['PUT'])
+@jwt_required
+def mar_entry_one(eid):
+    """action: close {note} (everyone out) | abort {note} (alarm, gas, emergency)."""
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    e = db.session.get(MarEntry, eid)
+    if not e or e.company_id != user.company_id:
+        return jsonify({'success': False, 'error': 'Not found.'}), 404
+    if e.status != 'open':
+        return jsonify({'success': False, 'error': 'This entry is already closed.'}), 409
+    data = _in_body()
+    action = data.get('action')
+    note = _rc_text(data.get('note'), 500)
+    if action == 'abort':
+        if len(note) < 3:
+            return jsonify({'success': False, 'error': 'Say why the entry was stopped.'}), 400
+        e.status = 'aborted'
+        _in_notify([(u.id, getattr(u, 'email', None)) for u in _rc_staff_users(e.company_id, exclude=user.id)],
+                   'Enclosed space entry stopped'[:200], note, '/hse-management/industry/maritime?tab=spaces', 'critical', email=True)
+    elif action == 'close':
+        if not data.get('all_out'):
+            return jsonify({'success': False, 'error': 'Confirm everyone is out and accounted for.'}), 400
+        e.status = 'closed'
+    else:
+        return jsonify({'success': False, 'error': 'Unknown action.'}), 400
+    e.exited_at, e.closed_by, e.close_note = datetime.utcnow(), user.id, note or None
+    db.session.commit()
+    return jsonify({'success': True, 'data': _mar_entry_dict(e, _in_names([e.authorised_by]))}), 200
+
+
+@app.route('/api/maritime/drills', methods=['GET', 'POST'])
+@jwt_required
+def mar_drills_route():
+    user = request.user
+    deny = _in_company_403(user)
+    if deny:
+        return deny
+    cid, today = user.company_id, datetime.utcnow().date()
+    if request.method == 'GET':
+        rows = MarDrill.query.filter(MarDrill.company_id == cid).order_by(MarDrill.held_on.desc()).limit(300).all()
+        return jsonify({'success': True, 'can_manage': _rc_staff(user), 'status': _mar_drill_status(cid, _mar_settings(cid), today),
+                        'data': [{'id': d.id, 'vessel': d.vessel, 'held_on': d.held_on.isoformat(), 'scenario': d.scenario, 'participants': d.participants,
+                                  'equipment_checked': d.equipment_checked, 'lessons': d.lessons} for d in rows]}), 200
+    if not _rc_staff(user):
+        return jsonify({'success': False, 'error': 'Officers / supervisors record drills.'}), 403
+    data = _in_body()
+    vessel, scenario = _mar_vessel(data.get('vessel')), _rc_text(data.get('scenario'), 300)
+    try:
+        held = datetime.strptime(str(data.get('held_on'))[:10], '%Y-%m-%d').date()
+        people = int(data.get('participants'))
+    except (TypeError, ValueError):
+        return jsonify({'success': False, 'error': 'Give the date and the number of participants.'}), 400
+    if len(vessel) < 2 or len(scenario) < 5 or held > today or people < 1:
+        return jsonify({'success': False, 'error': 'Give the vessel, the scenario, a date that is not in the future and the participants.'}), 400
+    d = MarDrill(company_id=cid, vessel=vessel, held_on=held, scenario=scenario, participants=people, equipment_checked=bool(data.get('equipment_checked')),
+                 lessons=_capa_long(data.get('lessons'), 2000) or None, created_by=user.id)
+    db.session.add(d)
+    db.session.commit()
+    return jsonify({'success': True, 'data': {'id': d.id}, 'status': _mar_drill_status(cid, _mar_settings(cid), today)}), 201
+
+
+def _mar_reminders(today=None):
+    """Once a day per company: vessels whose enclosed space drill is overdue."""
+    today = today or datetime.utcnow().date()
+    n = 0
+    cids = {c for (c,) in db.session.query(MarSpace.company_id).filter(MarSpace.active.is_(True)).distinct().all()}
+    for cid in cids:
+        st = _mar_settings(cid)
+        if st.get('notified_on') == today.isoformat():
+            continue
+        late = [v for v in _mar_drill_status(cid, st, today) if v['overdue']]
+        if not late:
+            continue
+        _dm_setting_put('mar_settings', cid, {**st, 'notified_on': today.isoformat()}, None)
+        db.session.commit()
+        n += 1
+        _in_notify([(u.id, getattr(u, 'email', None)) for u in _rc_staff_users(cid)], f'Enclosed space drill overdue: {len(late)} vessel(s)'[:200],
+                   ', '.join(v['vessel'] for v in late)[:400] + '. SOLAS III/19: at least every two months.', '/hse-management/industry/maritime?tab=drills', 'high')
+    return n
+
+
+def _mar_watch_loop():
+    time.sleep(1200)
+    while True:
+        try:
+            with app.app_context():
+                _mar_reminders()
+        except Exception as e:
+            logger.error(f'maritime watcher: {e}')
+        finally:
+            try:
+                with app.app_context():
+                    db.session.remove()
+            except Exception:
+                pass
+        time.sleep(3600)
+
+
+if os.environ.get('READY_CHECK_WATCHER', '1') == '1':
+    threading.Thread(target=_mar_watch_loop, daemon=True, name='maritime-watcher').start()
 # =====================================================================================================
 # AUTO MIGRATIONS (2026-11-23)
 # Railway's Data tab appends LIMIT to every query, so CREATE/ALTER statements fail there. Instead the
@@ -181126,7 +181512,7 @@ if os.environ.get('READY_CHECK_WATCHER', '1') == '1':
 #   - a failing statement is logged and the file is retried on the next start
 # Set AUTO_MIGRATE=0 on Railway to switch this off.
 # =====================================================================================================
-AUTO_MIGRATIONS = ('DEPLOY_2026-11-23_FULL.sql', '2026-11-24_company_quotes.sql', '2026-11-25_ready_checks.sql', '2026-11-26_muster_contractors.sql', '2026-11-27_document_control_plus.sql', '2026-11-27_inspections.sql', '2026-11-27_chemical_safety.sql', '2026-11-27_chemical_waste.sql', '2026-11-27_equipment.sql', '2026-11-27_incident_outcomes.sql', '2026-11-27_oil_gas.sql', '2026-11-27_vision_reports.sql', '2026-11-27_mining.sql', '2026-11-27_mfg_wh.sql', '2026-11-27_og_part2.sql', '2026-11-27_mining_part2.sql', '2026-11-27_chemical_part3.sql', '2026-11-28_capa.sql', '2026-11-28_lab.sql', '2026-11-28_construction.sql')
+AUTO_MIGRATIONS = ('DEPLOY_2026-11-23_FULL.sql', '2026-11-24_company_quotes.sql', '2026-11-25_ready_checks.sql', '2026-11-26_muster_contractors.sql', '2026-11-27_document_control_plus.sql', '2026-11-27_inspections.sql', '2026-11-27_chemical_safety.sql', '2026-11-27_chemical_waste.sql', '2026-11-27_equipment.sql', '2026-11-27_incident_outcomes.sql', '2026-11-27_oil_gas.sql', '2026-11-27_vision_reports.sql', '2026-11-27_mining.sql', '2026-11-27_mfg_wh.sql', '2026-11-27_og_part2.sql', '2026-11-27_mining_part2.sql', '2026-11-27_chemical_part3.sql', '2026-11-28_capa.sql', '2026-11-28_lab.sql', '2026-11-28_construction.sql', '2026-11-28_maritime.sql')
 _MIGRATION_LOCK_KEY = 74230115
 
 
