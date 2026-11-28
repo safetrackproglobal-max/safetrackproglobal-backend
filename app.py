@@ -172543,6 +172543,11 @@ def cs_compat_route():
         entries.append({'label': CS_EPA_GROUPS[str(g)], 'groups': [str(g)], 'confirmed': True})
     if len(entries) < 2:
         return jsonify({'success': False, 'error': 'Choose at least two chemicals or groups.'}), 400
+    return jsonify({'success': True, 'data': _cs_compat_pairs(entries)}), 200
+
+
+def _cs_compat_pairs(entries):
+    """entries [{label, groups, confirmed}] -> every pair with the EPA chart reactions (used by the register and the free public tool)."""
     pairs, missing = [], [e['label'] for e in entries if not e['groups']]
     for i in range(len(entries)):
         for j in range(i + 1, len(entries)):
@@ -172560,9 +172565,9 @@ def cs_compat_route():
                                       ('Unknown: reactivity group missing' if not a['groups'] or not b['groups'] else 'No reaction listed in the EPA chart')),
                           'unconfirmed': not (a['confirmed'] and b['confirmed'])})
     pairs.sort(key=lambda p: -p['severity'])
-    return jsonify({'success': True, 'data': {'pairs': pairs, 'missing_groups': missing,
-                                              'caution': 'Based on the EPA compatibility chart (EPA-600/2-80-076). A blank does not prove a mixture is safe; '
-                                                         'also read the reactivity section of each supplier SDS.'}}), 200
+    return {'pairs': pairs, 'missing_groups': missing,
+            'caution': 'Based on the EPA compatibility chart (EPA-600/2-80-076). A blank does not prove a mixture is safe; '
+                       'also read the reactivity section of each supplier SDS.'}
 
 
 @app.route('/api/chem/alerts', methods=['GET'])
@@ -178464,6 +178469,13 @@ def _cs_mh_compute(cid, extra=None):
             rows.append(r)
     if extra:
         rows.append(extra)
+    out = _cs_mh_core(rows)
+    out.update({'problems': problems, 'classified': len(rows) - (1 if extra else 0)})
+    return out
+
+
+def _cs_mh_core(rows):
+    """rows [{name, tonnes, cats, named, psm, location}] -> Seveso III tier, note-4 sums, named substances, OSHA PSM hits."""
     sums = {g: {'lower': 0.0, 'upper': 0.0, 'parts': []} for g in ('health', 'physical', 'environment')}
     single = []
     for r in rows:
@@ -178512,7 +178524,7 @@ def _cs_mh_compute(cid, extra=None):
         h['pct'] = round(h['lb'] / h['tq_lb'] * 100, 1)
         psm.append(h)
     psm.sort(key=lambda h: -h['pct'])
-    return {'tier': tier, 'sums': sums, 'single': single, 'psm': psm, 'problems': problems, 'classified': len(rows) - (1 if extra else 0)}
+    return {'tier': tier, 'sums': sums, 'single': single, 'psm': psm}
 
 
 # ---------------------------------------------------------------- major-hazard thresholds
@@ -181502,6 +181514,114 @@ def _mar_watch_loop():
 
 if os.environ.get('READY_CHECK_WATCHER', '1') == '1':
     threading.Thread(target=_mar_watch_loop, daemon=True, name='maritime-watcher').start()
+# ============================================================================
+# FREE PUBLIC SAFETY TOOLS (2026-11-28)
+#   No account needed. Chemical storage compatibility (EPA chart) with chemical name lookup (PubChem, cached),
+#   and Seveso III / OSHA PSM threshold screening. Nothing a visitor types is stored except the PubChem cache.
+#   The calculators (risk, noise, gas test, lifting, injury rates) run in the browser.
+# ============================================================================
+_HARDEN_RULES = (
+    ('GET', 'prefix', '/api/public/tools/chem-lookup', 20, 600),
+    ('GET', 'prefix', '/api/public/tools/chem-substance/', 20, 600),
+    ('POST', 'prefix', '/api/public/tools/', 60, 600),
+    ('GET', 'prefix', '/api/public/tools/', 120, 600),
+) + globals().get('_HARDEN_RULES', ())
+
+
+@app.route('/api/public/tools/chem-groups', methods=['GET'])
+def pt_chem_groups():
+    return jsonify({'success': True, 'data': [{'id': k, 'name': v} for k, v in CS_EPA_GROUPS.items()],
+                    'source': 'EPA-600/2-80-076, A Method for Determining the Compatibility of Hazardous Wastes'}), 200
+
+
+@app.route('/api/public/tools/chem-lookup', methods=['GET'])
+def pt_chem_lookup():
+    """Name or CAS -> PubChem candidates (only the search text leaves our server)."""
+    q = _rc_text(request.args.get('q'), 120)
+    if len(q) < 2:
+        return jsonify({'success': True, 'data': []}), 200
+    if not re.fullmatch(r"[A-Za-z0-9 ,.()'\-\[\]+/]+", q):
+        return jsonify({'success': False, 'error': 'Use letters, numbers and - , . ( ) only.'}), 400
+    cached = ChemSubstance.query.filter(or_(func.lower(ChemSubstance.name) == q.lower(), ChemSubstance.cas == q)).limit(5).all()
+    if cached:
+        return jsonify({'success': True, 'data': [{'cid': s.cid, 'name': s.name, 'formula': s.formula} for s in cached if s.cid]}), 200
+    try:
+        from urllib.parse import quote as _q
+        ids = _cs_get(f'/pug/compound/name/{_q(q, safe="")}/cids/JSON')
+        cids = ((ids or {}).get('IdentifierList') or {}).get('CID', [])[:5]
+        if not cids:
+            return jsonify({'success': True, 'data': []}), 200
+        props = _cs_get(f'/pug/compound/cid/{",".join(str(int(c)) for c in cids)}/property/Title,MolecularFormula/JSON')
+    except Exception as e:
+        logger.warning(f'public pubchem lookup: {e}')
+        return jsonify({'success': False, 'error': 'The chemical database (PubChem) could not be reached. Pick the reactivity group by hand.'}), 502
+    return jsonify({'success': True, 'data': [{'cid': p['CID'], 'name': p.get('Title'), 'formula': p.get('MolecularFormula')}
+                                              for p in (props or {}).get('PropertyTable', {}).get('Properties', [])]}), 200
+
+
+@app.route('/api/public/tools/chem-substance/<int:cid>', methods=['GET'])
+def pt_chem_substance(cid):
+    try:
+        s = _cs_fetch_substance(cid)
+    except Exception as e:
+        db.session.rollback()
+        logger.warning(f'public pubchem substance {cid}: {e}')
+        return jsonify({'success': False, 'error': 'The chemical database (PubChem) could not be reached. Try again in a minute.'}), 502
+    if not s:
+        return jsonify({'success': False, 'error': 'Chemical not found in PubChem.'}), 404
+    d = _cs_substance_dict(s)
+    ghs = d.get('ghs') or {}
+    return jsonify({'success': True, 'data': {'cid': d['cid'], 'name': d['name'], 'cas': d['cas'], 'formula': d['formula'], 'pubchem_url': d['pubchem_url'],
+                                              'suggested_groups': d['suggested_groups'], 'hazards': (ghs.get('h') or [])[:12]}}), 200
+
+
+@app.route('/api/public/tools/compatibility', methods=['POST'])
+def pt_compatibility():
+    data = request.get_json(silent=True) or {}
+    entries = []
+    for e in (data.get('entries') or [])[:10]:
+        if not isinstance(e, dict):
+            continue
+        groups = [str(g) for g in (e.get('groups') or [])[:6] if str(g) in CS_EPA_GROUPS]
+        label = _rc_text(e.get('label'), 80) or (CS_EPA_GROUPS[groups[0]] if groups else '')
+        if label:
+            entries.append({'label': label, 'groups': groups, 'confirmed': bool(e.get('confirmed', True))})
+    if len(entries) < 2:
+        return jsonify({'success': False, 'error': 'Add at least two chemicals, each with a reactivity group.'}), 400
+    return jsonify({'success': True, 'data': _cs_compat_pairs(entries)}), 200
+
+
+@app.route('/api/public/tools/thresholds', methods=['GET', 'POST'])
+def pt_thresholds():
+    if request.method == 'GET':
+        return jsonify({'success': True,
+                        'seveso_p1': [{'id': k, 'name': v[0], 'group': v[1], 'lower': v[2], 'upper': v[3]} for k, v in CS_SEVESO_P1.items()],
+                        'seveso_p2': [{'id': k, 'name': v[0], 'lower': v[2], 'upper': v[3]} for k, v in CS_SEVESO_P2.items()],
+                        'psm_list': [{'id': k, 'name': v[0], 'tq_lb': v[2]} for k, v in CS_PSM.items()],
+                        'sources': ['Directive 2012/18/EU (Seveso III) Annex I, Parts 1 and 2', 'OSHA 29 CFR 1910.119 Appendix A and (a)(1)(ii)']}), 200
+    data = request.get_json(silent=True) or {}
+    rows = []
+    for ln in (data.get('lines') or [])[:30]:
+        if not isinstance(ln, dict):
+            continue
+        try:
+            t = float(ln.get('tonnes'))
+        except (TypeError, ValueError):
+            return jsonify({'success': False, 'error': 'Give each quantity in tonnes.'}), 400
+        if not 0 <= t <= 10_000_000:
+            return jsonify({'success': False, 'error': 'Quantity out of range.'}), 400
+        cats = [c for c in (ln.get('cats') or [])[:6] if c in CS_SEVESO_P1]
+        named = ln.get('named') if ln.get('named') in CS_SEVESO_P2 else None
+        psm = ln.get('psm') if ln.get('psm') in CS_PSM else None
+        if not (cats or named or psm):
+            continue
+        rows.append({'name': _rc_text(ln.get('name'), 80) or 'Substance', 'tonnes': t, 'cats': cats, 'named': named, 'psm': psm,
+                     'location': _rc_text(ln.get('location'), 80) or None})
+    if not rows:
+        return jsonify({'success': False, 'error': 'Add at least one substance with a category, a named substance or a PSM chemical.'}), 400
+    return jsonify({'success': True, 'data': _cs_mh_core(rows),
+                    'note': 'Screening only: your competent authority decides. Seveso III also counts dangerous substances that could be '
+                            'generated in an accident; OSHA PSM has exemptions (for example retail and normally unoccupied remote facilities).'}), 200
 # =====================================================================================================
 # AUTO MIGRATIONS (2026-11-23)
 # Railway's Data tab appends LIMIT to every query, so CREATE/ALTER statements fail there. Instead the
